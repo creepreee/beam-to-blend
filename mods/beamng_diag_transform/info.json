@@ -1,0 +1,13 @@
+{
+  "name": "beamng_diag_transform",
+  "displayName": "Transform Diagnostic",
+  "description": "Verifies getRefNodeMatrix() == getPosition() + getClusterRotationSlow()",
+  "version": "1",
+  "author": "diagnostic",
+  "type": "Extension",
+  "enabled": true,
+  "dependencies": ["core"],
+  "loadOrder": 0,
+  "ignoreCleanup": true,
+  "noUnload": true
+}

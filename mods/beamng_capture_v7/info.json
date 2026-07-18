@@ -1,0 +1,13 @@
+{
+  "name": "beamng_capture_v7",
+  "displayName": "BeamNG Motion Capture (v7)",
+  "description": "Captures crash-sequence vertex data from GPU mesh for offline import. v7: single-file mod, no per-frame debug logging.",
+  "version": "7",
+  "author": "AI-assisted",
+  "type": "Extension",
+  "enabled": true,
+  "dependencies": ["core"],
+  "loadOrder": 0,
+  "ignoreCleanup": true,
+  "noUnload": true
+}

@@ -1,0 +1,31 @@
+__pycache__/
+*.pyc
+*.blend1
+*.blend2
+*.blend3
+*.blend~
+manifest.json
+.cache
+dist/
+build/
+
+# Large data / capture artifacts (do not commit)
+*.blend
+*.bmc
+*.bvc
+*.bin
+*.mdd
+*.abc
+*.glb
+testglt/
+capture_latest/
+capture*/
+diag/
+.pytest_cache/
+
+# Temp / scratch files at repo root
+session.md
+continue.txt
+temp.txt
+*.log
+newcapture*.txt
