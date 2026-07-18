@@ -29,3 +29,13 @@ continue.txt
 temp.txt
 *.log
 newcapture*.txt
+2026-*.txt
+
+# Tooling internals
+.opencode/
+
+# Mesh / image dumps
+*.obj
+*.png
+dump_debug.json
+gt_dump.json

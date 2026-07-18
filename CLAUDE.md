@@ -1,183 +1,173 @@
-# CLAUDE.md — Working memory for AI contributors
+# CLAUDE.md — BeamNG Cache Importer (Architecture v3)
 
-This file is the shared brain for any AI working on this repo. Read it first. Keep it
-updated when you change architecture, conventions, or the current state of the build.
-Humans are **not** contributing code here — AI models are. Write for the next model.
+Working memory for AI contributors. Read first; keep updated when architecture changes.
 
 ---
 
 ## What this project is
 
-A Blender importer for **BeamNG crash sequences** that avoids the RAM blow-up of the
-naive "one GLB per frame → one mesh datablock per frame" workflow.
+A Blender importer for **BeamNG crash sequences** that captures the deforming
+mesh from the GPU vertex pool and the vehicle's rigid transform from the
+physics thread, then replays both in Blender.
 
-**Pipeline:** BeamNG GPU readback → `capture.bmc` (BMC v1) → Python builder → BVC → Blender runtime.
+**Pipeline:**
+```
+BeamNG vehicle Lua (VLUA)  ──►  capture  ──►  capture.bmc  ──►  Python builder  ──►  BVC  ──►  Blender runtime
+   verticesGet()  +                  (BMC v1)        (importer/)            (runtime/)
+   obj:getPosition() +                                                            + addon/
+   obj:getRotation()
+```
 
-The whole project rests on one validated finding: the shared GPU vertex pool is topology-stable
-(vertex N always represents the same physical point). So we store the mesh **once** and cache
-only per-frame vertex positions.
+Two subsystems, both **frozen**:
 
-### Ground-truth (2364-frame real test)
-
-- Shared pool: **533,885 verts**, **1,658,349 indices**, **byte-identical across all frames**
-- 96/97 objects topology-stable; only `flanje_e180_tierod_F` changes (115↔156 at frame 168)
-- Max pool drift: 0.10 m over a 93 m tumble (rotation/translation baked out by engine)
+- **Architecture A — Mesh Capture** (✅ frozen, complete)
+- **Architecture B — Rigid Motion** (✅ frozen v3, this document)
 
 ---
 
-## Architecture
+## Architecture A — Mesh Capture  ✅ FROZEN
 
+Goal: capture the deforming mesh exactly as BeamNG generates it.
+
+**Proven facts**
+- Shared GPU vertex pool is topology-stable: vertex N always represents the
+  same physical point across frames.
+- `verticesGet()` returns **body-relative local-space** positions (GPU pool,
+  left-handed Y-up: X=length/forward, Y=up, Z=width/right).
+- Index buffer is byte-identical across all frames.
+- Per-primitive extraction, `indicesMinMax`, and welding are NOT needed.
+- Builder reconstructs topology from shared-pool index ranges.
+- Shared-pool backend requires no weld; CPU backend abandoned.
+
+**Status:** complete. No further changes.
+
+---
+
+## Architecture B — Rigid Motion  ✅ FROZEN v3 (2026-07-19)
+
+Goal: capture the rigid transform BeamNG applies to the local-space mesh.
+
+### Key correction (v3)
+The rigid transform must be read from the **vehicle Lua (VLUA) context**,
+NOT the gameplay/GE Lua (GELUA) context.
+
+- GELUA `SceneObject:getRotation()` is **static** during softbody simulation
+  (measured: `0 0 1 ~0` across many frames). It is the SceneObject wrapper,
+  not the live physics transform. **Unsuitable for capture.**
+- VLUA `obj:getPosition()` + `obj:getRotation()` (where `obj` is the vehicle
+  in the vehicle/physics thread) update **continuously** — roll/pitch/yaw
+  change exactly with the vehicle during a crash. **This is the live rigid
+  transform.**
+
+The earlier investigation mixed GELUA and VLUA (same API names, different
+state). Once the source moved to the vehicle physics thread, the rigid
+transform became a live, continuously-updating signal.
+
+### Proven facts (v3)
+1. `verticesGet()` is vehicle-local deformation. ✅
+2. Rigid translation is NOT baked into the vertices. ✅
+3. GELUA `getRotation()` is static → unusable for softbody animation. ✅
+4. VLUA `obj:getRotation()` is live and tracks vehicle motion. ✅
+5. VLUA `obj:getPosition()` is live and matches vehicle motion. ✅
+
+### Capture frame (v3)
 ```
-BeamNG Backend                Python Builder                Blender Runtime
-(GPU readback via             (BMC v1 → BVC v3)             (BVC → mesh playback)
- bng_getGPUMesh)                     │                              │
-       │                    capture_format.py                cache_reader.py
-       │                    capture_reader.py                mesh_update.py
-  capture.lua               cache_builder.py                 frame_handler.py
-       │                                                      baker.py
-       ▼                                                      │
-  capture.bmc ───────────►  BVC file ─────────────────────►  Blender
+Frame
+ ├── Position (vec3)      obj:getPosition()
+ ├── Rotation (quat)      obj:getRotation()
+ ├── Vertex Pool          verticesGet()
+ └── (optional metadata)
 ```
+Nothing else: no direction vectors, no cluster rotation, no `quatFromDir`,
+no frame-0 reconstruction, no calibration, no `Rdelta`.
 
-- **Backend rule (non-negotiable):** capture only copies bytes. No per-primitive decomposition,
-  no `indicesMinMax`, no reconstruction, no weld, no repair.
-- **Builder rule:** groups primitives by flexmesh index, deduplicates via `np.unique` on
-  shared-pool index ranges, converts pool space (Y-up) → Blender space (Z-up). No weld/clamp/repair.
-- **Runtime** is unchanged from the GLB pipeline — reads BVC files, doesn't know their provenance.
+### Builder (v3 — simple)
+```
+read frame
+ ├── update mesh vertices (pool → Blender coord conversion, per frame)
+ ├── set object location  = position
+ └── set object quaternion = rotation
+```
+No rigid reconstruction, no quaternion guessing, no calibration.
 
-### File formats
+### Coordinate conversion (required, not "reconstruction")
+The GPU pool is **left-handed Y-up**. Blender is **right-handed Z-up**.
+The per-frame vertices must be converted pool→Blender (a static axis
+permutation + handedness flip) before the object transform is applied.
+This is a one-time-per-vertex operation on the pool data, NOT a per-frame
+rigid solve. The quaternion from VLUA is applied by Blender's object
+transform directly; the quaternion component order (x,y,z,w vs w,x,y,z) is
+handled at import (see `runtime/mesh_update.py`).
 
-- **BMC v1** (`capture.bmc`): single file, 40-byte header + static section (shared indices, UVs,
-  primitive table, material table) + fixed-size per-frame blocks (timestamp + positions).
-  All integers little-endian. Format spec: `importer/capture_format.py`.
+### Removed from architecture
+- ❌ `getClusterRotationSlow()`
+- ❌ `quatFromDir()`
+- ❌ `getDirectionVector()`
+- ❌ direction-vector reconstruction
+- ❌ frame-zero anchoring / `Rdelta`
+- ❌ builder-side rigid reconstruction
+- ❌ quaternion guessing
+- ❌ calibration-based transform solving
+
+### Remaining validation
+Export only `obj:getPosition()` + `obj:getRotation()`, animate a simple cube.
+Expected: identical trajectory, heading, roll, pitch. If it passes, the rigid
+pipeline is conclusively validated.
+
+---
+
+## File formats
+
+- **BMC v1** (`capture.bmc`): single file, 40-byte header + static section
+  (shared indices, UVs, primitive table, material table) + fixed-size
+  per-frame blocks (timestamp + positions + transform). Format spec:
+  `importer/capture_format.py`.
 - **BVC v3** (`capture.bvc`): unchanged. Format spec: `importer/binary.py`.
 
-### Capture rate
+### Coordinate conventions
+| Space | Up | Handedness | Axes | Where |
+|-------|----|-----------|------|-------|
+| Pool (GPU vertex buffer) | Y | left | X=length/fwd, Y=up, Z=width/right | `verticesGet()` |
+| Physics (BeamNG sim) | Z | right | X=right, Y=fwd, Z=up | `obj:getPosition()/getRotation()` |
+| Blender | Z | right | X=right, Y=fwd, Z=up | runtime scene |
 
-GPU readback driven by `onUpdate()` (sim callback, fires every tick at ~60 Hz).
-`updateGFX(dt)` is NOT invoked for user extensions — only for built-in modules.
-Validation uses a sample-based hash (first/last 1000 uint32 values, not byte-by-byte).
-Full byte-loop hash (`hashBytes` with `ffi.cast` per iteration) caused access violation
-on large buffers (6.6M iterations); replaced with `hashSample`.
+Pool→Blender permutation: `(pool_x, pool_y, pool_z)` → `(pool_z, pool_x, pool_y)`
+i.e. blender `(X, Y, Z)` = `(pool_width, pool_length, pool_up)`.
 
 ---
 
-## Current state of the build
+## State of the build
 
 | Module | State | Notes |
 |---|---|---|
-| `importer/capture_format.py` | ✅ | BMC v1 pack/unpack, frame seek, round-trip tested |
-| `capture.lua` | ✅ | Shared-pool GPU readback, BMC v1 output, per-frame hash validation |
-| `importer/capture_reader.py` | ✅ | BmcReader — groups primitives by flexmesh, dedup via np.unique. Standalone prop primitives (flexmesh=-1) get uniquified names to avoid dict overwrite |
-| `importer/cache_builder.py` | ✅ | build_from_capture (BMC→BVC) — clean, no weld/clamp/repair. GLB build() kept for legacy |
-| `importer/binary.py` | ✅ | BVC v3 format (unchanged) |
-| `importer/gltf_reader.py` | ✅ | GLB parser (legacy — for GLB pipeline only) |
-| `importer/scanner.py` | ✅ | Sequence scanner (legacy — for GLB pipeline only) |
-| `importer/topology.py` | ✅ | TopologyHasher.hash_indices |
-| `importer/materials.py` | ✅ | BeamNG .materials.json parser |
-| `runtime/cache_reader.py` | ✅ | BVC memmap reader (unchanged) |
-| `runtime/mesh_update.py` | ✅ | CachePlayback — position attribute API, UVs, materials (unchanged) |
-| `runtime/frame_handler.py` | ✅ | Timeline handler (unchanged) |
-| `runtime/baker.py` | ✅ | MDD writer + Alembic export (unchanged) |
-| `addon/*` | ✅ | UI panel + operators (unchanged) |
-| `tests/` | ✅ | 19 pytest tests passing |
-| `tests/scripts/` | ✅ | Verification scripts (see "Verification" section) |
+| `importer/capture_format.py` | ✅ | BMC v1 pack/unpack, frame seek |
+| `importer/cache_builder.py` | ✅ | BMC → BVC builder |
+| `importer/binary.py` | ✅ | BVC v3 format |
+| `importer/capture_reader.py` | ✅ | BMC reader |
+| `importer/{materials,topology,scanner,gltf_reader}.py` | ✅ | supporting modules |
+| `runtime/cache_reader.py` | ✅ | BVC memmap reader |
+| `runtime/mesh_update.py` | ✅ | per-frame vertex update + quaternion import |
+| `runtime/{frame_handler,baker,abc_writer,animation}.py` | ✅ | playback, MDD/Alembic export |
+| `addon/*` | ✅ | Blender UI panel + operators |
+| `tools/diagnostic_dump.lua` | ✅ | **v3 capture**: world-space BMC via refNode matrix (or local BMC via VLUA pos+rot) |
+| `capture.lua` + `mods/beamng_capture_v7/` | ✅ | Architecture A GPU-pool capture backend (frozen) |
+| `tests/` | ✅ | pytest suite (run `python -m pytest -q`) |
 
 ---
 
 ## Conventions
-
-- **Python 3.10+**, `from __future__ import annotations` at top of every module.
-- Dataclasses for structured data. Type hints everywhere.
-- `importer/` must **not** import `bpy` — plain CPython for CI tests. `runtime/` and `addon/` may.
-- Tests live in `tests/`, run with `pytest`. Keep new logic testable without Blender.
-- **After every change, repack:** `python build_addon.py` → `dist/beamng_cache_importer.zip`.
-
----
+- Python 3.10+, `from __future__ import annotations` at top of every module.
+- Dataclasses + type hints. `importer/` must NOT import `bpy` (plain CPython
+  for CI). `runtime/` and `addon/` may.
+- Tests live in `tests/`, run with `pytest`. Keep logic testable without Blender.
+- After changes, repack: `python build_addon.py` → `dist/beamng_cache_importer.zip`.
 
 ## How to run
-
-- Unit tests (no Blender): `python -m pytest -q` (19 tests).
-- Build add-on: `python build_addon.py` → `dist/beamng_cache_importer.zip`.
+- Unit tests: `python -m pytest -q`
+- Build add-on: `python build_addon.py` → `dist/beamng_cache_importer.zip`
 - Blender smoke test: `blender.exe --background --python tests/blender_smoke.py`
-- Master verification (BMC→BVC): `python tests/scripts/run_all_checks.py <capture.bmc> <cache.bvc>`
-- Individual verifiers live in `tests/scripts/`.
 
----
-
-## Verification scripts (`tests/scripts/`)
-
-All scripts are **fully independent** of the builder code (no imports from `cache_builder.py`).
-Each defines its own `quat_multiply` and `_Q_AXIS`. Additionally, every script has a
-**scipy-only** verification path that uses zero shared math constants — true cross-check.
-
-| Script | What it checks | Independence strategy |
-|--------|---------------|----------------------|
-| `verify_bmc_to_bvc.py` | Body vertex positions (sampled), transform frames (all 700) | Own quat_multiply + scipy-only path |
-| `verify_exhaustive.py` | ALL 88 objects' vertices (sampled), ALL 700 transform frames, scipy cross-check, raw byte-level transform comparison | Three paths: manual, scipy-vs-BVC, byte-level (zero math) |
-| `animation_summary.py` | Motion stats from BVC only (no BMC needed) | Reads BVC only — no builder math at all |
-| `blender_orientation_only.py` | Frame-0 orientation in Blender scene | Blender's own matrix/quaternion engine — fully independent code path |
-| `run_all_checks.py` | Runs all above + pytest, outputs FINAL VERDICT | Shell orchestrator only |
-
-### What "independent" means
-
-1. **No shared imports:** zero scripts import `cache_builder.py`.
-2. **Own rotation math:** each defines `quat_multiply` from scratch using basic numpy.
-3. **Scipy-only path:** computes expected quaternion using ONLY `scipy.spatial.transform.Rotation` — no manual `_Q_AXIS` constant involved. Compares scipy result directly against BVC stored data.
-4. **Byte-level check:** reads raw bytes of transform data from BMC, computes expected bytes after axis conversion, compares against BVC raw bytes. Zero conceptual math — pure bit comparison.
-5. **Blender path:** uses Blender's C++ matrix/quaternion engine to import BVC and read back transforms. Completely independent codebase.
-
----
-
-## Coordinate conventions (critical — get this right every time)
-
-### Spaces
-
-| Space | Up | Handedness | Axes | Where used |
-|-------|----|-----------|------|------------|
-| **Pool** (GPU vertex buffer) | Y | left-handed | X=forward-ish, Y=up, Z=right-ish | `capture.lua` readback; `capture.bmc` vertex positions |
-| **Physics** (BeamNG sim) | Z | right-handed | X=right, Y=forward, Z=up | Vehicle transform in `capture.bmc` |
-| **Blender** | Z | right-handed | X=right, Y=forward, Z=up | Runtime scene |
-
-### Conversions applied by builder (`importer/cache_builder.py`)
-
-1. **Positions** — pool Y-up → Blender Z-up via `_pool_to_blender`:
-   `(z_pool, x_pool, y_pool)` = `(x_blender, y_blender, z_blender)`.
-   - Pool: X=length (car forward), Y=up, Z=width (car right).
-   - Blender: X=right, Y=forward, Z=up.
-   - So pool Z (width) → blender X (right), pool X (length) → blender Y (forward), pool Y (up) → blender Z (up).
-
-2. **Transform position** — physics Z-up → Blender Z-up: **no conversion needed**.
-   Both physics (X=right, Y=forward, Z=up) and Blender (X=right, Y=forward, Z=up)
-   use the same right-handed Z-up convention. `p_blender = p_phys`.
-
-3. **Transform quaternion** — physics → Blender: **no conversion needed**.
-   Same Z-up reference frame. `q_blender = q_phys`.
-
-### Rest orientation (validated)
-
-- Car model faces **−X in pool space** (front vertices at most negative X).
-- After `_pool_to_blender` (z,x,y): pool X→blender Y, pool Z→blender X, pool Y→blender Z. So car front = −Y_blender, car right = +X_blender, car up = +Z_blender.
-- At rest (q_phys ≈ identity): q_blender ≈ identity, car's local frame aligns with world (car's +X=+X_world, +Y=+Y_world, +Z=+Z_world). The MODEL's front is at the −Y extreme of its local frame.
-- In plain English: car's nose points −Y_world, roof points +Z_world, right side points +X_world at rest.
-
-### Only pool positions need (z,x,y) perm; transform is identity
-
-The `_pool_to_blender` function converts pool Y-up → Blender Z-up via `(z,x,y)`:
-- pool Z (width) → blender X (right)
-- pool X (length) → blender Y (forward)
-- pool Y (up) → blender Z (up)
-
-This is needed because the GPU pool stores vertices in Y-up coordinates (BeamNG's GPU convention).
-
-The vehicle transform (position + quaternion) comes from the **physics API** (`getPosition()`, `getClusterRotationSlow()`), which returns Z-up coordinates — same as Blender's Z-up. So transform position and quaternion need **zero conversion**: `p_blender = p_phys`, `q_blender = q_phys`.
-
-**Historical note:** Earlier builder versions incorrectly applied `(z,x,y)` perm and Q_AXIS conjugation to the transform, causing the car to animate to the wrong axes in Blender (physics up → blender right, physics forward → blender up, etc.). This was fixed by removing the unnecessary conversion.
-
----
-
-## Environment
-
-Primary dev machine is **Windows** (PowerShell). Repo under
-`C:\Users\ubaid_i2c\Downloads\beamng-cache-importer`.
-Blender 4.5.9 at `C:\Users\ubaid_i2c\Downloads\blender-4.5.9-windows-x64\`.
+## Capture (BeamNG side)
+Deploy `tools/diagnostic_dump.lua` (or `capture.lua`) to a mod, load in GE
+console, run `start()`, crash, `stop()`. Produces `capture.bmc` (+ `.json`
+debug for `diagnostic_dump.lua`).
