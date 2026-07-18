@@ -147,11 +147,12 @@ Each defines its own `quat_multiply` and `_Q_AXIS`. Additionally, every script h
    - Blender: X=right, Y=forward, Z=up.
    - So pool Z (width) → blender X (right), pool X (length) → blender Y (forward), pool Y (up) → blender Z (up).
 
-2. **Transform position** — physics Z-up → Blender Z-up via cyclic perm:
-   `p_blender = [p_z, p_x, p_y]` — maps physics Z→Blender X, X→Y, Y→Z.
+2. **Transform position** — physics Z-up → Blender Z-up: **no conversion needed**.
+   Both physics (X=right, Y=forward, Z=up) and Blender (X=right, Y=forward, Z=up)
+   use the same right-handed Z-up convention. `p_blender = p_phys`.
 
-3. **Transform quaternion** — physics → Blender via conjugation:
-   `q_blender = Q_AXIS * q_phys * Q_AXIS_INV` where `Q_AXIS = [0.5, 0.5, 0.5, 0.5]` = 120° around `(1,1,1)/√3` = cyclic perm mapping physics X→Blender Y, Y→Z, Z→X.
+3. **Transform quaternion** — physics → Blender: **no conversion needed**.
+   Same Z-up reference frame. `q_blender = q_phys`.
 
 ### Rest orientation (validated)
 
@@ -160,9 +161,18 @@ Each defines its own `quat_multiply` and `_Q_AXIS`. Additionally, every script h
 - At rest (q_phys ≈ identity): q_blender ≈ identity, car's local frame aligns with world (car's +X=+X_world, +Y=+Y_world, +Z=+Z_world). The MODEL's front is at the −Y extreme of its local frame.
 - In plain English: car's nose points −Y_world, roof points +Z_world, right side points +X_world at rest.
 
-### Pool and physics spaces use the same (z,x,y) perm
+### Only pool positions need (z,x,y) perm; transform is identity
 
-Both `_pool_to_blender` and the position transform use `(z, x, y)` — this is NOT a coincidence. The pool stores vertices in world-space positions (Y-up) after physics deformation. The builder converts pool Y-up → Blender Z-up via `(z,x,y)`, and the vehicle transform also converts physics Z-up → Blender Z-up via `(z,x,y)`. They are consistent because pool space Y-up and physics space Z-up describe the same world, just with different up-axes.
+The `_pool_to_blender` function converts pool Y-up → Blender Z-up via `(z,x,y)`:
+- pool Z (width) → blender X (right)
+- pool X (length) → blender Y (forward)
+- pool Y (up) → blender Z (up)
+
+This is needed because the GPU pool stores vertices in Y-up coordinates (BeamNG's GPU convention).
+
+The vehicle transform (position + quaternion) comes from the **physics API** (`getPosition()`, `getClusterRotationSlow()`), which returns Z-up coordinates — same as Blender's Z-up. So transform position and quaternion need **zero conversion**: `p_blender = p_phys`, `q_blender = q_phys`.
+
+**Historical note:** Earlier builder versions incorrectly applied `(z,x,y)` perm and Q_AXIS conjugation to the transform, causing the car to animate to the wrong axes in Blender (physics up → blender right, physics forward → blender up, etc.). This was fixed by removing the unnecessary conversion.
 
 ---
 

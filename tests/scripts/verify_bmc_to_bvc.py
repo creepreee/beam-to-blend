@@ -69,19 +69,6 @@ def format_vec(v: np.ndarray, fmt: str = "+.6f") -> str:
     return f"({v[0]:{fmt}}, {v[1]:{fmt}}, {v[2]:{fmt}})"
 
 
-# =========================================================================
-#  Axis permutation quaternions
-# =========================================================================
-
-# Physics (Y-up? Actually BeamNG physics: X=right, Y=forward, Z=up) -> Blender (Z-up: X=right, Y=-forward, Z=up)
-# Position mapping: p_blender[x,y,z] = p_physics[z, x, y]
-# This is the permutation (z,x,y)
-# Q_AXIS rotates vectors from physics space to Blender space (axis permutation)
-# 120° rotation around (1,1,1)/√3
-_Q_AXIS = np.array([0.5, 0.5, 0.5, 0.5], dtype=np.float64)  # (x,y,z,w)
-_Q_AXIS_INV = np.array([-0.5, -0.5, -0.5, 0.5], dtype=np.float64)  # conjugate
-
-
 def main():
     if len(sys.argv) < 3:
         # Try default paths
@@ -235,10 +222,10 @@ def main():
     elif not has_bvc_transform:
         print("  BVC has no transform data!")
     else:
-        print(f"\n  {'Frame':>6s} | {'BMC pos (physics)':>30s} | {'BVC pos (blender)':>30s} | {'BMC->Blender pos':>30s} | {'pos_diff':>10s}")
+        print(f"\n  {'Frame':>6s} | {'BMC pos (physics)':>30s} | {'BVC pos (blender)':>30s} | {'expected (identity)':>30s} | {'pos_diff':>10s}")
         print(f"  {'-'*6}-+-{'-'*30}-+-{'-'*30}-+-{'-'*30}-+-{'-'*10}")
 
-        # Compute expected position: axis permutation (z, x, y)
+        # Physics Z-up = Blender Z-up. No conversion needed.
         for fi in check_frames:
             bmc_tf = bmc_fmt.read_frame_transform(bmc_path, bmc_hdr, fi)
             bvc_tf = bvc_reader.frame_transform(fi)
@@ -246,15 +233,14 @@ def main():
             bmc_p = bmc_tf[:3].astype(np.float64)
             bvc_p = bvc_tf[:3].astype(np.float64)
 
-            # Expected: p_blender = [p_z, p_x, p_y]
-            expected_p = np.array([bmc_p[2], bmc_p[0], bmc_p[1]], dtype=np.float64)
+            expected_p = bmc_p.copy()
 
             pd = np.linalg.norm(bvc_p - expected_p)
             match = "PERFECT" if pd < 1e-5 else ("CLOSE" if pd < 0.01 else "MISMATCH")
             print(f"  {fi:6d} | {format_vec(bmc_p):>30s} | {format_vec(bvc_p):>30s} | {format_vec(expected_p):>30s} | {pd:10.6f}")
 
-        print(f"\n  {'Frame':>6s} | {'BMC q (raw)':>48s} | {'Expected q in Blender':>48s} | {'BVC q (stored)':>48s} | {'q_diff':>10s}")
-        print(f"  {'-'*6}-+-{'-'*48}-+-{'-'*48}-+-{'-'*48}-+-{'-'*10}")
+        print(f"\n  {'Frame':>6s} | {'BMC q (raw)':>48s} | {'BVC q (stored)':>48s} | {'q_diff':>10s}")
+        print(f"  {'-'*6}-+-{'-'*48}-+-{'-'*48}-+-{'-'*10}")
 
         max_q_diff = 0.0
 
@@ -272,36 +258,16 @@ def main():
             if bvc_q_norm > 0:
                 bvc_q = bvc_q / bvc_q_norm
 
-            # Expected: q_blender = Q_AXIS * q_phys * Q_AXIS_INV
-            # i.e., conjugate q_phys by Q_AXIS
-            expected_q = quat_multiply(
-                quat_multiply(_Q_AXIS, bmc_q),
-                _Q_AXIS_INV,
-            )
+            # No conversion needed — physics Z-up = Blender Z-up
+            expected_q = bmc_q.copy()
 
-            # Handle quaternion sign ambiguity
             qd0 = np.linalg.norm(expected_q - bvc_q)
             qd1 = np.linalg.norm(expected_q + bvc_q)
             qd = min(qd0, qd1)
             max_q_diff = max(max_q_diff, qd)
 
-            match = "PERFECT" if qd < 1e-5 else ("CLOSE" if qd < 0.01 else "MISMATCH")
-
-            # R matrix comparison
-            R_expected = quat_to_matrix(expected_q)
-            R_stored = quat_to_matrix(bvc_q)
-
             print(f"  {fi:6d} | ({bmc_q[0]:+.6f}, {bmc_q[1]:+.6f}, {bmc_q[2]:+.6f}, {bmc_q[3]:+.6f}) | "
-                  f"({expected_q[0]:+.6f}, {expected_q[1]:+.6f}, {expected_q[2]:+.6f}, {expected_q[3]:+.6f}) | "
                   f"({bvc_q[0]:+.6f}, {bvc_q[1]:+.6f}, {bvc_q[2]:+.6f}, {bvc_q[3]:+.6f}) | {qd:10.6f}")
-
-            if qd > 0.01:
-                print(f"    Expected matrix:")
-                for row in R_expected:
-                    print(f"      [{row[0]:+8.4f}  {row[1]:+8.4f}  {row[2]:+8.4f}]")
-                print(f"    Stored matrix (BVC):")
-                for row in R_stored:
-                    print(f"      [{row[0]:+8.4f}  {row[1]:+8.4f}  {row[2]:+8.4f}]")
 
         print(f"\n  Max q_diff across all checked frames: {max_q_diff:.6f}")
 
@@ -367,7 +333,9 @@ def main():
             bvc_tf = bvc_reader.frame_transform(fi)
 
             bmc_p = bmc_tf[:3].astype(np.float64)
-            expected_p = np.array([bmc_p[2], bmc_p[0], bmc_p[1]], dtype=np.float64)
+            # Transform position is already in physics Z-up, same as Blender Z-up.
+            # No (z,x,y) perm needed — only pool-space vertex positions need that.
+            expected_p = bmc_p.copy()
             bvc_p = bvc_tf[:3].astype(np.float64)
             pd = np.linalg.norm(bvc_p - expected_p)
             if pd > 0.01:
@@ -377,7 +345,9 @@ def main():
             bn = np.linalg.norm(bmc_q)
             if bn > 0:
                 bmc_q /= bn
-            expected_q = quat_multiply(quat_multiply(_Q_AXIS, bmc_q), _Q_AXIS_INV)
+            # Quaternion is already in physics Z-up, same as Blender Z-up.
+            # No Q_AXIS conjugation needed — only the pool->blender rotation needs that.
+            expected_q = bmc_q.copy()
 
             bvc_q = bvc_tf[3:7].astype(np.float64)
             qn = np.linalg.norm(bvc_q)
@@ -393,45 +363,13 @@ def main():
 
         if q_mismatches > 0:
             print(f"\n  [FAIL] TRANSFORM ANIMATION: {q_mismatches} quaternion mismatches!")
-            print(f"     The BVC quaternion is NOT the correct axis-converted BMC quaternion.")
-
-            # Show what the correct approach would give vs what it currently gives
-            print(f"\n  Diagnosis:")
-            print(f"    The correct formula: q_blender = Q_AXIS * q_phys * Q_AXIS_INV")
-            print(f"    (where Q_AXIS = 120° around (1,1,1)/√3)")
-            print(f"    Current approach: reconstruct dir/up from q_phys matrix -> "
-                  f"build Y-forward matrix -> convert to quat -> apply Q_AXIS")
-            print(f"    The reconstruction step is BROKEN for identity/near-identity quaternions.")
-
-            # DROP TABLE format showing the differences
-            print(f"\n  {'=' * 120}")
-            print(f"  Detailed quaternion comparison (all frames):")
-            print(f"  {'FRM':>4s} | {'BMC_q_raw':>40s} | {'Expected_q (correct)':>40s} | {'BVC_q (current)':>40s} | Stored q ≈ Expected?")
-            print(f"  {'-'*4}-+-{'-'*40}-+-{'-'*40}-+-{'-'*40}-+-------------------")
-            # Show first 20 and last 10
-            detailed_frames = list(range(0, min(20, n_frames))) + list(range(max(0, n_frames - 10), n_frames))
-            detailed_frames = sorted(set(detailed_frames))
-            for fi in detailed_frames:
+            print(f"     BVC quaternion does not match BMC raw quaternion.")
+            for fi in range(min(10, n_frames)):
                 bmc_tf = bmc_fmt.read_frame_transform(bmc_path, bmc_hdr, fi)
                 bvc_tf = bvc_reader.frame_transform(fi)
-
                 bmc_q = bmc_tf[3:7].astype(np.float64)
-                bn = np.linalg.norm(bmc_q)
-                if bn > 0:
-                    bmc_q /= bn
-
-                expected_q = quat_multiply(quat_multiply(_Q_AXIS, bmc_q), _Q_AXIS_INV)
-
                 bvc_q = bvc_tf[3:7].astype(np.float64)
-                qn = np.linalg.norm(bvc_q)
-                if qn > 0:
-                    bvc_q /= qn
-
-                qd = min(np.linalg.norm(expected_q - bvc_q), np.linalg.norm(expected_q + bvc_q))
-                match = "MATCH" if qd < 0.001 else "DIFFERS"
-                print(f"  {fi:4d} | ({bmc_q[0]:+.6f}, {bmc_q[1]:+.6f}, {bmc_q[2]:+.6f}, {bmc_q[3]:+.6f}) | "
-                      f"({expected_q[0]:+.6f}, {expected_q[1]:+.6f}, {expected_q[2]:+.6f}, {expected_q[3]:+.6f}) | "
-                      f"({bvc_q[0]:+.6f}, {bvc_q[1]:+.6f}, {bvc_q[2]:+.6f}, {bvc_q[3]:+.6f}) | {match} (qd={qd:.4f})")
+                print(f"    frame {fi}: BMC={format_vec(bmc_q)}  BVC={format_vec(bvc_q)}")
         else:
             print(f"\n  [OK] TRANSFORM: PERFECT MATCH! (all {n_frames} frames)")
 
@@ -445,14 +383,11 @@ def main():
 
         if HAVE_SCIPY:
             print(f"\n{'=' * 100}")
-            print("5. INDEPENDENT CROSS-VALIDATION (scipy only, no shared math)")
+            print("5. RAW DIRECT COMPARISON (BMC physics data vs BVC stored)")
             print(f"{'=' * 100}")
-            print("  Uses ONLY scipy.spatial.transform.Rotation to compute expected")
-            print("  quaternion from raw BMC data, then compares against BVC stored.")
-            print("  No quat_multiply, no manual Q_AXIS constant — fully independent.")
-
-            # Q_AXIS defined via scipy (not manual constants)
-            r_axis = R_scipy.from_quat([0.5, 0.5, 0.5, 0.5])  # (x,y,z,w)
+            print("  Transform position and quaternion are in physics Z-up space,")
+            print("  which is the same as Blender Z-up. No conversion needed.")
+            print("  This is a direct byte-for-byte comparison of identical data.")
 
             scipy_q_mismatches = 0
             max_scipy_q_diff = 0.0
@@ -463,9 +398,9 @@ def main():
                 bmc_tf = bmc_fmt.read_frame_transform(bmc_path, bmc_hdr, fi)
                 bvc_tf = bvc_reader.frame_transform(fi)
 
-                # Position: independent perm (z,x,y)
+                # Position: identity — physics Z-up = Blender Z-up
                 bmc_p = bmc_tf[:3].astype(np.float64)
-                expected_p = np.array([bmc_p[2], bmc_p[0], bmc_p[1]], dtype=np.float64)
+                expected_p = bmc_p.copy()
                 bvc_p = bvc_tf[:3].astype(np.float64)
                 pd = np.linalg.norm(bvc_p - expected_p)
                 if pd > max_scipy_pos_diff:
@@ -475,12 +410,8 @@ def main():
 
                 # Quaternion via scipy ONLY
                 bmc_q = bmc_tf[3:7].astype(np.float64)
-                # scipy from_quat takes (x,y,z,w) = our storage format
-                r_phys = R_scipy.from_quat(bmc_q)
-                # q_blender = Q_AXIS * q_phys * Q_AXIS_INV
-                r_blender = r_axis * r_phys * r_axis.inv()
-                expected_q_scipy = r_blender.as_quat()  # returns (x,y,z,w)
-                expected_q_scipy = expected_q_scipy.astype(np.float64)
+                # No Q_AXIS conjugation — physics Z-up = Blender Z-up
+                expected_q_scipy = bmc_q.astype(np.float64)
                 en = np.linalg.norm(expected_q_scipy)
                 if en > 0:
                     expected_q_scipy /= en

@@ -852,9 +852,6 @@ class CacheBuilder:
                 # Basis-change quaternion: physics Y-up → Blender Z-up.
                 # Axis permutation (z,x,y): physics X→Blender Y, Y→Blender Z, Z→Blender X.
                 # Represented as 120° rotation around (1,1,1)/√3.
-                _Q_AXIS = np.array([0.5, 0.5, 0.5, 0.5], dtype=np.float64)  # (x,y,z,w)
-                _Q_AXIS_INV = np.array([-0.5, -0.5, -0.5, 0.5], dtype=np.float64)
-
                 per_frame_transforms: list[np.ndarray] = []
 
                 for fi in range(total_frames):
@@ -866,25 +863,12 @@ class CacheBuilder:
 
                     if has_transform:
                         vtx = reader.frame_vehicle_transform(fi)
-                        p_phys = vtx[:3].astype(np.float64)
-                        q_phys = vtx[3:7].astype(np.float64)
-
-                        # Direct axis change: q_blender = Q_AXIS * q_phys * Q_AXIS_INV
-                        # (No dir/up reconstruction needed — the BMC quaternion IS the rotation)
-                        p_blender = np.array([p_phys[2], p_phys[0], p_phys[1]], dtype=np.float32)
-
-                        ax, ay, az, aw = _Q_AXIS
-                        x, y, z, w = q_phys
-                        ix, iy, iz, iw = _Q_AXIS_INV
-                        t_w = w * iw - x * ix - y * iy - z * iz
-                        t_x = w * ix + x * iw + y * iz - z * iy
-                        t_y = w * iy - x * iz + y * iw + z * ix
-                        t_z = w * iz + x * iy - y * ix + z * iw
-                        bw = aw * t_w - ax * t_x - ay * t_y - az * t_z
-                        bx = aw * t_x + ax * t_w + ay * t_z - az * t_y
-                        by = aw * t_y - ax * t_z + ay * t_w + az * t_x
-                        bz = aw * t_z + ax * t_y - ay * t_x + az * t_w
-                        q_blender = np.array([bx, by, bz, bw], dtype=np.float32)
+                        # Transform is already in physics Z-up space.
+                        # Physics Z-up (X=right, Y=forward, Z=up) is the same as
+                        # Blender Z-up — no axis conversion needed.
+                        # Only vertex positions need _pool_to_blender (pool Y-up -> Z-up).
+                        p_blender = vtx[:3].astype(np.float32)
+                        q_blender = vtx[3:7].astype(np.float32)
 
                     for name in current_stable:
                         obj_idx = index_range[name]

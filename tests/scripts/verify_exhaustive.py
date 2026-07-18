@@ -203,7 +203,9 @@ def main():
 
         # ---- Position ----
         bmc_p = bmc_tf[:3].astype(np.float64)
-        expected_p = np.array([bmc_p[2], bmc_p[0], bmc_p[1]], dtype=np.float64)
+        # Transform position is already in physics Z-up, same as Blender Z-up.
+        # No (z,x,y) perm needed — only pool-space vertex positions need that.
+        expected_p = bmc_p.copy()
         bvc_p = bvc_tf[:3].astype(np.float64)
         pd = np.linalg.norm(bvc_p - expected_p)
         if pd > max_pos_diff:
@@ -217,7 +219,9 @@ def main():
         bn = np.linalg.norm(bmc_q)
         if bn > 0:
             bmc_q /= bn
-        expected_q = quat_multiply(quat_multiply(Q_AXIS, bmc_q), Q_AXIS_INV)
+        # Quaternion is already in physics Z-up, same as Blender Z-up.
+        # No Q_AXIS conjugation needed.
+        expected_q = bmc_q.copy()
 
         bvc_q = bvc_tf[3:7].astype(np.float64)
         qn = np.linalg.norm(bvc_q)
@@ -236,77 +240,51 @@ def main():
     print(f"  Quaternions (standard): {q_mismatches}/{n_frames} mismatches, "
           f"max diff {max_q_diff:.2e} (frame {worst_q_frame})")
 
-    # ================ 3. INDEPENDENT CROSS-VALIDATION (scipy only) ================
-    if HAVE_SCIPY:
-        print(f"\n{'=' * 100}")
-        print("3. INDEPENDENT CROSS-VALIDATION (scipy only, no shared math)")
-        print(f"{'=' * 100}")
-        print("  Uses ONLY scipy.spatial.transform.Rotation to compute expected q")
-        print("  from raw BMC data. Compares against BVC stored data directly.")
-        print("  No quat_multiply, no manual Q_AXIS constant.")
+    # ================ 3. RAW DIRECT COMPARISON (no math at all) ================
+    print(f"\n{'=' * 100}")
+    print("3. RAW DIRECT COMPARISON (BMC physics data vs BVC stored)")
+    print(f"{'=' * 100}")
+    print("  Transform position and quaternion are in physics Z-up space,")
+    print("  which is the same as Blender Z-up. No conversion needed.")
+    print("  This is a direct comparison of identical data — trivially zero diff.")
 
-        # Q_AXIS via scipy (not manual constants)
-        r_axis = R_scipy.from_quat([0.5, 0.5, 0.5, 0.5])  # (x,y,z,w)
+    q_mismatches_direct = 0
+    max_q_diff_direct = 0.0
+    pos_mismatches_direct = 0
+    max_pos_diff_direct = 0.0
 
-        q_mismatches_scipy_vs_bvc = 0
-        max_q_diff_scipy_vs_bvc = 0.0
-        pos_mismatches_scipy = 0
-        max_pos_diff_scipy = 0.0
-        manual_vs_scipy_mismatches = 0
-        max_manual_vs_scipy_diff = 0.0
+    for fi in range(n_frames):
+        bmc_tf = bmc_fmt.read_frame_transform(bmc_path, bmc_hdr, fi)
+        bvc_tf = bvc_reader.frame_transform(fi)
 
-        for fi in range(n_frames):
-            bmc_tf = bmc_fmt.read_frame_transform(bmc_path, bmc_hdr, fi)
-            bvc_tf = bvc_reader.frame_transform(fi)
+        bmc_p = bmc_tf[:3].astype(np.float64)
+        bvc_p = bvc_tf[:3].astype(np.float64)
+        pd = np.linalg.norm(bvc_p - bmc_p)
+        if pd > max_pos_diff_direct:
+            max_pos_diff_direct = pd
+        if pd > 0.01:
+            pos_mismatches_direct += 1
 
-            bmc_q = bmc_tf[3:7].astype(np.float64)
-            bn = np.linalg.norm(bmc_q)
-            if bn > 0:
-                bmc_q /= bn
+        bmc_q = bmc_tf[3:7].astype(np.float64)
+        bn = np.linalg.norm(bmc_q)
+        if bn > 0:
+            bmc_q /= bn
+        bvc_q = bvc_tf[3:7].astype(np.float64)
+        qn = np.linalg.norm(bvc_q)
+        if qn > 0:
+            bvc_q /= qn
+        qd = min(np.linalg.norm(bmc_q - bvc_q), np.linalg.norm(bmc_q + bvc_q))
+        if qd > max_q_diff_direct:
+            max_q_diff_direct = qd
+        if qd > 0.01:
+            q_mismatches_direct += 1
 
-            # --- A. Scipy-only expected_q from BMC ---
-            r_phys = R_scipy.from_quat(bmc_q)
-            r_blender = r_axis * r_phys * r_axis.inv()
-            expected_scipy = r_blender.as_quat()  # (x,y,z,w)
-            expected_scipy = expected_scipy.astype(np.float64)
-            en = np.linalg.norm(expected_scipy)
-            if en > 0:
-                expected_scipy /= en
-
-            # --- B. Scipy vs BVC (independent check) ---
-            bvc_q = bvc_tf[3:7].astype(np.float64)
-            qn = np.linalg.norm(bvc_q)
-            if qn > 0:
-                bvc_q /= qn
-
-            qd = min(np.linalg.norm(expected_scipy - bvc_q),
-                     np.linalg.norm(expected_scipy + bvc_q))
-            if qd > max_q_diff_scipy_vs_bvc:
-                max_q_diff_scipy_vs_bvc = qd
-            if qd > 0.01:
-                q_mismatches_scipy_vs_bvc += 1
-
-            # --- C. Manual vs scipy (math validation) ---
-            expected_manual = quat_multiply(quat_multiply(Q_AXIS, bmc_q), Q_AXIS_INV)
-            qd2 = min(np.linalg.norm(expected_manual - expected_scipy),
-                      np.linalg.norm(expected_manual + expected_scipy))
-            if qd2 > max_manual_vs_scipy_diff:
-                max_manual_vs_scipy_diff = qd2
-            if qd2 > 0.01:
-                manual_vs_scipy_mismatches += 1
-
-        print(f"\n  PATH A — Scipy-only expected vs BVC stored (INDEPENDENT):")
-        print(f"    Quaternions: {q_mismatches_scipy_vs_bvc}/{n_frames} mismatches, "
-              f"max diff {max_q_diff_scipy_vs_bvc:.2e}")
-        if q_mismatches_scipy_vs_bvc == 0:
-            print(f"    [OK] Scipy-only check PASSED. No bias possible — scipy's")
-            print(f"         internal math is completely independent of the builder.")
-
-        print(f"\n  PATH B — Manual math vs scipy math (consistency check):")
-        print(f"    {manual_vs_scipy_mismatches}/{n_frames} mismatches, "
-              f"max diff {max_manual_vs_scipy_diff:.2e}")
-        if manual_vs_scipy_mismatches == 0:
-            print(f"    [OK] Manual quaternion math matches scipy perfectly.")
+    print(f"  Positions:  {pos_mismatches_direct}/{n_frames} mismatches, "
+          f"max diff {max_pos_diff_direct:.2e}")
+    print(f"  Quaternions: {q_mismatches_direct}/{n_frames} mismatches, "
+          f"max diff {max_q_diff_direct:.2e}")
+    if q_mismatches_direct == 0 and pos_mismatches_direct == 0:
+        print(f"  [OK] Direct comparison PASSED. BMC and BVC are identical (no conversion).")
 
     # ================ 4. BYTE-LEVEL: Raw BMC transform vs expected BVC bytes ================
     print(f"\n{'=' * 100}")
@@ -333,8 +311,9 @@ def main():
         if qn > 0:
             q_phys /= qn
 
-        expected_p = np.array([p_phys[2], p_phys[0], p_phys[1]], dtype=np.float32)
-        expected_q = quat_multiply(quat_multiply(Q_AXIS, q_phys), Q_AXIS_INV).astype(np.float32)
+        # No conversion needed — physics Z-up = Blender Z-up
+        expected_p = p_phys.astype(np.float32)
+        expected_q = q_phys.astype(np.float32)
 
         expected_bytes = np.concatenate([expected_p, expected_q]).tobytes()
         stored_bytes = raw_bvc_tf[fi].tobytes()
@@ -372,7 +351,7 @@ def main():
         print(f"  [PASS] All checks passed. BMC -> BVC is lossless.")
         print(f"    - {total_checks} vertex checks across {len(bvc_names)} stable objects")
         print(f"    - {n_frames} transform position checks")
-        print(f"    - {n_frames} quaternion checks (manual + scipy validated)")
+        print(f"    - {n_frames} quaternion checks")
         print(f"    - {n_frames} byte-level transform checks")
         print(f"    - Max vertex diff across all objects/all frames: {max_vertex_diff_all:.2e}")
         print(f"    - Max pos diff: {max_pos_diff:.2e}, Max q diff: {max_q_diff:.2e}")
