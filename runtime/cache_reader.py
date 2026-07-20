@@ -157,17 +157,24 @@ class CacheReader:
         )
         return flat.reshape(-1, 3)
 
-    # --- per-frame vehicle transforms (BVC v4+) ------------------------
-    def frame_transform(self, frame: int) -> np.ndarray:
-        """Returns [px, py, pz, qx, qy, qz, qw] for *frame* in Blender space.
+    # --- per-frame vehicle transforms (BVC v4) --------------------------
+    # Stored as 12 float32 per frame: position(3) + orientation matrix(9,
+    # row-major, columns = right/fwd/up).  Reconstructed in the builder from
+    # the captured forward/up direction vectors (refNode-offset-free).
+    _TRANSFORM_FLOATS = 12
+    _TRANSFORM_BYTES = _TRANSFORM_FLOATS * 4
 
-        The transform is stored after frame blocks when the BVC has a
-        non-zero transform_data_offset.  Returns None if no transform data."""
+    def frame_transform(self, frame: int) -> np.ndarray:
+        """Returns [px, py, pz, rxx, rxy, rxz, fxx, fxy, fxz, uxx, uxy, uxz]
+        for *frame* in Blender space.
+
+        position(3) + 3x3 orientation matrix(9, row-major, columns =
+        right/fwd/up).  Returns None if no transform data."""
         tdo = self.header.get("transform_data_offset", 0)
         if tdo == 0 or not (0 <= frame < self.frame_count):
             return None
-        off = tdo + frame * 28  # 7 * float32
-        raw = np.frombuffer(self._mmap, dtype=np.float32, count=7, offset=off)
+        off = tdo + frame * self._TRANSFORM_BYTES
+        raw = np.frombuffer(self._mmap, dtype=np.float32, count=self._TRANSFORM_FLOATS, offset=off)
         return raw.copy()
 
     # --- UV + material: stable objects ---------------------------------

@@ -181,10 +181,11 @@ class BmcReader:
         return pos[obj.index_range].copy()
 
     def frame_vehicle_transform(self, frame_index: int) -> np.ndarray:
-        """Returns [px, py, pz, qx, qy, qz, qw] for frame N.
+        """Returns [px, py, pz, fx, fy, fz, ux, uy, uz] for frame N (v4).
 
-        The transform is stored after vertex positions when FLAG_HAS_TRANSFORM
-        is set in the BMC header.  Raises ValueError if not present.
+        position + forward dir + up dir.  The transform is stored after vertex
+        positions when FLAG_HAS_TRANSFORM is set in the BMC header.  Raises
+        ValueError if not present.
         """
         if not self.header.has_transform:
             raise ValueError("BMC has no vehicle transform data")

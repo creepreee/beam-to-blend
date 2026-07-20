@@ -386,18 +386,22 @@ class CachePlayback:
         )
 
     def _create_transform_empty(self, collection: "bpy.types.Collection") -> None:
-        """Create a parent empty that carries the vehicle's world transform."""
-        empty = bpy.data.objects.new("Vehicle Transform", None)
+        """Create a parent empty that carries the rigid transform per frame.
+
+        The builder writes a 12-float transform block (position + 3x3 matrix)
+        into the BVC when the capture has a separable rigid motion (local-pool
+        verts + direction-vector orientation).  All stable/dynamic meshes are
+        parented to this empty so the object's motion (translation + rotation)
+        is separated from the per-vertex deformation animation.
+        """
+        if self.reader.header.get("transform_data_offset", 0) == 0:
+            self._transform_empty = None
+            return
+        import mathutils  # noqa: F401  (imported lazily; bpy available here)
+        empty = bpy.data.objects.new(f"{self.collection_name}__root", None)
         empty.empty_display_type = "ARROWS"
-        empty.empty_display_size = 2.0
         collection.objects.link(empty)
         self._transform_empty = empty
-        # Check if transform data exists
-        tf = self.reader.frame_transform(0)
-        if tf is not None:
-            self._log("  vehicle transform data found — will animate empty")
-        else:
-            self._log("  no vehicle transform data — empty stays at origin")
 
     # --- setup ---------------------------------------------------------
     def build_scene(self) -> None:
@@ -632,16 +636,31 @@ class CachePlayback:
         self._log_mesh_stats("DYNCREATE", name, mesh)
 
     def _apply_transform(self, frame: int) -> None:
-        """Animate the parent empty from per-frame transform data."""
+        """Animate the parent empty from per-frame transform data.
+
+        Transform = position(3) + 3x3 orientation matrix(9, row-major).  The
+        matrix is the FINAL world matrix computed in the builder (proven
+        calibrator basis: x=forward, z=up, y=z x x).  It maps directly to the
+        Blender matrix_basis — no flip, no PCA, no quaternion guessing.
+        """
         if self._transform_empty is None:
             return
         tf = self.reader.frame_transform(frame)
         if tf is None:
             return
-        px, py, pz, qx, qy, qz, qw = tf
-        self._transform_empty.location = (float(px), float(py), float(pz))
+        px, py, pz = float(tf[0]), float(tf[1]), float(tf[2])
+        # The 12-float block is [px,py,pz, m00,m01,m02, m10,m11,m12, m20,m21,m22]
+        # row-major -> directly the Blender Matrix.
+        m = tf[3:12].reshape(3, 3).astype(np.float64)
+
+        mat = mathutils.Matrix((
+            (m[0, 0], m[0, 1], m[0, 2], px),
+            (m[1, 0], m[1, 1], m[1, 2], py),
+            (m[2, 0], m[2, 1], m[2, 2], pz),
+            (0.0, 0.0, 0.0, 1.0),
+        ))
+        self._transform_empty.matrix_basis = mat
         self._transform_empty.rotation_mode = "QUATERNION"
-        self._transform_empty.rotation_quaternion = (float(qw), float(qx), float(qy), float(qz))
 
     # --- per-frame update ---------------------------------------------
     def set_frame(self, frame: int) -> None:

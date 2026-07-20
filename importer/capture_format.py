@@ -31,9 +31,15 @@ HEADER_SIZE = 40
 FLAG_HAS_UVS = 1 << 0
 FLAG_HAS_NORMALS = 1 << 1
 FLAG_HAS_TRANSFORM = 1 << 2
+FLAG_HAS_NODES = 1 << 3  # v5: refNode-triangle rigid transform
+FLAG_WORLD_SPACE = 1 << 4  # v5: vertices already in absolute world space (no pool->Blender)
 
-# Per-frame layout when transform is present: timestamp(8) + vertices(vertex_count*12) + transform(28)
-FRAME_TRANSFORM_FLOATS = 7  # px, py, pz, qx, qy, qz, qw
+# Per-frame layout (v5): timestamp(8) + vertices + transform block.
+# Transform block = 9 f32 = (px,py,pz) translation + forward(3) + up(3),
+# all already in Blender Z-up space (physics->Blender swap {x,z,-y}).  The
+# builder reconstructs an orthonormal basis R=[right|fwd|up] and drives a
+# parent empty, mirroring export.lua's rigid-motion intent.
+FRAME_TRANSFORM_FLOATS = 9
 FRAME_TRANSFORM_BYTES = FRAME_TRANSFORM_FLOATS * 4
 
 
@@ -78,6 +84,10 @@ class BmcHeader:
     @property
     def has_transform(self) -> bool:
         return bool(self.flags & FLAG_HAS_TRANSFORM)
+
+    @property
+    def has_world_space(self) -> bool:
+        return bool(self.flags & FLAG_WORLD_SPACE)
 
     @property
     def frame_positions_bytes(self) -> int:

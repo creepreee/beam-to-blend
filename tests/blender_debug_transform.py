@@ -131,7 +131,13 @@ def main():
     frame_handler.attach(playback, frame_start=1)
 
     # Get the empty and body object
-    empty = bpy.data.objects.get("Vehicle Transform")
+    empty = bpy.data.objects.get("BeamNG Cache__root")
+    if empty is None:
+        # fallback: first empty object in the file
+        for o in bpy.data.objects:
+            if o.type == 'EMPTY':
+                empty = o
+                break
     body_obj = bpy.data.objects.get(body_name)
 
     if empty is None:
