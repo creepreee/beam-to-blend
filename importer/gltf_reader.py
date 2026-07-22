@@ -322,6 +322,21 @@ def read_glb(
             obj.positions = (mat @ xyz1.T).T[:, :3].astype(np.float32)
             objects.append(obj)
 
+    # --- glTF Y-up → Blender Z-up conversion ---
+    # glTF: X=right, Y=up, Z=toward_viewer.  Blender: X=right, Y=depth, Z=up.
+    # Permutation: blender_x = gltf_x, blender_y = -gltf_z, blender_z = gltf_y
+    _GLTF_TO_BLENDER = np.array([
+        [1,  0,  0, 0],
+        [0,  0, -1, 0],
+        [0,  1,  0, 0],
+        [0,  0,  0, 1],
+    ], dtype=np.float64)
+
+    for obj in objects:
+        obj.positions = (
+            (_GLTF_TO_BLENDER[:3, :3] @ obj.positions.T).T
+        ).astype(np.float32)
+
     return GLBDocument(objects=objects)
 
 

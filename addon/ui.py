@@ -2,7 +2,7 @@ import os
 
 import bpy
 from bpy.types import Panel, PropertyGroup
-from bpy.props import BoolProperty, IntProperty, StringProperty
+from bpy.props import BoolProperty, FloatProperty, IntProperty, StringProperty
 
 
 def _default_workers() -> int:
@@ -61,6 +61,16 @@ class BeamNGSceneProperties(PropertyGroup):
         max=64,
         soft_max=32,
     )
+    start_second: FloatProperty(
+        name="Start at Second",
+        description="Animation starts at this Blender timeline second. "
+                    "Cache frame 0 maps to this time on the timeline.",
+        default=0.0,
+        min=0.0,
+        soft_max=60.0,
+        step=10,
+        precision=2,
+    )
 
 
 class BEAMNG_PT_main(Panel):
@@ -86,6 +96,7 @@ class BEAMNG_PT_main(Panel):
         box.prop(props, "use_chunked")
         box.prop(props, "weld_cache")
         box.prop(props, "workers")
+        box.prop(props, "start_second")
 
         col = layout.column(align=True)
         col.operator("beamng.scan_sequence", text="1. Scan Sequence", icon="FILE_REFRESH")

@@ -72,9 +72,309 @@ class CacheBuilder:
         self.sequence_dir = Path(sequence_dir)
         self.out_path = Path(out_path)
 
-    # Public entry point. The only supported source is a v3 capture (.bmc).
-    def build(self, capture_bmc_path: str | None = None, **_ignored) -> "SequenceManifest":
-        return self.build_from_capture(capture_bmc_path or self.sequence_dir)
+    # Public entry point — auto-detects BMC vs GLB directory.
+    def build(
+        self,
+        capture_bmc_path: str | None = None,
+        manifest: "SequenceManifest | None" = None,
+        workers: int = 1,
+        **_ignored,
+    ) -> "SequenceManifest":
+        src = Path(capture_bmc_path) if capture_bmc_path else self.sequence_dir
+        if src.is_dir() or (manifest is not None):
+            return self.build_from_gltf(manifest=manifest, workers=workers)
+        return self.build_from_capture(str(src))
+
+    def build_from_gltf(
+        self,
+        manifest: "SequenceManifest | None" = None,
+        workers: int = 1,
+    ) -> "SequenceManifest":
+        """Build a BVC from a directory of per-frame GLB files.
+
+        Uses :class:`~importer.gltf_reader.GLBSequenceReader` for
+        topology-cached per-object extraction.  Positions are already in
+        Blender space (the glTF SE applies world-space root translation at
+        capture time, and ``read_glb`` walks the node tree).
+
+        *manifest* is an optional pre-computed
+        :class:`~importer.scanner.SequenceManifest` (from
+        :class:`~importer.scanner.SequenceScanner`).  When ``None`` a fresh
+        scan is performed.
+        """
+        from .gltf_reader import GLBSequenceReader
+        from .scanner import SequenceScanner
+
+        frames = sorted(self.sequence_dir.glob("*.glb"))
+        if not frames:
+            raise FileNotFoundError(f"no .glb frames in {self.sequence_dir}")
+        total_frames = len(frames)
+
+        if manifest is None:
+            scanner = SequenceScanner(self.sequence_dir)
+            manifest = scanner.scan(workers=workers)
+
+        obj_names = manifest.stable_objects
+        if not obj_names:
+            raise CacheBuildError("no stable objects in manifest")
+
+        print(
+            f"[BeamNG] Building cache from GLB sequence: "
+            f"{len(obj_names)} stable objects, {total_frames} frames "
+            f"-> {self.out_path}",
+            flush=True,
+        )
+
+        reader = GLBSequenceReader()
+        frame0_doc = reader.read(frames[0], want_materials=True)
+        frame0 = frame0_doc.by_name()
+
+        base_indices: Dict[str, np.ndarray] = {}
+        base_uvs: Dict[str, np.ndarray] = {}
+        base_mat_names: Dict[str, List[str]] = {}
+        base_face_mats: Dict[str, np.ndarray] = {}
+        vcounts: Dict[str, int] = {}
+        face_counts: Dict[str, int] = {}
+
+        for name in obj_names:
+            obj = frame0.get(name)
+            if obj is None:
+                raise CacheBuildError(
+                    f"stable object {name!r} not found in frame 0"
+                )
+            base_indices[name] = (
+                np.ascontiguousarray(obj.indices, dtype=np.int32)
+                if obj.indices is not None
+                else np.zeros(0, dtype=np.int32)
+            )
+            base_uvs[name] = (
+                np.ascontiguousarray(obj.uvs, dtype=np.float32)
+                if obj.uvs is not None
+                else np.zeros((obj.vertex_count, 2), dtype=np.float32)
+            )
+            base_mat_names[name] = obj.material_names or []
+            base_face_mats[name] = (
+                np.ascontiguousarray(obj.face_material_ids, dtype=np.uint16)
+                if obj.face_material_ids is not None
+                else np.zeros(obj.face_count, dtype=np.uint16)
+            )
+            vcounts[name] = obj.vertex_count
+            face_counts[name] = obj.face_count
+
+        # --- Layout computation ----------------------------------------
+        frame_vertex_offset: Dict[str, int] = {}
+        cursor = 0
+        for name in obj_names:
+            frame_vertex_offset[name] = cursor
+            cursor += vcounts[name] * 3
+        max_stable_vertex_total = sum(vcounts[n] for n in obj_names)
+
+        all_material_names: List[str] = ["__no_material__"]
+        name_index: Dict[str, int] = {"__no_material__": 0}
+
+        def _ensure_name(n: str) -> int:
+            idx = name_index.get(n)
+            if idx is None:
+                idx = len(all_material_names)
+                name_index[n] = idx
+                all_material_names.append(n)
+            return idx
+
+        initial_table_size = sum(
+            2 + len(n.encode("utf-8")) + binary._OBJ_TAIL.size + 16
+            for n in obj_names
+        )
+        padded_table_size = initial_table_size + 4096
+        object_table_offset = binary.HEADER_SIZE
+        base_mesh_offset = object_table_offset + padded_table_size
+
+        base_index_bytes: Dict[str, bytes] = {}
+        base_index_offset: Dict[str, int] = {}
+        index_count: Dict[str, int] = {}
+        off = base_mesh_offset
+        for name in obj_names:
+            ib = np.ascontiguousarray(
+                base_indices[name], dtype=np.int32
+            ).tobytes()
+            base_index_bytes[name] = ib
+            base_index_offset[name] = off
+            index_count[name] = face_counts[name]
+            off += len(ib)
+
+        uv_block_bytes: Dict[str, bytes] = {}
+        uv_off: Dict[str, int] = {}
+        for name in obj_names:
+            uv = base_uvs.get(name)
+            ub = (
+                np.ascontiguousarray(uv, dtype=np.float32).tobytes()
+                if uv is not None and uv.size > 0
+                else b""
+            )
+            uv_block_bytes[name] = ub
+            uv_off[name] = off
+            off += len(ub)
+
+        uv_blocks_offset = off
+
+        mat_table_bytes = binary.pack_material_name_table(all_material_names)
+        material_table_offset = off
+        off += len(mat_table_bytes)
+
+        mat_block_bytes: Dict[str, bytes] = {}
+        mat_off: Dict[str, int] = {}
+        for name in obj_names:
+            mnames = base_mat_names.get(name, [])
+            if not mnames:
+                mnames = ["__no_material__"]
+            global_ids = [_ensure_name(mn) for mn in mnames]
+            face_mats = base_face_mats.get(name)
+            if face_mats is not None and len(face_mats) == face_counts[name]:
+                mids = face_mats
+            else:
+                mids = np.zeros(face_counts[name], dtype=np.uint16)
+            mb = binary.pack_material_block(global_ids, mids.tolist())
+            mat_block_bytes[name] = mb
+            mat_off[name] = off
+            off += len(mb)
+
+        material_blocks_offset = off
+
+        frame_block_size = max_stable_vertex_total * 3 * 4
+        frame_directory_offset = off
+        off += total_frames * 8
+        frame_blocks_offset = off
+
+        # --- Write BVC file -------------------------------------------
+        print(f"[BeamNG]   writing {self.out_path} ...", flush=True)
+        self.out_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.out_path.exists():
+            try:
+                self.out_path.unlink()
+            except OSError:
+                pass
+
+        with open(self.out_path, "wb") as fh:
+            fh.write(
+                binary.pack_header(
+                    frame_count=total_frames,
+                    object_count=len(obj_names),
+                    stable_count=len(obj_names),
+                    stable_vertex_total=max_stable_vertex_total,
+                    object_table_offset=object_table_offset,
+                    base_mesh_offset=base_mesh_offset,
+                    uv_blocks_offset=uv_blocks_offset,
+                    material_table_offset=material_table_offset,
+                    material_blocks_offset=material_blocks_offset,
+                    frame_directory_offset=frame_directory_offset,
+                    frame_blocks_offset=frame_blocks_offset,
+                    dynamic_directory_offset=0,
+                    dynamic_data_offset=0,
+                    transform_data_offset=0,
+                )
+            )
+            fh.write(b"\x00" * padded_table_size)
+
+            for name in obj_names:
+                fh.write(base_index_bytes[name])
+            for name in obj_names:
+                fh.write(uv_block_bytes[name])
+
+            fh.write(mat_table_bytes)
+            for name in obj_names:
+                fh.write(mat_block_bytes[name])
+
+            for i in range(total_frames):
+                fh.write(
+                    struct.pack(
+                        "<Q", frame_blocks_offset + i * frame_block_size
+                    )
+                )
+
+            # --- Per-frame vertex positions ----------------------------
+            from .parallel_reader import read_frames_parallel
+
+            frame_paths = frames
+            for fi, record in read_frames_parallel(
+                frame_paths, reader.remap_cache,
+                want_positions=True, want_indices=False,
+                workers=workers,
+            ):
+                for name in obj_names:
+                    entry = record.get(name)
+                    if entry is None:
+                        fh.write(b"\x00" * vcounts[name] * 12)
+                        continue
+                    _vc, positions, _idx, _uv, _mats, _matids = entry
+                    if positions is None:
+                        fh.write(b"\x00" * vcounts[name] * 12)
+                        continue
+                    pos = np.ascontiguousarray(positions, dtype=np.float32)
+                    if pos.shape[0] != vcounts[name]:
+                        raise CacheBuildError(
+                            f"vertex count mismatch for {name!r} "
+                            f"in frame {fi}: expected {vcounts[name]}, "
+                            f"got {pos.shape[0]}"
+                        )
+                    fh.write(pos.tobytes())
+
+                written = sum(vcounts[n] * 12 for n in obj_names)
+                pad = frame_block_size - written
+                if pad > 0:
+                    fh.write(b"\x00" * pad)
+
+                if fi == 0 or (fi + 1) % 100 == 0:
+                    print(
+                        f"[BeamNG]   frame {fi + 1}/{total_frames} written",
+                        flush=True,
+                    )
+
+            # Patch header + write object table
+            fh.seek(0)
+            fh.write(
+                binary.pack_header(
+                    frame_count=total_frames,
+                    object_count=len(obj_names),
+                    stable_count=len(obj_names),
+                    stable_vertex_total=max_stable_vertex_total,
+                    object_table_offset=object_table_offset,
+                    base_mesh_offset=base_mesh_offset,
+                    uv_blocks_offset=uv_blocks_offset,
+                    material_table_offset=material_table_offset,
+                    material_blocks_offset=material_blocks_offset,
+                    frame_directory_offset=frame_directory_offset,
+                    frame_blocks_offset=frame_blocks_offset,
+                    dynamic_directory_offset=0,
+                    dynamic_data_offset=0,
+                    transform_data_offset=0,
+                )
+            )
+
+            fh.seek(object_table_offset)
+            for name in obj_names:
+                sig = manifest.objects[name]
+                fh.write(
+                    binary.pack_object_entry(
+                        name=name,
+                        stable=True,
+                        vertex_count=vcounts[name],
+                        face_count=face_counts[name],
+                        topology_hash=sig.topology_hash,
+                        base_index_offset=base_index_offset[name],
+                        index_count=index_count[name],
+                        frame_vertex_offset=frame_vertex_offset[name],
+                        welded=False,
+                        uv_offset=uv_off[name],
+                        material_offset=mat_off[name],
+                    )
+                )
+
+        size_mb = self.out_path.stat().st_size / 1e6
+        print(
+            f"[BeamNG] cache written from GLB: {size_mb:.1f} MB "
+            f"({total_frames} frames, {len(obj_names)} objects)",
+            flush=True,
+        )
+        return manifest
 
     def build_from_capture(self, capture_bmc_path: str) -> "SequenceManifest":
         """Build a BVC directly from a BMC v1 ``capture.bmc`` file.

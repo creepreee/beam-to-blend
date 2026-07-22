@@ -210,9 +210,12 @@ class BEAMNG_OT_import_cache(Operator):
             chunk_map = CHUNK_MAP_E180 if context.scene.beamng.use_chunked else None
             playback = CachePlayback(reader, log_path=log_path, chunk_map=chunk_map)
             playback.build_scene()
+
+            fps = context.scene.render.fps or 60
+            frame_start = int(context.scene.beamng.start_second * fps)
             frame_handler.attach(
                 playback,
-                frame_start=context.scene.frame_start,
+                frame_start=frame_start,
             )
             playback.close_log()
 
