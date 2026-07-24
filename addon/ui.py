@@ -14,6 +14,24 @@ def _default_workers() -> int:
 print("[BeamNG] add-on loading...")
 
 
+def _on_playback_fps_update(self, context):
+    """Push the new playback speed to the live handler (no re-import needed)."""
+    try:
+        from runtime import frame_handler
+        frame_handler.update_fps(playback_fps=int(self.playback_fps))
+    except Exception:
+        pass
+
+
+def _on_output_fps_update(self, context):
+    """Push the new output/render fps to the live handler (no re-import needed)."""
+    try:
+        from runtime import frame_handler
+        frame_handler.update_fps(output_fps=int(self.output_fps))
+    except Exception:
+        pass
+
+
 class BeamNGSceneProperties(PropertyGroup):
     sequence_dir: StringProperty(
         name="Sequence Folder",
@@ -83,6 +101,7 @@ class BeamNGSceneProperties(PropertyGroup):
         min=1,
         max=240,
         soft_max=60,
+        update=_on_playback_fps_update,
     )
     output_fps: IntProperty(
         name="Output FPS (smoothness)",
@@ -95,6 +114,7 @@ class BeamNGSceneProperties(PropertyGroup):
         min=1,
         max=240,
         soft_max=120,
+        update=_on_output_fps_update,
     )
 
 

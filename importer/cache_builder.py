@@ -377,6 +377,22 @@ class CacheBuilder:
 
         uv_blocks_offset = off
 
+        # --- Register EVERY object's material names FIRST, then pack the table.
+        # THE "<unknown> material" FIX (2026-07-24): the global name table must be
+        # packed AFTER all names are registered.  The old code packed the table
+        # here (when it held only "__no_material__") and only called _ensure_name
+        # in the per-object loop below — so the on-disk table had 1 name while the
+        # per-object blocks referenced global ids 1..N.  At import every name
+        # resolved to "<unknown>", collapsing all slots into one and breaking
+        # per-object material binding + texture assignment.  BMC's build already
+        # registers names before packing; this brings GLB in line.
+        obj_global_ids: Dict[str, List[int]] = {}
+        for name in obj_names:
+            mnames = base_mat_names.get(name, [])
+            if not mnames:
+                mnames = ["__no_material__"]
+            obj_global_ids[name] = [_ensure_name(mn) for mn in mnames]
+
         mat_table_bytes = binary.pack_material_name_table(all_material_names)
         material_table_offset = off
         off += len(mat_table_bytes)
@@ -384,10 +400,7 @@ class CacheBuilder:
         mat_block_bytes: Dict[str, bytes] = {}
         mat_off: Dict[str, int] = {}
         for name in obj_names:
-            mnames = base_mat_names.get(name, [])
-            if not mnames:
-                mnames = ["__no_material__"]
-            global_ids = [_ensure_name(mn) for mn in mnames]
+            global_ids = obj_global_ids[name]
             face_mats = base_face_mats.get(name)
             if face_mats is not None and len(face_mats) == face_counts[name]:
                 mids = face_mats

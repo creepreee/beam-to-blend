@@ -55,6 +55,76 @@ def _cache_frame_for(blender_frame: int) -> int:
     return int(round(rel * (_playback_fps / _output_fps)))
 
 
+def _set_realtime_sync() -> None:
+    """Force the viewport to play at real wall-clock speed (frame dropping).
+
+    THE "RENDER TOO FAST" FIX (2026-07-24)
+    --------------------------------------
+    Blender's default playback sync is ``'NONE'`` ("Play Every Frame"), which
+    is COMPUTE-BOUND: it shows every frame no matter how long the frame handler
+    takes.  With ~550K verts/frame our handler can't hit ``output_fps``, so the
+    viewport crawls in *unintended* slow-motion.  The render, by contrast, emits
+    every frame at exactly ``scene.render.fps`` — true speed.  So a speed tuned
+    against the laggy viewport renders far too fast.
+
+    ``'FRAME_DROP'`` makes the viewport target real wall-clock time and DROP
+    frames it can't compute, so the viewport plays at the identical speed as the
+    render.  Now what you tune in the viewport is exactly what renders.
+    """
+    if bpy is None:
+        return
+    scene = bpy.context.scene
+    if scene is None:
+        return
+    # Modern API (Blender 2.8+): Scene.sync_mode enum.
+    try:
+        scene.sync_mode = "FRAME_DROP"
+    except (AttributeError, TypeError):
+        pass
+    # Legacy boolean, harmless if absent.
+    try:
+        scene.render.use_frame_drop = True
+    except (AttributeError, TypeError):
+        pass
+
+
+def update_fps(playback_fps: Optional[float] = None,
+               output_fps: Optional[float] = None) -> None:
+    """Update the playback/output frame rates on the LIVE handler.
+
+    Called from the add-on's fps property callbacks so the two fps fields take
+    effect immediately (no re-import needed).  Recomputes the timeline end so
+    the sequence duration tracks ``playback_fps``, keeps ``scene.render.fps`` in
+    sync with ``output_fps``, and re-asserts realtime viewport sync.
+    """
+    global _playback_fps, _output_fps
+    if playback_fps is not None:
+        _playback_fps = max(0.001, float(playback_fps))
+    if output_fps is not None:
+        _output_fps = max(0.001, float(output_fps))
+
+    if bpy is None:
+        return
+    scene = bpy.context.scene
+    if scene is None:
+        return
+
+    scene.render.fps = max(1, int(round(_output_fps)))
+    scene.render.fps_base = 1.0
+    _set_realtime_sync()
+
+    # Persist for undo/reload recovery.
+    scene["_beamng_playback_fps"] = _playback_fps
+    scene["_beamng_output_fps"] = _output_fps
+
+    # Recompute timeline length so the whole cache still fits and the duration
+    # reflects the new speed (duration_s = (n_src - 1) / playback_fps).
+    if _active is not None:
+        n_src = _active.reader.frame_count
+        duration_s = (n_src - 1) / _playback_fps if n_src > 1 else 0.0
+        scene.frame_end = _frame_start + int(round(duration_s * _output_fps))
+
+
 def set_force_depsgraph(enabled: bool) -> None:
     """When True, call view_layer.update() after every set_frame().
 
@@ -240,11 +310,30 @@ def attach(playback: CachePlayback, frame_start: int = 0,
 
     scene = bpy.context.scene
     scene.frame_start = frame_start
+
+    # THE RENDER-SPEED FIX (the part that actually governs the RENDER, not the
+    # viewport): the rendered clip plays Blender frames [frame_start, frame_end]
+    # at scene.render.fps and each maps to a cache frame by TIME, so the clip
+    # lasts exactly (n_src-1)/playback_fps SECONDS — independent of output_fps
+    # and of viewport speed.  render.fps MUST be output_fps for that duration to
+    # hold, so attach() sets it here (previously only the import operator did,
+    # leaving undo-recovery / any other attach() caller rendering at the wrong
+    # rate).  playback_fps=60 renders at true realtime (capture is 60fps);
+    # lower playback_fps = proportionally slower render.  This is what fixes
+    # "the crash renders 2-3x too fast".
+    scene.render.fps = max(1, int(round(_output_fps)))
+    scene.render.fps_base = 1.0
+
     # Timeline length in OUTPUT frames = duration_seconds * output_fps, where
     # duration_seconds = (frame_count - 1) / playback_fps.
     n_src = playback.reader.frame_count
     duration_s = (n_src - 1) / _playback_fps if n_src > 1 else 0.0
     scene.frame_end = frame_start + int(round(duration_s * _output_fps))
+
+    # Viewport-only nicety: play at real wall-clock speed (drop frames instead
+    # of crawling) so the PREVIEW matches the render.  Has NO effect on the
+    # rendered output — render speed is set by render.fps + frame_end above.
+    _set_realtime_sync()
 
     # Store state for undo/reload recovery
     scene["_beamng_cache_path"] = str(playback.reader.path)
