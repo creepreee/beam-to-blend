@@ -23,13 +23,47 @@ for _candidate in (_PKG_DIR, os.path.dirname(_PKG_DIR)):
 from . import ui, operators, preferences  # noqa: E402,F401
 
 
+def _on_load_post(_dummy):
+    """Auto-recover BeamNG animation after file reload.
+
+    Blender's load clears module-level state (_active).  If the loaded file
+    has BeamNG metadata stored on the scene, _try_recover will recreate the
+    playback from the stored BVC path.
+    """
+    import bpy
+    from runtime import frame_handler
+    scene = bpy.context.scene
+    if scene is None:
+        return
+    # Clear stale state so _try_recover runs fresh
+    frame_handler._active = None
+    # Re-register frame handler (load clears handler list)
+    frame_handler._ensure_handler_registered()
+    # Try recovery from stored scene metadata
+    if frame_handler._try_recover(scene):
+        # Trigger an immediate frame update so meshes show correct positions
+        try:
+            frame_handler._on_frame_change(scene)
+        except Exception:
+            pass
+
+
 def register():
+    import bpy
     ui.register()
     operators.register()
     preferences.register()
+    # Mark load handler as persistent (survives file reload) and register
+    bpy.app.handlers.persistent(_on_load_post)
+    bpy.app.handlers.load_post.append(_on_load_post)
 
 
 def unregister():
+    import bpy
+    try:
+        bpy.app.handlers.load_post.remove(_on_load_post)
+    except ValueError:
+        pass
     preferences.unregister()
     operators.unregister()
     ui.unregister()

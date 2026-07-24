@@ -71,6 +71,31 @@ class BeamNGSceneProperties(PropertyGroup):
         step=10,
         precision=2,
     )
+    playback_fps: IntProperty(
+        name="Playback Speed (src fps)",
+        description="Animation SPEED: how many CAPTURED (source) frames advance "
+                    "per real second. This is the '15 that felt right' clock. "
+                    "The capture is recorded at 60 fps (realtime); lower values "
+                    "give slow motion (24 = 2.5x slow-mo, 15 = 4x slow-mo). "
+                    "This is INDEPENDENT of Output FPS, so the render plays at "
+                    "exactly the speed you tuned in the viewport.",
+        default=24,
+        min=1,
+        max=240,
+        soft_max=60,
+    )
+    output_fps: IntProperty(
+        name="Output FPS (smoothness)",
+        description="Scene render frame rate (scene.render.fps) — how SMOOTH the "
+                    "playback/render is, NOT how fast. Higher = smoother motion "
+                    "with in-between Blender frames; the animation still lasts "
+                    "the same wall-clock time set by Playback Speed. Set to 60 "
+                    "for smooth 60fps renders that play at the tuned speed.",
+        default=60,
+        min=1,
+        max=240,
+        soft_max=120,
+    )
 
 
 class BEAMNG_PT_main(Panel):
@@ -97,15 +122,16 @@ class BEAMNG_PT_main(Panel):
         box.prop(props, "weld_cache")
         box.prop(props, "workers")
         box.prop(props, "start_second")
+        box.prop(props, "playback_fps")
+        box.prop(props, "output_fps")
 
         col = layout.column(align=True)
-        col.operator("beamng.scan_sequence", text="1. Scan Sequence", icon="FILE_REFRESH")
-        col.operator("beamng.build_cache", text="2. Build Cache", icon="EXPORT")
-        col.operator("beamng.import_cache", text="3. Import Cache", icon="IMPORT")
+        col.operator("beamng.build_cache", text="1. Build Cache", icon="EXPORT")
+        col.operator("beamng.import_cache", text="2. Import Cache", icon="IMPORT")
 
         col.separator()
         col.prop(props, "vehicle_dir")
-        col.operator("beamng.assign_textures", text="5. Assign Textures", icon="TEXTURE")
+        col.operator("beamng.assign_textures", text="3. Assign Textures", icon="TEXTURE")
 
         col.separator()
         col.operator("beamng.export_alembic", text="4. Export to Alembic", icon="EXPORT")

@@ -34,6 +34,8 @@ class ObjectInfo:
     index_range: np.ndarray  # int64[N] — shared-pool vertex indices contributing to this object
     remap: np.ndarray  # int64[N] — shared_pool_index -> compact_local_index
     base_indices: np.ndarray  # int32[Mx3] — triangle indices in compact local space
+    material_names: List[str] = field(default_factory=list)  # local material names, in local-id order
+    face_material_ids: Optional[np.ndarray] = None  # uint16[M] — local material id per surviving triangle
 
 
 class BmcReader:
@@ -84,6 +86,13 @@ class BmcReader:
         self._primitives = bmc._unpack_primitive_table(
             static[offset:], self.header.primitive_count
         )
+        # Advance past the primitive table to reach the material name table.
+        for p in self._primitives:
+            offset += 2 + len(p.name.encode("utf-8")) + 12 + 4
+        self._materials = bmc._unpack_material_table(
+            static[offset:], self.header.material_count
+        )
+        self._material_names = [m.name for m in self._materials]
 
     def _build_objects(self):
         """Group primitives by flexmesh name prefix, dedup indices from shared pool."""
@@ -98,12 +107,17 @@ class BmcReader:
 
         def _dedup_object(member_indices: List[int], name: str) -> ObjectInfo:
             all_shared_idx = []
+            tri_mat_global: List[np.ndarray] = []  # global material id per triangle
             for mi in member_indices:
                 p = self._primitives[mi]
                 shared = self._index_data[p.start_index:p.start_index + p.index_count].ravel().astype(np.int64)
                 all_shared_idx.append(shared)
+                n_tri = p.index_count // 3
+                tri_mat_global.append(np.full(n_tri, p.material_id, dtype=np.int64))
 
             concat = np.concatenate(all_shared_idx) if len(all_shared_idx) > 1 else all_shared_idx[0]
+            tri_mat = (np.concatenate(tri_mat_global)
+                       if len(tri_mat_global) > 1 else tri_mat_global[0])
 
             # Deduplicate — multiple material-split primitives may reference same vertices
             unique_idx, inverse = np.unique(concat, return_inverse=True)
@@ -118,6 +132,20 @@ class BmcReader:
             n_degen = int((~valid).sum())
             if n_degen:
                 compact_idx = compact_idx[valid]
+                tri_mat = tri_mat[valid]
+
+            # Build this object's LOCAL material name list + per-face LOCAL ids.
+            # (Global ids are compacted to a small per-object set so Blender gets
+            #  one material slot per distinct material this object actually uses.)
+            used_global = sorted({int(g) for g in np.unique(tri_mat)})
+            g2l = {g: l for l, g in enumerate(used_global)}
+            local_names = [
+                self._material_names[g] if 0 <= g < len(self._material_names)
+                else f"material_{g}"
+                for g in used_global
+            ]
+            face_local = np.array([g2l[int(g)] for g in tri_mat], dtype=np.uint16) \
+                if len(tri_mat) else np.empty(0, dtype=np.uint16)
 
             return ObjectInfo(
                 name=name,
@@ -126,6 +154,8 @@ class BmcReader:
                 index_range=unique_idx,
                 remap=np.arange(n_unique, dtype=np.int64),  # direct: local -> shared pool index
                 base_indices=compact_idx,
+                material_names=local_names,
+                face_material_ids=face_local,
             )
 
         # Process flexmesh groups
@@ -174,6 +204,15 @@ class BmcReader:
         if self._uv_data is not None:
             return self._uv_data[obj.index_range].copy()
         return None
+
+    def base_material_names(self, name: str) -> List[str]:
+        """Local material names for this object, in local-id order."""
+        return list(self._objects[name].material_names)
+
+    def base_material_ids(self, name: str) -> np.ndarray:
+        """Per-face LOCAL material id (uint16), one per surviving triangle."""
+        fm = self._objects[name].face_material_ids
+        return fm.copy() if fm is not None else np.empty(0, dtype=np.uint16)
 
     def frame_positions(self, frame_index: int, name: str) -> np.ndarray:
         obj = self._objects[name]

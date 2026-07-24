@@ -43,7 +43,9 @@ def test_positions_roundtrip_exactly(tmp_path):
     glb = build_glb([(name, positions, indices)])
     doc = read_glb(_write(tmp_path, glb))
 
-    np.testing.assert_array_equal(doc.objects[0].positions, positions)
+    # read_glb applies glTF Y-up → Blender Z-up: (x, y, z) -> (x, -z, y)
+    expected = np.stack([positions[:, 0], -positions[:, 2], positions[:, 1]], axis=1).astype(np.float32)
+    np.testing.assert_array_equal(doc.objects[0].positions, expected)
     np.testing.assert_array_equal(doc.objects[0].indices.reshape(-1), indices.reshape(-1))
 
 

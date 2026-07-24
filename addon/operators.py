@@ -211,11 +211,24 @@ class BEAMNG_OT_import_cache(Operator):
             playback = CachePlayback(reader, log_path=log_path, chunk_map=chunk_map)
             playback.build_scene()
 
-            fps = context.scene.render.fps or 60
-            frame_start = int(context.scene.beamng.start_second * fps)
+            # Two INDEPENDENT knobs (see runtime.frame_handler for the mapping):
+            #   * playback_fps = animation SPEED (captured/source frames per real
+            #     second — the "15 that felt right").
+            #   * output_fps   = scene.render.fps (render/viewport smoothness).
+            # The handler maps cache frames by TIME, so the sequence lasts
+            # frame_count/playback_fps seconds regardless of output_fps, and the
+            # viewport preview matches the final render exactly (no more "60fps
+            # render is 4x too fast").
+            playback_fps = max(1, int(getattr(context.scene.beamng, "playback_fps", 24)))
+            output_fps = max(1, int(getattr(context.scene.beamng, "output_fps", 60)))
+            context.scene.render.fps = output_fps
+            context.scene.render.fps_base = 1.0
+            frame_start = int(context.scene.beamng.start_second * output_fps)
             frame_handler.attach(
                 playback,
                 frame_start=frame_start,
+                playback_fps=playback_fps,
+                output_fps=output_fps,
             )
             playback.close_log()
 

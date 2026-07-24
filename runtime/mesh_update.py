@@ -125,36 +125,21 @@ def _write_positions(mesh: "bpy.types.Mesh", flat: np.ndarray,
     110 ms vs 0.9 ms/frame for the E180 at 550K verts).  Prefer the attribute
     API; fall back to the legacy path on older Blender that lacks it.
 
-    **Critical:** writing the ``position`` attribute does NOT invalidate the
-    object-level bounding box (unlike the legacy ``vertices.co`` channel).  A
-    stale bbox makes Blender's viewport frustum-cull the object on camera
-    rotation — parts vanish until you toggle edit mode (which forces a bbox
-    recompute).  ``mesh.transform(Identity)`` re-flags the bbox as dirty at
-    C speed (~2 ms for 550K verts) without altering positions.  See BUGS.md #8.
+    After writing positions, ``mesh.update()`` recomputes normals, edges, and
+    the bounding box so that faces are visible from all camera angles
+    (prevents clipping / disappearing faces on rotated views).  The depsgraph
+    flags ensure modifier stacks (Weighted Normal, etc.) also re-evaluate.
     """
     attr = mesh.attributes.get("position")
     if attr is not None:
         attr.data.foreach_set("vector", flat)
-        # Force the bounding box dirty-flag that the attribute API skips.
-        mesh.transform(_IDENTITY_4X4)
     else:  # pragma: no cover - only on pre-4.x Blender
         mesh.vertices.foreach_set("co", flat)
-    mesh.update()  # recompute normals + edge data + bbox (C-level, <1ms)
 
+    mesh.update()  # recompute normals + edge data + bbox
     mesh.update_tag()  # notify depsgraph that mesh data changed
-
-    # **Critical when the user has applied "Shade Auto Smooth" (or any
-    # modifier).** In Blender 4.1+ Shade Auto Smooth adds a "Smooth by Angle"
-    # Geometry Nodes modifier, so the object's *displayed* geometry is the
-    # modifier's evaluated output, not the base mesh we just wrote to. The
-    # interactive viewport evaluates the depsgraph incrementally — it only
-    # re-runs what is tagged dirty. Tagging the *mesh* alone is enough when the
-    # object has no modifiers, but the modifier's evaluated cache is keyed to
-    # the *object*: without ``obj.update_tag()`` it stays frozen at frame 0 and
-    # the animation appears static after auto-smooth is applied. (Headless
-    # ``frame_set`` hides this because it forces a full scene re-evaluation.)
     if obj is not None:
-        obj.update_tag()
+        obj.update_tag()  # force modifier stack re-evaluation
 
 
 def _finalize_mesh(mesh: "bpy.types.Mesh") -> None:
@@ -612,6 +597,16 @@ class CachePlayback:
         positions = self._gltf_to_blender(raw)
         faces = self.reader.base_indices(name)
         mesh = _mesh_from_data(positions, faces, name)
+        # Apply UVs + per-face material slots so the part is ready for texture
+        # assignment in Blender (individual/non-chunked path).  Guarded so a
+        # cache without material data still imports cleanly.
+        try:
+            uvs = self.reader.base_uvs(name)
+            matnames = self.reader.base_material_names(name)
+            matids = self.reader.base_material_ids(name)
+            _apply_uvs_and_materials(mesh, uvs, matnames, matids)
+        except Exception as exc:  # pragma: no cover - defensive
+            self._log(f"  UV/material apply skipped for {name}: {exc}")
         _finalize_mesh(mesh)
         self._log_mesh_stats("CREATE", name, mesh)
         return mesh
@@ -679,23 +674,29 @@ class CachePlayback:
 
     def _set_frame_individual(self, frame: int) -> None:
         """Original per-object position update (96 calls)."""
+        logging = self._log_fh is not None
         self._apply_transform(frame)
         for name, obj in self._objects.items():
             raw = self.reader.frame_positions(name, frame)
-            self._log_bounds("RAW_GLTF", name, frame, raw)
             positions = self._gltf_to_blender(raw)
-            self._log_bounds("AFTER_XFORM", name, frame, positions)
             flat = np.ascontiguousarray(positions, dtype=np.float32).reshape(-1)
             _write_positions(obj.data, flat, obj)
 
-            got = np.empty(len(obj.data.vertices) * 3, dtype=np.float32)
-            obj.data.vertices.foreach_get("co", got)
-            got = got.reshape(-1, 3)
-            self._log_bounds("BLENDER", name, frame, got)
+            # Diagnostic read-back: only when logging is enabled.  Reading all
+            # ~550K verts back with foreach_get every frame is a large hidden
+            # per-frame cost that both slows playback and makes fps uneven, so
+            # it MUST stay behind the log guard (the hot path skips it).
+            if logging:
+                self._log_bounds("RAW_GLTF", name, frame, raw)
+                self._log_bounds("AFTER_XFORM", name, frame, positions)
+                got = np.empty(len(obj.data.vertices) * 3, dtype=np.float32)
+                obj.data.vertices.foreach_get("co", got)
+                self._log_bounds("BLENDER", name, frame, got.reshape(-1, 3))
 
         for name, obj in self._dynamic_objects.items():
             positions, indices = self.reader.frame_dynamic_geometry(name, frame)
-            self._log_bounds("RAW_GLTF", name, frame, positions)
+            if logging:
+                self._log_bounds("RAW_GLTF", name, frame, positions)
             if len(positions) == 0:
                 obj.hide_viewport = True
                 obj.hide_render = True
@@ -708,22 +709,22 @@ class CachePlayback:
             new_vc = positions.shape[0]
             existing_fc = len(mesh.polygons)
             new_fc = indices.shape[0]
+            pos_blender = self._gltf_to_blender(positions.copy())
             if existing_vc != new_vc or existing_fc != new_fc:
-                pos_blender = self._gltf_to_blender(positions.copy())
-                self._log_bounds("AFTER_XFORM", name, frame, pos_blender)
                 mesh.clear_geometry()
                 _fill_mesh_via_bmesh(mesh, pos_blender, indices)
                 _finalize_mesh(mesh)
                 mesh.update_tag()
+                obj.update_tag()
             else:
-                pos_blender = self._gltf_to_blender(positions.copy())
-                self._log_bounds("AFTER_XFORM", name, frame, pos_blender)
                 flat = np.ascontiguousarray(pos_blender, dtype=np.float32).reshape(-1)
                 _write_positions(mesh, flat, obj)
 
-            got = np.empty(len(mesh.vertices) * 3, dtype=np.float32)
-            mesh.vertices.foreach_get("co", got)
-            self._log_bounds("BLENDER", name, frame, got.reshape(-1, 3))
+            if logging:
+                self._log_bounds("AFTER_XFORM", name, frame, pos_blender)
+                got = np.empty(len(mesh.vertices) * 3, dtype=np.float32)
+                mesh.vertices.foreach_get("co", got)
+                self._log_bounds("BLENDER", name, frame, got.reshape(-1, 3))
 
     def _set_frame_chunked(self, frame: int) -> None:
         """Update chunk meshes (one foreach_set per chunk)."""
@@ -762,6 +763,7 @@ class CachePlayback:
                 _fill_mesh_via_bmesh(mesh, pos_blender, indices)
                 _finalize_mesh(mesh)
                 mesh.update_tag()
+                obj.update_tag()
             else:
                 pos_blender = self._gltf_to_blender(positions.copy())
                 self._log_bounds("AFTER_XFORM", name, frame, pos_blender)

@@ -18,7 +18,7 @@ No welding, no reconstruction, no calibration, no quaternion guessing.
 
 import struct
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -36,16 +36,44 @@ class CaptureBuildError(CacheBuildError):
 
 
 def _pool_to_blender(pos: np.ndarray) -> np.ndarray:
-    """GPU pool space (Y-up, left-handed) -> Blender/physics space (Z-up).
+    """GPU pool space (Y-up, left-handed) -> Blender space (Z-up), EXACTLY as
+    the stock glTF Sequence Exporter maps it.
+
+    THE DRAG FIX (2026-07-24, proven on test_drag.bmc)
+    --------------------------------------------------
+    ``verticesGet()`` returns each vertex **world-oriented** (the full rigid
+    rotation is baked in) but expressed **origin-relative in the pool frame**,
+    i.e. relative to the vehicle's live ``getPosition()``.  The rigid motion is
+    re-applied as a single verbatim ``getPosition()`` translation (physics Z-up
+    == Blender Z-up), mirroring the exporter's root-node translation.
+
+    For a DETACHED part that comes to rest in the world, its pool coordinates
+    must *recede* by exactly the vehicle's motion so that
+    ``map(pool) + getPosition`` stays constant (the part does not drag).  That
+    cancellation only happens when ``map`` sends the pool frame into the SAME
+    axis frame the translation lives in.
+
+    The exporter achieves this in two steps that compose to a single map:
+      1. dump ``verticesGet()`` verbatim into glTF (Y-up),
+      2. Blender's glTF importer converts glTF Y-up -> Blender Z-up as
+         ``(x, y, z) -> (x, -z, y)``.
+    Net:  ``blender = (pool_x, -pool_z, pool_y)``.
+
+    The OLD map ``(pool_z, pool_x, pool_y)`` yawed the mesh 90 deg relative to
+    the translation frame (measured: body nose 88 deg off ``getDirectionVector``
+    instead of ~0 deg), so a detached part's recession pointed perpendicular to
+    ``getPosition`` and never cancelled -> the part was dragged along with the
+    car.  The exporter map puts the nose 0.7 deg on heading and cancels the
+    recession, so rested parts stay put.
 
     Pool axes:  X = length (forward), Y = up, Z = width (right)
-    Blender:    X = right,           Y = forward, Z = up
-
-    i.e.  blender = (pool_z, pool_x, pool_y)
+    Blender:    X = right(-ish),      Y = forward-ish, Z = up
+    (The exact BeamNG world-axis labels don't matter; what matters is that this
+    is the SAME frame ``getPosition()`` is reported in, so translation cancels.)
     """
     out = np.empty_like(pos)
-    out[:, 0] = pos[:, 2]
-    out[:, 1] = pos[:, 0]
+    out[:, 0] = pos[:, 0]
+    out[:, 1] = -pos[:, 2]
     out[:, 2] = pos[:, 1]
     return out
 
@@ -67,6 +95,103 @@ def _world_to_blender(pos: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(pos, dtype=np.float32)
 
 
+def _weld_object(
+    positions: np.ndarray,
+    indices: Optional[np.ndarray],
+    uvs: Optional[np.ndarray],
+    epsilon: float = 1e-5,
+) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray], np.ndarray]:
+    """Remove exact-duplicate vertices (position-only, tight epsilon).
+
+    Snaps positions to a grid of ``epsilon`` precision, finds unique rows,
+    and builds a remap table.  Only vertices at nearly identical positions
+    are merged — UV seams, glass interiors, and headlight faces are safe.
+
+    Returns:
+      * welded_positions  (K, 3) float32 — K unique vertices
+      * welded_indices    (F, 3) int32   — remapped triangle indices (or None)
+      * welded_uvs        (K, 2) float32 — UVs of the kept vertices (or None)
+      * remap             (N,) int32     — old_vertex_id -> new_vertex_id
+    """
+    n = positions.shape[0]
+    if n == 0:
+        return positions, indices, uvs, np.zeros(0, dtype=np.int32)
+
+    # Snap to grid and find unique rows
+    snapped = np.round(positions / epsilon) * epsilon
+    _, unique_ids, inverse = np.unique(
+        snapped, axis=0, return_index=True, return_inverse=True
+    )
+    remap = inverse.astype(np.int32)
+
+    k = unique_ids.shape[0]
+    welded_positions = positions[unique_ids].astype(np.float32, copy=False)
+
+    welded_indices = None
+    if indices is not None:
+        welded_indices = remap[indices]
+
+    welded_uvs = None
+    if uvs is not None and uvs.size > 0:
+        welded_uvs = uvs[unique_ids].astype(np.float32, copy=False)
+
+    return welded_positions, welded_indices, welded_uvs, remap
+
+
+def _weld_keep_remap_multiframe(
+    pos_frames: List[np.ndarray],
+    epsilon: float = 1e-4,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Cross-frame-safe vertex weld: merge only vertices that stay coincident
+    across EVERY sampled frame.
+
+    THE WINDSHIELD FIX (2026-07-24)
+    -------------------------------
+    The old single-frame grid-snap weld merged vertices that were coincident in
+    ONE pose (e.g. a windshield edge touching the body at rest).  During the
+    crash those points separate, but the weld had already fused them into one —
+    so the surviving vertex was pulled between two diverging positions, creating
+    the stretched spikes.  A manual Blender "merge by distance" only looked fine
+    because it was applied to a single pose.
+
+    This weld computes, per vertex, a *multi-frame signature* (its snapped
+    position in every sampled frame) and merges only vertices whose signatures
+    are identical — i.e. points that never separate anywhere in the animation.
+    A windshield vertex and a body vertex that ever move apart get different
+    signatures and are kept distinct.  Safe by construction.
+
+    Args:
+      pos_frames: list of (N,3) float arrays, one per sampled frame, all in the
+                  SAME vertex order (this object's local order).
+      epsilon:    merge distance (grid cell size).
+
+    Returns:
+      keep:  (K,) int64 — indices of the vertices to KEEP (first of each group)
+      remap: (N,) int64 — old local vertex id -> new welded id in [0, K)
+    """
+    n = pos_frames[0].shape[0]
+    if n == 0:
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
+
+    # Incrementally refine group labels frame by frame (memory O(N), never holds
+    # all frames at once).  Two verts keep the same label only while they share
+    # the same snapped cell in every processed frame.
+    labels = np.zeros(n, dtype=np.int64)
+    for pos in pos_frames:
+        snapped = np.round(pos / epsilon).astype(np.int64)
+        # combine current label with this frame's cell -> refined label
+        combined = np.column_stack([labels, snapped])
+        _, labels = np.unique(combined, axis=0, return_inverse=True)
+    labels = labels.astype(np.int64).ravel()
+
+    # keep = first occurrence of each final label; remap via label re-index.
+    uniq, keep, inverse = np.unique(
+        labels, return_index=True, return_inverse=True
+    )
+    remap = inverse.astype(np.int64)
+    return keep.astype(np.int64), remap
+
+
 class CacheBuilder:
     def __init__(self, sequence_dir: Path, out_path: Path):
         self.sequence_dir = Path(sequence_dir)
@@ -77,17 +202,19 @@ class CacheBuilder:
         self,
         capture_bmc_path: str | None = None,
         manifest: "SequenceManifest | None" = None,
+        weld: bool = True,
         workers: int = 1,
         **_ignored,
     ) -> "SequenceManifest":
         src = Path(capture_bmc_path) if capture_bmc_path else self.sequence_dir
         if src.is_dir() or (manifest is not None):
-            return self.build_from_gltf(manifest=manifest, workers=workers)
-        return self.build_from_capture(str(src))
+            return self.build_from_gltf(manifest=manifest, weld=weld, workers=workers)
+        return self.build_from_capture(str(src), weld=weld)
 
     def build_from_gltf(
         self,
         manifest: "SequenceManifest | None" = None,
+        weld: bool = True,
         workers: int = 1,
     ) -> "SequenceManifest":
         """Build a BVC from a directory of per-frame GLB files.
@@ -131,6 +258,7 @@ class CacheBuilder:
 
         base_indices: Dict[str, np.ndarray] = {}
         base_uvs: Dict[str, np.ndarray] = {}
+        base_positions: Dict[str, np.ndarray] = {}
         base_mat_names: Dict[str, List[str]] = {}
         base_face_mats: Dict[str, np.ndarray] = {}
         vcounts: Dict[str, int] = {}
@@ -142,6 +270,9 @@ class CacheBuilder:
                 raise CacheBuildError(
                     f"stable object {name!r} not found in frame 0"
                 )
+            base_positions[name] = np.ascontiguousarray(
+                obj.positions, dtype=np.float32,
+            )
             base_indices[name] = (
                 np.ascontiguousarray(obj.indices, dtype=np.int32)
                 if obj.indices is not None
@@ -160,6 +291,36 @@ class CacheBuilder:
             )
             vcounts[name] = obj.vertex_count
             face_counts[name] = obj.face_count
+
+        # --- Weld pass: merge near-duplicate vertices per object ----------
+        weld_remaps: Dict[str, np.ndarray] = {}
+        total_before = sum(vcounts[n] for n in obj_names)
+        if weld:
+            for name in obj_names:
+                wpos, widx, wuv, remap = _weld_object(
+                    base_positions[name], base_indices.get(name),
+                    base_uvs.get(name),
+                )
+                base_positions[name] = wpos
+                if widx is not None:
+                    base_indices[name] = widx
+                if wuv is not None:
+                    base_uvs[name] = wuv
+                weld_remaps[name] = remap
+                vcounts[name] = wpos.shape[0]
+                face_counts[name] = widx.shape[0] if widx is not None else wpos.shape[0] // 3
+            total_after = sum(vcounts[n] for n in obj_names)
+            print(
+                f"[BeamNG]   weld: {total_before} -> {total_after} vertices "
+                f"({total_before - total_after} merged)",
+                flush=True,
+            )
+        else:
+            total_after = total_before
+            print(
+                f"[BeamNG]   weld disabled, keeping {total_after} vertices",
+                flush=True,
+            )
 
         # --- Layout computation ----------------------------------------
         frame_vertex_offset: Dict[str, int] = {}
@@ -309,7 +470,13 @@ class CacheBuilder:
                         fh.write(b"\x00" * vcounts[name] * 12)
                         continue
                     pos = np.ascontiguousarray(positions, dtype=np.float32)
-                    if pos.shape[0] != vcounts[name]:
+                    remap = weld_remaps.get(name)
+                    if remap is not None and remap.shape[0] != vcounts[name]:
+                        # Welded: scatter raw positions into compact slots
+                        welded = np.zeros((vcounts[name], 3), dtype=np.float32)
+                        welded[remap] = pos
+                        pos = welded
+                    elif pos.shape[0] != vcounts[name]:
                         raise CacheBuildError(
                             f"vertex count mismatch for {name!r} "
                             f"in frame {fi}: expected {vcounts[name]}, "
@@ -362,7 +529,7 @@ class CacheBuilder:
                         base_index_offset=base_index_offset[name],
                         index_count=index_count[name],
                         frame_vertex_offset=frame_vertex_offset[name],
-                        welded=False,
+                        welded=(weld and name in weld_remaps),
                         uv_offset=uv_off[name],
                         material_offset=mat_off[name],
                     )
@@ -376,13 +543,21 @@ class CacheBuilder:
         )
         return manifest
 
-    def build_from_capture(self, capture_bmc_path: str) -> "SequenceManifest":
+    def build_from_capture(self, capture_bmc_path: str,
+                           weld: bool = False) -> "SequenceManifest":
         """Build a BVC directly from a BMC v1 ``capture.bmc`` file.
 
-        Uses the shared-pool reader (BmcReader). No weld, no clamp, no
-        repair.  All objects are topology-stable.  Positions are converted
-        from pool space to Blender space via ``_pool_to_blender``; the rigid
-        transform is copied through byte-for-byte.
+        Uses the shared-pool reader (BmcReader).  All objects are
+        topology-stable.  Positions are converted from pool space to Blender
+        space via ``_pool_to_blender``; the rigid transform is copied through
+        byte-for-byte.  Materials are carried from the BMC primitive/material
+        tables so each part gets its real material slots.
+
+        ``weld`` (default False): when True, run the CROSS-FRAME-SAFE weld
+        (:func:`_weld_keep_remap_multiframe`) that merges only vertices which
+        stay coincident in EVERY sampled frame — collapsing seam-split
+        duplicates without breaking parts (like the windshield) whose edges
+        separate during the crash.
         """
         with BmcReader(capture_bmc_path) as reader:
             total_frames = reader.frame_count()
@@ -397,6 +572,8 @@ class CacheBuilder:
 
             base_indices: Dict[str, np.ndarray] = {}
             base_uvs: Dict[str, np.ndarray] = {}
+            base_matnames: Dict[str, List[str]] = {}
+            base_matids: Dict[str, np.ndarray] = {}
             vcounts: Dict[str, int] = {}
             face_counts: Dict[str, int] = {}
             index_range: Dict[str, np.ndarray] = {}
@@ -416,16 +593,64 @@ class CacheBuilder:
                     if uvs is not None
                     else np.zeros((info.vertex_count, 2), dtype=np.float32)
                 )
+                base_matnames[name] = reader.base_material_names(name)
+                base_matids[name] = reader.base_material_ids(name)
                 vcounts[name] = info.vertex_count
                 face_counts[name] = info.index_count
-                index_range[name] = info.index_range
+                index_range[name] = np.asarray(info.index_range, dtype=np.int64)
 
-                topo_hash = TopologyHasher.hash_indices(info.vertex_count, idx)
+            # --- CROSS-FRAME-SAFE WELD (optional) --------------------------
+            # Merge seam-split duplicate vertices that stay coincident in EVERY
+            # sampled frame.  Parts whose edges separate during the crash (e.g.
+            # the windshield) keep distinct vertices and are never spiked.
+            if weld:
+                n_sample = min(total_frames, 16)
+                sample_frames = (
+                    np.linspace(0, total_frames - 1, n_sample).astype(int)
+                    if total_frames > 1 else np.array([0])
+                )
+                # Read each sampled frame's shared pool once; slice per object.
+                sampled_shared = [
+                    reader._read_shared_positions(int(fi)).astype(np.float32)
+                    for fi in sample_frames
+                ]
+                total_before = sum(vcounts[n] for n in obj_names)
+                for name in obj_names:
+                    ir = index_range[name]
+                    per_frame = [sh[ir] for sh in sampled_shared]
+                    keep, remap = _weld_keep_remap_multiframe(per_frame, epsilon=1e-4)
+                    if len(keep) == vcounts[name]:
+                        continue  # nothing merged for this object
+                    # Rewrite geometry with welded vertex set.
+                    index_range[name] = ir[keep]
+                    base_uvs[name] = base_uvs[name][keep]
+                    new_idx = remap[base_indices[name]].astype(np.int32)
+                    # Drop triangles that became degenerate after merging.
+                    a, b, c = new_idx[:, 0], new_idx[:, 1], new_idx[:, 2]
+                    valid = (a != b) & (b != c) & (a != c)
+                    new_idx = new_idx[valid]
+                    fmids = base_matids[name]
+                    if fmids is not None and len(fmids) == len(valid):
+                        base_matids[name] = fmids[valid]
+                    base_indices[name] = new_idx
+                    vcounts[name] = int(len(keep))
+                    face_counts[name] = int(new_idx.shape[0])
+                total_after = sum(vcounts[n] for n in obj_names)
+                print(
+                    f"[BeamNG]   weld (cross-frame safe): "
+                    f"{total_before} -> {total_after} vertices "
+                    f"({total_before - total_after} merged)",
+                    flush=True,
+                )
+
+            for name in obj_names:
+                topo_hash = TopologyHasher.hash_indices(
+                    vcounts[name], base_indices[name])
                 manifest.objects[name] = ObjectSignature(
                     name=name,
-                    vertex_count=info.vertex_count,
-                    edge_count=_edge_count(idx, info.index_count),
-                    face_count=info.index_count,
+                    vertex_count=vcounts[name],
+                    edge_count=_edge_count(base_indices[name], face_counts[name]),
+                    face_count=face_counts[name],
                     topology_hash=topo_hash,
                     cacheable=True,
                 )
@@ -486,6 +711,29 @@ class CacheBuilder:
 
             uv_blocks_offset = off
 
+            # --- Per-object materials (from the BMC primitive/material tables) --
+            # The capture records, per primitive, a material id into a 90-entry
+            # name table.  The reader compacts these to a per-object local set +
+            # a per-face local id.  We register the names globally (dedup) and
+            # write one material block per object so Blender gets a proper
+            # material slot per part — required for texture assignment later.
+            obj_local_names: Dict[str, List[str]] = {}
+            obj_face_ids: Dict[str, np.ndarray] = {}
+            for name in current_stable:
+                lnames = base_matnames.get(name) or []
+                fids = base_matids.get(name)
+                if not lnames:
+                    lnames = ["__no_material__"]
+                    fids = np.zeros(face_counts[name], dtype=np.uint16)
+                # Register globally and remember each name's global id.
+                for mn in lnames:
+                    _ensure_name(mn)
+                obj_local_names[name] = lnames
+                # Guard: face-id array must match this object's face count.
+                if fids is None or len(fids) != face_counts[name]:
+                    fids = np.zeros(face_counts[name], dtype=np.uint16)
+                obj_face_ids[name] = fids
+
             mat_table_bytes = binary.pack_material_name_table(all_material_names)
             material_table_offset = off
             off += len(mat_table_bytes)
@@ -493,9 +741,9 @@ class CacheBuilder:
             mat_block_bytes: Dict[str, bytes] = {}
             mat_off: Dict[str, int] = {}
             for name in current_stable:
-                mnames = ["__no_material__"]
-                global_ids = [_ensure_name(mn) for mn in mnames]
-                mids = np.zeros(face_counts[name], dtype=np.uint16)
+                lnames = obj_local_names[name]
+                global_ids = [name_index[mn] for mn in lnames]
+                mids = obj_face_ids[name]
                 mb = binary.pack_material_block(global_ids, mids)
                 mat_block_bytes[name] = mb
                 mat_off[name] = off

@@ -9,7 +9,8 @@
 --
 --    * Rigid motion is captured SEPARATELY (so it can drive a Blender parent
 --      empty and be split from the deformation animation):
---          - translation = veh:getPosition()          (physics space)
+--          - translation = veh:getPosition() - originWorld  (origin-relative,
+--                            exactly like the exporter's setOrigin() magic)
 --          - forward     = veh:getDirectionVector()
 --          - up          = veh:getDirectionVectorUp()
 --      Stored raw in physics space; the builder reconstructs the orthonormal
@@ -48,6 +49,27 @@ local bmcPath     = nil
 local maxFrames   = 0
 local frameCount  = 0
 local vehId       = nil
+
+-- --- Origin (the glTF Sequence Exporter's "magic", ported faithfully) --------
+--  The stock exporter (gltfSequenceExporter/export.lua) places the whole
+--  vehicle with a SINGLE root-node TRANSLATION and NO rotation:
+--      finalRootNode.translation = {t.x, t.z, -t.y}   -- export.lua:901
+--  where  t = veh:getPosition() - originWorld  (origin set by setOrigin()).
+--  Every flexmesh's verticesGet() is dumped VERBATIM as a child of that root;
+--  all rotation + deformation + PART DETACHMENT is already baked into those
+--  local vertices (the flexbody skinning tracks the live node positions).  A
+--  detached part that comes to rest recedes in local space as the car drives
+--  on, so the single translation places it back at its true world rest spot —
+--  it does NOT get dragged.  Subtracting the spawn origin keeps coordinates
+--  small so f32 precision stays tight (the exporter's real reason for it).
+--
+--  We store  (getPosition() - originWorld)  raw in physics space; the builder
+--  applies it translation-only to the parent empty (identity rotation), which
+--  is byte-for-byte the exporter's placement in a different, self-consistent
+--  axis frame (physics Z-up == Blender Z-up; the pool->Blender permutation on
+--  the verts lines the two up).
+local originWorld = {x = 0.0, y = 0.0, z = 0.0}
+local originSet   = false
 
 local totalVerts  = 0
 local totalIndices = 0
@@ -97,6 +119,14 @@ function M.start(path, frames)
   maxFrames = frames or 300
   frameCount = 0
   vehId = veh:getId()
+
+  -- Set the origin to the vehicle's spawn position, exactly like the stock
+  -- exporter's setOrigin().  All per-frame translations are stored relative to
+  -- this, so the car starts at ~origin in Blender and coordinates stay small.
+  local p0 = veh:getPosition()
+  originWorld = {x = p0.x, y = p0.y, z = p0.z}
+  originSet = true
+  log('I', logTag, string.format('origin set at (%.2f, %.2f, %.2f)', p0.x, p0.y, p0.z))
 
   local meshInfo = GPUMesh.bng_getGPUMesh(vehId)
   if not meshInfo then log('E', logTag, 'GPUMesh unavailable'); return false end
@@ -221,10 +251,16 @@ local function dumpWorldFrame()
     -- Stored raw in physics space; the builder reconstructs the orthonormal
     -- basis and drives a parent empty (mirroring export.lua's intent of
     -- keeping object motion separable from the mesh animation).
+    -- Origin-relative translation — the exporter's magic (export.lua:1104-1106).
+    -- Detached parts are NOT dragged: their world rest position is already in
+    -- the local verticesGet() pool, and this single translation only re-seats
+    -- the whole (already-correct) pool back into world space around the spawn.
     local p = veh:getPosition()
     local d = veh:getDirectionVector()
     local u = veh:getDirectionVectorUp()
-    writeF32(bmcFile, p.x); writeF32(bmcFile, p.y); writeF32(bmcFile, p.z)
+    writeF32(bmcFile, p.x - originWorld.x)
+    writeF32(bmcFile, p.y - originWorld.y)
+    writeF32(bmcFile, p.z - originWorld.z)
     writeF32(bmcFile, d.x); writeF32(bmcFile, d.y); writeF32(bmcFile, d.z)
     writeF32(bmcFile, u.x); writeF32(bmcFile, u.y); writeF32(bmcFile, u.z)
     bmcFile:flush()
