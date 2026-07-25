@@ -150,6 +150,42 @@ class BEAMNG_OT_build_cache(Operator):
         from importer.scanner import SequenceManifest, SequenceScanner
         from importer.cache_builder import CacheBuilder
 
+        weld = bool(context.scene.beamng.weld_cache)
+
+        # --- BMC pipeline routing ------------------------------------------
+        # If the folder holds a .bmc capture (not a .glb sequence), build via
+        # build_from_capture so the cross-frame-safe weld actually runs.  The
+        # GLB path (below) never reaches build_from_capture, so without this a
+        # BMC user's "Weld duplicate vertices" checkbox is a no-op.
+        bmc_files = [f for f in os.listdir(directory) if f.lower().endswith(".bmc")]
+        if bmc_files and not any(
+            f.lower().endswith(".glb") for f in os.listdir(directory)
+        ):
+            bmc_path = os.path.join(directory, sorted(bmc_files)[0])
+            sys.stderr.write(
+                f"[BeamNG] BMC capture found ({bmc_files[0]}), "
+                f"building via build_from_capture (weld={weld})\n"
+            )
+            sys.stderr.flush()
+            try:
+                manifest = CacheBuilder(directory, out).build_from_capture(
+                    bmc_path, weld=weld)
+            except Exception as exc:
+                details = traceback.format_exc()
+                sys.stderr.write(f"[BeamNG] BUILD CACHE ERROR:\n{details}\n")
+                sys.stderr.flush()
+                self.report({"ERROR"}, f"Cache build failed: {exc}")
+                return {"CANCELLED"}
+            sys.stderr.write("[BeamNG] BUILD CACHE DONE\n")
+            sys.stderr.flush()
+            self.report(
+                {"INFO"},
+                f"Built BMC cache: {out} "
+                f"({manifest.frame_count} frames, "
+                f"{len(manifest.stable_objects)} objects)",
+            )
+            return {"FINISHED"}
+
         # Try loading stashed manifest; fall back to scan.
         manifest = None
         stash = _manifest_stash(directory)
@@ -169,7 +205,6 @@ class BEAMNG_OT_build_cache(Operator):
             sys.stderr.flush()
             manifest = SequenceScanner(directory).scan(workers=workers)
 
-        weld = bool(context.scene.beamng.weld_cache)
         try:
             manifest = CacheBuilder(directory, out).build(
                 manifest=manifest, weld=weld, workers=workers)
