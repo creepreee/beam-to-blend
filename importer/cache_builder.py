@@ -78,6 +78,68 @@ def _pool_to_blender(pos: np.ndarray) -> np.ndarray:
     return out
 
 
+def _quat_to_matrix(q: np.ndarray) -> np.ndarray:
+    """Unit quaternion (xyzw) -> 3x3 rotation matrix (float64)."""
+    x, y, z, w = (float(q[0]), float(q[1]), float(q[2]), float(q[3]))
+    n = x * x + y * y + z * z + w * w
+    if n < 1e-12:
+        return np.eye(3, dtype=np.float64)
+    s = 2.0 / n
+    return np.array([
+        [1 - s * (y * y + z * z), s * (x * y - z * w),     s * (x * z + y * w)],
+        [s * (x * y + z * w),     1 - s * (x * x + z * z), s * (y * z - x * w)],
+        [s * (x * z - y * w),     s * (y * z + x * w),     1 - s * (x * x + y * y)],
+    ], dtype=np.float64)
+
+
+# glTF Y-up -> Blender Z-up permutation (x, y, z) -> (x, -z, y), the exact
+# transform Blender's native glTF importer applies.  Used to bake props into the
+# same Blender space the flexmesh pool lands in.
+_GLTF_TO_BLENDER3 = np.array([
+    [1, 0, 0],
+    [0, 0, -1],
+    [0, 1, 0],
+], dtype=np.float64)
+
+
+def _prop_to_blender_frozen(
+    local_verts: np.ndarray,
+    position: np.ndarray,
+    rotation: np.ndarray,
+) -> np.ndarray:
+    """Bake one rigid prop's local verts into vehicle-origin-relative Blender space.
+
+    Mirrors the stock exporter's prop placement (util/export.lua:411-412) exactly,
+    then applies the same glTF Y-up -> Blender Z-up conversion Blender's importer
+    uses, so props land in the SAME frame as the flexmesh pool (``_pool_to_blender``)
+    and can parent to the ``__root`` motion empty that carries ``getPosition()``.
+
+    Exporter placement (glTF space):
+        translation = (px, pz, -py)
+        rotation    = (-rx, -rz,  ry, rw)      # quaternion xyzw
+    So in glTF space:  v_gltf = R(q_gltf) @ v_local + t_gltf
+    Then Blender:      v_bl   = (x, -z, y) applied to v_gltf.
+
+    NOTE (unverified until a live capture): this assumes ``prop.position`` is
+    vehicle-origin-relative and ``verticesGet`` returns prop-local coords in the
+    same Y-up frame the exporter consumes.  Raw data is preserved in the .bmc, so
+    if props land wrong this bake can be re-tuned and the BVC rebuilt WITHOUT a
+    fresh capture.
+    """
+    v = np.ascontiguousarray(local_verts, dtype=np.float64).reshape(-1, 3)
+    px, py, pz = float(position[0]), float(position[1]), float(position[2])
+    rx, ry, rz, rw = (float(rotation[0]), float(rotation[1]),
+                      float(rotation[2]), float(rotation[3]))
+
+    q_gltf = np.array([-rx, -rz, ry, rw], dtype=np.float64)
+    t_gltf = np.array([px, pz, -py], dtype=np.float64)
+    R = _quat_to_matrix(q_gltf)
+
+    v_gltf = (R @ v.T).T + t_gltf
+    v_bl = (_GLTF_TO_BLENDER3 @ v_gltf.T).T
+    return np.ascontiguousarray(v_bl, dtype=np.float32)
+
+
 def _world_to_blender(pos: np.ndarray) -> np.ndarray:
     """BeamNG absolute world space -> Blender space.
 
@@ -668,7 +730,66 @@ class CacheBuilder:
                     cacheable=True,
                 )
 
-            current_stable = obj_names
+            # --- Rigid props (frozen pose, separate section) ---------------
+            # Steering wheel, pedals, gauge needles and the indicator stalk are
+            # PROPMESHES, not flexmeshes, so they were missing from BMC caches.
+            # They live in a trailing .bmc section that never touched the pool
+            # vertex_count (so the flexmesh per-frame math is byte-identical).
+            # Bake each prop's frozen pose into Blender space here and emit it as
+            # a stable object with a CONSTANT per-frame position — it parents to
+            # the __root motion empty and thus rides along with the car.
+            prop_names: List[str] = []
+            prop_frozen_pos: Dict[str, np.ndarray] = {}
+            props = reader.props()
+            if props:
+                mat_names_global = getattr(reader, "_material_names", [])
+                name_counter: Dict[str, int] = {}
+                for prop in props:
+                    pname = prop.name or "prop"
+                    c = name_counter.get(pname, 0)
+                    name_counter[pname] = c + 1
+                    if c > 0:
+                        pname = f"{pname}_{c}"
+                    frozen = _prop_to_blender_frozen(
+                        prop.vertices, prop.position, prop.rotation)
+                    idx = np.ascontiguousarray(
+                        prop.indices, dtype=np.int32).reshape(-1, 3)
+                    # Drop degenerate triangles (mirror the flexmesh path).
+                    a, b, c2 = idx[:, 0], idx[:, 1], idx[:, 2]
+                    valid = (a != b) & (b != c2) & (a != c2)
+                    idx = idx[valid]
+                    mid = int(prop.material_id)
+                    mname = (mat_names_global[mid]
+                             if 0 <= mid < len(mat_names_global)
+                             else f"material_{mid}")
+                    vc = frozen.shape[0]
+                    base_indices[pname] = idx
+                    base_uvs[pname] = (
+                        np.ascontiguousarray(prop.uvs, dtype=np.float32)
+                        if prop.uvs is not None
+                        else np.zeros((vc, 2), dtype=np.float32)
+                    )
+                    base_matnames[pname] = [mname]
+                    base_matids[pname] = np.zeros(idx.shape[0], dtype=np.uint16)
+                    vcounts[pname] = vc
+                    face_counts[pname] = int(idx.shape[0])
+                    prop_frozen_pos[pname] = frozen
+                    prop_names.append(pname)
+                    manifest.objects[pname] = ObjectSignature(
+                        name=pname,
+                        vertex_count=vc,
+                        edge_count=_edge_count(idx, idx.shape[0]),
+                        face_count=int(idx.shape[0]),
+                        topology_hash=TopologyHasher.hash_indices(vc, idx),
+                        cacheable=True,
+                    )
+                print(
+                    f"[BeamNG]   props: added {len(prop_names)} rigid prop "
+                    f"object(s) (frozen pose)",
+                    flush=True,
+                )
+
+            current_stable = list(obj_names) + prop_names
             current_dynamic: List[str] = []
 
             # --- Layout computation ------------------------------------
@@ -842,9 +963,14 @@ class CacheBuilder:
                         pos_blender = np.ascontiguousarray(
                             _world_to_blender(shared_pos.astype(np.float32)))
                         for name in current_stable:
-                            obj_idx = index_range[name]
-                            pos = np.ascontiguousarray(
-                                pos_blender[obj_idx], dtype=np.float32)
+                            if name in prop_frozen_pos:
+                                # Frozen prop: constant world position every frame.
+                                pos = np.ascontiguousarray(
+                                    prop_frozen_pos[name], dtype=np.float32)
+                            else:
+                                obj_idx = index_range[name]
+                                pos = np.ascontiguousarray(
+                                    pos_blender[obj_idx], dtype=np.float32)
                             fh.write(pos.tobytes())
                         written = sum(vcounts[n] * 12 for n in current_stable)
                         pad = frame_block_size - written
@@ -905,8 +1031,15 @@ class CacheBuilder:
                         tf_blender = IDENTITY_ROT
 
                         for name in current_stable:
-                            obj_idx = index_range[name]
-                            pos = np.ascontiguousarray(pos_blender[obj_idx], dtype=np.float32)
+                            if name in prop_frozen_pos:
+                                # Frozen prop: constant vehicle-local position.
+                                # It parents to the __root empty (which carries
+                                # getPosition), so it rides with the car.
+                                pos = np.ascontiguousarray(
+                                    prop_frozen_pos[name], dtype=np.float32)
+                            else:
+                                obj_idx = index_range[name]
+                                pos = np.ascontiguousarray(pos_blender[obj_idx], dtype=np.float32)
                             fh.write(pos.tobytes())
 
                         written = sum(vcounts[n] * 12 for n in current_stable)

@@ -33,6 +33,43 @@ FLAG_HAS_NORMALS = 1 << 1
 FLAG_HAS_TRANSFORM = 1 << 2
 FLAG_HAS_NODES = 1 << 3  # v5: refNode-triangle rigid transform
 FLAG_WORLD_SPACE = 1 << 4  # v5: vertices already in absolute world space (no pool->Blender)
+FLAG_HAS_PROPS = 1 << 5  # v6: trailing prop section (rigid propmeshes, frozen pose)
+
+# --- Prop section (v6) -------------------------------------------------------
+# BeamNG vehicles expose two mesh families: FLEXMESHES (the deforming body,
+# captured into the shared pool + per-frame stream) and PROPMESHES (rigid parts
+# animated by prop.position/prop.rotation — steering wheel, pedals, gauge
+# needles, indicator stalk).  The stock exporter (util/export.lua:924-928)
+# walks BOTH; the BMC capture historically walked only flexmeshes, so those
+# rigid parts were missing from BMC-built caches.
+#
+# Props are stored in a NEW static section appended AFTER the material table,
+# gated by FLAG_HAS_PROPS.  CRITICAL INVARIANT: this section grows
+# ``static_size`` ONLY — it never touches ``vertex_count`` or ``frame_size``,
+# so the per-frame flexmesh pool block and the ``frame_vehicle_transform``
+# offset inside each frame are byte-for-byte unchanged.  (A prior attempt that
+# folded prop verts into ``vertex_count`` shifted that offset and launched the
+# car into the air; this layout makes that failure structurally impossible.)
+# Old readers that don't know the flag simply ignore the trailing bytes.
+#
+# Data is stored RAW as the engine returns it (prop-local verts + a
+# vehicle-space position + rotation quaternion) so the coordinate bake lives in
+# Python and can be re-tuned by rebuilding the BVC from the SAME .bmc.
+#
+# Prop section layout (only present when FLAG_HAS_PROPS):
+#   [0..4)  prop_count        uint32
+#   per prop:
+#     [2]   name_len          uint16
+#     [..]  name              utf-8 bytes
+#     [4]   vertices_count    uint32
+#     [4]   index_count       uint32
+#     [4]   material_id       int32
+#     [4]   has_uv            uint32  (1/0)
+#     [12]  position          f32 * 3   (vehicle-space, RAW)
+#     [16]  rotation          f32 * 4   (quaternion xyzw, RAW)
+#     [..]  vertices          f32 * 3 * vertices_count  (prop-local, RAW)
+#     [..]  indices           uint32 * index_count
+#     [..]  uvs               f32 * 2 * vertices_count   (only if has_uv)
 
 # Per-frame layout (v5): timestamp(8) + vertices + transform block.
 # Transform block = 9 f32 = (px,py,pz) translation + forward(3) + up(3),
@@ -63,6 +100,25 @@ class MaterialEntry:
 
 
 @dataclass
+class PropEntry:
+    """One rigid propmesh, captured once (frozen pose).
+
+    All spatial data is stored RAW in the engine's own space — ``position`` and
+    ``rotation`` are the vehicle-space placement the engine reports for this
+    prop, ``vertices`` are prop-local.  The Python builder is responsible for
+    baking these into the same Blender space the flexmesh pool uses, so the
+    coordinate convention can be re-tuned without a fresh capture.
+    """
+    name: str
+    material_id: int
+    position: "np.ndarray"          # f32[3] — vehicle-space, raw
+    rotation: "np.ndarray"          # f32[4] — quaternion xyzw, raw
+    vertices: "np.ndarray"          # f32[N,3] — prop-local, raw
+    indices: "np.ndarray"           # uint32[M] — flat triangle indices
+    uvs: Optional["np.ndarray"] = None  # f32[N,2] or None
+
+
+@dataclass
 class BmcHeader:
     version: int
     vertex_count: int
@@ -88,6 +144,10 @@ class BmcHeader:
     @property
     def has_world_space(self) -> bool:
         return bool(self.flags & FLAG_WORLD_SPACE)
+
+    @property
+    def has_props(self) -> bool:
+        return bool(self.flags & FLAG_HAS_PROPS)
 
     @property
     def frame_positions_bytes(self) -> int:
@@ -208,6 +268,69 @@ def _unpack_material_table(data: bytes, count: int) -> List[MaterialEntry]:
         offset += name_len
         materials.append(MaterialEntry(name=name))
     return materials
+
+
+def pack_prop_section(props: List[PropEntry]) -> bytes:
+    """Serialize the trailing prop section (see the layout note at module top)."""
+    parts: List[bytes] = [struct.pack("<I", len(props))]
+    for p in props:
+        name_bytes = p.name.encode("utf-8")
+        if len(name_bytes) > 65535:
+            raise ValueError(f"Prop name too long: {p.name}")
+        verts = np.ascontiguousarray(p.vertices, dtype=np.float32).reshape(-1, 3)
+        idx = np.ascontiguousarray(p.indices, dtype=np.uint32).ravel()
+        has_uv = 1 if p.uvs is not None else 0
+        parts.append(struct.pack("<H", len(name_bytes)))
+        parts.append(name_bytes)
+        parts.append(struct.pack("<IiiI", verts.shape[0], int(idx.shape[0]),
+                                 int(p.material_id), has_uv))
+        parts.append(np.ascontiguousarray(p.position, dtype=np.float32).tobytes())
+        parts.append(np.ascontiguousarray(p.rotation, dtype=np.float32).tobytes())
+        parts.append(verts.tobytes())
+        parts.append(idx.tobytes())
+        if has_uv:
+            uv = np.ascontiguousarray(p.uvs, dtype=np.float32).reshape(-1, 2)
+            parts.append(uv.tobytes())
+    return b"".join(parts)
+
+
+def unpack_prop_section(data: bytes) -> List[PropEntry]:
+    """Parse the trailing prop section produced by :func:`pack_prop_section`."""
+    props: List[PropEntry] = []
+    if len(data) < 4:
+        return props
+    (count,) = struct.unpack_from("<I", data, 0)
+    offset = 4
+    for _ in range(count):
+        (name_len,) = struct.unpack_from("<H", data, offset)
+        offset += 2
+        name = data[offset:offset + name_len].decode("utf-8")
+        offset += name_len
+        vcount, icount, material_id, has_uv = struct.unpack_from("<IiiI", data, offset)
+        offset += 16
+        position = np.frombuffer(data, dtype=np.float32, count=3, offset=offset).copy()
+        offset += 12
+        rotation = np.frombuffer(data, dtype=np.float32, count=4, offset=offset).copy()
+        offset += 16
+        verts = np.frombuffer(
+            data, dtype=np.float32, count=vcount * 3, offset=offset
+        ).reshape(-1, 3).copy()
+        offset += vcount * 12
+        indices = np.frombuffer(
+            data, dtype=np.uint32, count=icount, offset=offset
+        ).copy()
+        offset += icount * 4
+        uvs = None
+        if has_uv:
+            uvs = np.frombuffer(
+                data, dtype=np.float32, count=vcount * 2, offset=offset
+            ).reshape(-1, 2).copy()
+            offset += vcount * 8
+        props.append(PropEntry(
+            name=name, material_id=material_id, position=position,
+            rotation=rotation, vertices=verts, indices=indices, uvs=uvs,
+        ))
+    return props
 
 
 # ---------------------------------------------------------------------------

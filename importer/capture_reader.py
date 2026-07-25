@@ -94,6 +94,16 @@ class BmcReader:
         )
         self._material_names = [m.name for m in self._materials]
 
+        # --- Prop section (v6, optional) --------------------------------
+        # Rigid propmeshes (steering wheel, pedals, gauge needles, indicator
+        # stalk) live in a trailing static section that never touched the pool
+        # vertex_count.  Advance past the material names to reach it.
+        self._props: List[bmc.PropEntry] = []
+        if self.header.has_props:
+            for m in self._materials:
+                offset += 2 + len(m.name.encode("utf-8"))
+            self._props = bmc.unpack_prop_section(static[offset:])
+
     def _build_objects(self):
         """Group primitives by flexmesh name prefix, dedup indices from shared pool."""
         groups: Dict[int, List[int]] = {}
@@ -180,6 +190,10 @@ class BmcReader:
             self._object_names.append(name)
 
     # --- Public API ---
+
+    def props(self) -> List["bmc.PropEntry"]:
+        """Rigid propmeshes (frozen pose), empty list if the capture has none."""
+        return list(self._props)
 
     def object_count(self) -> int:
         return len(self._object_names)

@@ -42,6 +42,7 @@ local bit = bit or require('bit')
 
 local FLAG_HAS_UVS = 1
 local FLAG_HAS_TRANSFORM = 4  -- 1 << 2: per-frame rigid transform block present
+local FLAG_HAS_PROPS = 32     -- 1 << 5: trailing rigid-prop section present
 
 local active      = false
 local bmcFile     = nil
@@ -109,6 +110,21 @@ local function writePrimitive(f, name, startIndex, indexCount, materialId, flexm
   writeI32(f, materialId); writeI32(f, flexmeshIndex)
 end
 local function writeMaterial(f, name) writeU16(f, #name); f:write(name) end
+local function writeProp(f, p)
+  -- Layout must match importer/capture_format.py unpack_prop_section:
+  --   name_len(u16), name, vcount(u32), icount(i32), materialId(i32),
+  --   has_uv(u32), position(3 f32), rotation(4 f32), verts, indices, [uvs]
+  writeU16(f, #p.name); f:write(p.name)
+  writeU32(f, p.verticesCount)
+  writeI32(f, p.indexCount)
+  writeI32(f, p.materialId)
+  writeU32(f, p.uv and 1 or 0)
+  writeF32(f, p.px); writeF32(f, p.py); writeF32(f, p.pz)
+  writeF32(f, p.rx); writeF32(f, p.ry); writeF32(f, p.rz); writeF32(f, p.rw)
+  f:write(ffi.string(p.verts, p.verticesCount * 12))
+  f:write(ffi.string(p.indices, p.indexCount * 4))
+  if p.uv then f:write(ffi.string(p.uv, p.verticesCount * 8)) end
+end
 
 -- ---------------------------------------------------------------------------
 function M.start(path, frames)
@@ -178,8 +194,60 @@ function M.start(path, frames)
     for _, n in ipairs(veh:getMaterialNames()) do materials[#materials + 1] = n end
   end
 
+  -- --- Rigid props (steering wheel, pedals, gauge needles, indicator stalk) --
+  -- These are PROPMESHES, not flexmeshes, so the flexmesh loop above misses
+  -- them and BMC caches were incomplete vs the glTF exporter (util/export.lua
+  -- walks BOTH families, lines 918-928).  Capture each prop ONCE here (frozen
+  -- pose): a self-contained local mesh + the vehicle-space position/rotation
+  -- the engine reports.  Stored in a SEPARATE trailing section so the flexmesh
+  -- pool vertex_count / per-frame layout is byte-for-byte unchanged (a prior
+  -- attempt that folded prop verts into the pool broke the transform offset and
+  -- launched the car skyward — this layout makes that impossible).
+  local props = {}
+  local propOk, propErr = pcall(function()
+    local pmCount = meshInfo.propmeshesCount or 0
+    for i = 0, pmCount - 1 do
+      local pm = meshInfo:propmeshes(i)
+      local pvc = pm.verticesCount or 0
+      local pic = pm.indicesCount or 0
+      if pvc > 0 and pic > 0 then
+        local pverts = ffi.new('float[?]', pvc * 3)
+        local pidx = ffi.new('unsigned int[?]', pic)
+        if pm:verticesGet(pverts) and pm:indicesGet(pidx) then
+          local puv = nil
+          local puvCount = pm.uv1Count or 0
+          if puvCount > 0 then
+            puv = ffi.new('float[?]', puvCount * 2)
+            if not pm:uv1Get(puv) then puv = nil end
+          end
+          -- material id from the prop's first primitive (props are single-part)
+          local matId = -1
+          local ppc = pm.primitivesCount or 0
+          if ppc > 0 then
+            local pprims = ffi.new('gpuPrimitive_t[?]', ppc)
+            if pm:primitivesGet(pprims) then matId = tonumber(pprims[0].materialId) end
+          end
+          local pos = pm.position or {x = 0, y = 0, z = 0}
+          local rot = pm.rotation or {x = 0, y = 0, z = 0, w = 1}
+          props[#props + 1] = {
+            name = pm.meshName or ('prop_' .. i),
+            verticesCount = pvc, indexCount = pic, materialId = matId,
+            verts = pverts, indices = pidx, uv = puv, uvCount = puvCount,
+            px = pos.x, py = pos.y, pz = pos.z,
+            rx = rot.x, ry = rot.y, rz = rot.z, rw = rot.w,
+          }
+        end
+      end
+    end
+  end)
+  if not propOk then
+    log('W', logTag, 'prop capture failed (' .. tostring(propErr) .. '); continuing without props')
+    props = {}
+  end
+
   local flags = 0
   if hasUvs then flags = bit.bor(flags, FLAG_HAS_UVS) end
+  if #props > 0 then flags = bit.bor(flags, FLAG_HAS_PROPS) end
   -- Store the per-frame rigid transform (pos + forward + up, all Blender Z-up)
   -- so the builder can drive a parent empty and separate object motion from
   -- the deformation animation — mirroring export.lua's rigid-motion capture.
@@ -189,6 +257,16 @@ function M.start(path, frames)
   if hasUvs then staticSize = staticSize + uvCount * 8 end
   for _, p in ipairs(primitives) do staticSize = staticSize + 2 + #p.name + 12 + 4 end
   for _, m in ipairs(materials)  do staticSize = staticSize + 2 + #m end
+  -- Prop section: prop_count(4) + per prop [name + 16-byte header + pos(12) +
+  -- rot(16) + verts + indices + optional uvs].
+  if #props > 0 then
+    staticSize = staticSize + 4
+    for _, p in ipairs(props) do
+      staticSize = staticSize + 2 + #p.name + 16 + 12 + 16
+        + p.verticesCount * 12 + p.indexCount * 4
+      if p.uv then staticSize = staticSize + p.verticesCount * 8 end
+    end
+  end
 
   -- per-frame: timestamp + N LOCAL pool vertex positions + 9 f32 rigid
   -- transform (px,py,pz, fx,fy,fz, ux,uy,uz), all in Blender Z-up ({x,z,-y}).
@@ -208,12 +286,16 @@ function M.start(path, frames)
     writePrimitive(bmcFile, p.name, p.startIndex, p.indexCount, p.materialId, p.flexmeshIndex)
   end
   for _, m in ipairs(materials) do writeMaterial(bmcFile, m) end
+  if #props > 0 then
+    writeU32(bmcFile, #props)
+    for _, p in ipairs(props) do writeProp(bmcFile, p) end
+  end
 
   meshInfo:free()
   active = true
   log('I', logTag, string.format(
-    'v5capture started: %s (%d verts, %d idx, uvs=%s, up to %d frames)',
-    bmcPath, totalVerts, totalIndices, tostring(hasUvs), maxFrames))
+    'v5capture started: %s (%d verts, %d idx, uvs=%s, %d props, up to %d frames)',
+    bmcPath, totalVerts, totalIndices, tostring(hasUvs), #props, maxFrames))
   return true
 end
 
