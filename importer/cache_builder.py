@@ -78,6 +78,34 @@ def _pool_to_blender(pos: np.ndarray) -> np.ndarray:
     return out
 
 
+def _basis_from_dirs(fwd: np.ndarray, up: np.ndarray) -> np.ndarray:
+    """World-space orientation matrix (columns = right, fwd, up) from the
+    captured forward/up direction vectors.
+
+    The .bmc stores ``getDirectionVector()`` (fwd) and ``getDirectionVectorUp()``
+    (up) every frame, already in Blender Z-up world space (physics Z-up ==
+    Blender Z-up, no permutation — see CLAUDE.md).  We build a right-handed
+    orthonormal basis ``right = fwd x up``, re-orthogonalizing ``up`` so tiny
+    non-perpendicularity in the captured vectors can't shear the result.
+    Returns identity for degenerate input.
+    """
+    f = np.asarray(fwd, dtype=np.float64).reshape(3)
+    u = np.asarray(up, dtype=np.float64).reshape(3)
+    fn = np.linalg.norm(f)
+    un = np.linalg.norm(u)
+    if fn < 1e-9 or un < 1e-9:
+        return np.eye(3, dtype=np.float64)
+    f = f / fn
+    u = u / un
+    r = np.cross(f, u)
+    rn = np.linalg.norm(r)
+    if rn < 1e-9:
+        return np.eye(3, dtype=np.float64)
+    r = r / rn
+    u = np.cross(r, f)  # re-orthogonalize up against right x fwd
+    return np.column_stack([r, f, u])
+
+
 def _quat_to_matrix(q: np.ndarray) -> np.ndarray:
     """Unit quaternion (xyzw) -> 3x3 rotation matrix (float64)."""
     x, y, z, w = (float(q[0]), float(q[1]), float(q[2]), float(q[3]))
@@ -1019,6 +1047,22 @@ class CacheBuilder:
                     #   The permuted pool mesh already sits in Blender axes (physics
                     #   Z-up == Blender Z-up), so getPosition() needs no conversion.
                     IDENTITY_ROT = np.eye(3, dtype=np.float32).reshape(-1)
+                    # --- Prop rotation baking (BMC pipeline) ---------------
+                    # Flexmesh pool verts are re-sampled every frame, so the
+                    # car's rotation is already baked into them per-frame.  Props
+                    # are captured ONCE (frozen rest pose), so on their own they
+                    # only ride the __root empty's TRANSLATION and never turn —
+                    # when the car yaws the props stick out.  We fix that here by
+                    # rotating each frozen prop by the car's rotation SINCE FRAME
+                    # 0, reconstructed from the captured fwd/up direction vectors,
+                    # around the (origin-relative) vehicle origin.  This bakes
+                    # prop rotation into the vertex stream exactly as the flexmesh
+                    # pool already bakes its own — keeping the pipeline invariant
+                    # (verts carry rotation, empty carries translation only).
+                    R0 = None
+                    if prop_frozen_pos:
+                        vtx0 = reader.frame_vehicle_transform(0)
+                        R0 = _basis_from_dirs(vtx0[3:6], vtx0[6:9])
                     for fi in range(total_frames):
                         shared_pos = reader._read_shared_positions(fi)
                         pos_blender = _pool_to_blender(shared_pos.astype(np.float64))
@@ -1030,13 +1074,23 @@ class CacheBuilder:
                         p_blender = p.astype(np.float32)
                         tf_blender = IDENTITY_ROT
 
+                        # Car rotation since frame 0 (identity at fi==0), applied
+                        # to frozen props below.  None when there are no props.
+                        dR = None
+                        if R0 is not None:
+                            Rf = _basis_from_dirs(vtx[3:6], vtx[6:9])
+                            dR = (Rf @ R0.T).astype(np.float32)
+
                         for name in current_stable:
                             if name in prop_frozen_pos:
-                                # Frozen prop: constant vehicle-local position.
-                                # It parents to the __root empty (which carries
-                                # getPosition), so it rides with the car.
+                                # Frozen prop rotated by the car's rotation since
+                                # frame 0, so it turns with the body.  It still
+                                # parents to the __root empty (which carries
+                                # getPosition translation), so it rides along too.
+                                frozen = prop_frozen_pos[name]
                                 pos = np.ascontiguousarray(
-                                    prop_frozen_pos[name], dtype=np.float32)
+                                    (frozen @ dR.T) if dR is not None else frozen,
+                                    dtype=np.float32)
                             else:
                                 obj_idx = index_range[name]
                                 pos = np.ascontiguousarray(pos_blender[obj_idx], dtype=np.float32)
