@@ -28,6 +28,7 @@ class CachedObject:
     _frame_vertex_offset: int
     _uv_offset: int = 0
     _material_offset: int = 0
+    _loop_uv_offset: int = 0
 
 
 class CacheReader:
@@ -39,6 +40,7 @@ class CacheReader:
         )
         self.header = binary.unpack_header(raw)
         self._is_v3 = self.header.get("version", 0) >= 3
+        self._is_v5 = self.header.get("version", 0) >= 5
         self._dyn_entry_size = binary.DYN_ENTRY_SIZE_V2 if not self._is_v3 else binary.DYN_ENTRY_SIZE
         self._load_object_table()
         self._dynamic_names: List[str] = [o.name for o in self._objects if not o.stable]
@@ -81,7 +83,9 @@ class CacheReader:
         objects: List[CachedObject] = []
         offset = 0
         for _ in range(self.header["object_count"]):
-            entry, offset = binary.unpack_object_entry(buf, offset, is_v3=self._is_v3)
+            entry, offset = binary.unpack_object_entry(
+                buf, offset, is_v3=self._is_v3, is_v5=self._is_v5,
+            )
             objects.append(
                 CachedObject(
                     name=entry["name"],
@@ -94,6 +98,7 @@ class CacheReader:
                     _frame_vertex_offset=entry["frame_vertex_offset"],
                     _uv_offset=entry.get("uv_offset", 0),
                     _material_offset=entry.get("material_offset", 0),
+                    _loop_uv_offset=entry.get("loop_uv_offset", 0),
                 )
             )
         self._objects = objects
@@ -189,6 +194,24 @@ class CacheReader:
         n = obj.vertex_count * 2
         flat = np.frombuffer(self._mmap, dtype=np.float32, count=n, offset=off)
         return flat.reshape(-1, 2)
+
+    def base_loop_uvs(self, name: str) -> Optional[np.ndarray]:
+        """Per-face-corner UVs as ``(face_count, 3, 2)`` f32, or None (pre-v5).
+
+        Loop UVs are what let a seam survive a position-only weld: two corners
+        of adjacent faces can sit on the SAME merged vertex and still carry
+        different UVs.  Callers should prefer this over :meth:`base_uvs` and
+        fall back to the per-vertex block when it returns None.
+        """
+        obj = self._by_name[name]
+        if not obj.stable:
+            raise ValueError(f"{name!r} is not stable")
+        off = obj._loop_uv_offset
+        if off == 0 or obj.face_count == 0:
+            return None
+        n = obj.face_count * 6
+        flat = np.frombuffer(self._mmap, dtype=np.float32, count=n, offset=off)
+        return flat.reshape(-1, 3, 2)
 
     def base_material_names(self, name: str) -> List[str]:
         self._require_v3()

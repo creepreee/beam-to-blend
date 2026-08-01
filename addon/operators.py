@@ -18,6 +18,20 @@ def _manifest_stash(directory: str) -> str:
     return os.path.join(tempfile.gettempdir(), f"beamng_manifest_{h}.json")
 
 
+def _tyre_settings(context):
+    """Build a TyreSettings from the scene's tyre UI properties."""
+    from runtime.tyre_deform import TyreSettings
+
+    props = context.scene.beamng
+    return TyreSettings(
+        amount=float(getattr(props, "tyre_flatten", 0.0)),
+        extra=float(getattr(props, "tyre_deflection", 0.02)),
+        bulge=float(getattr(props, "tyre_bulge", 0.6)),
+        release=float(getattr(props, "tyre_release", 0.03)),
+        ground_z=float(getattr(props, "tyre_ground_z", 0.0)),
+    ).update(names=getattr(props, "tyre_names", "tire,tyre"))
+
+
 def _iter_layer_collections(layer_coll):
     """Yield a LayerCollection and all of its descendants."""
     yield layer_coll
@@ -243,7 +257,8 @@ class BEAMNG_OT_import_cache(Operator):
             reader = CacheReader(cache_path)
             log_path = os.path.splitext(cache_path)[0] + "_debug.log"
             chunk_map = CHUNK_MAP_E180 if context.scene.beamng.use_chunked else None
-            playback = CachePlayback(reader, log_path=log_path, chunk_map=chunk_map)
+            playback = CachePlayback(reader, log_path=log_path, chunk_map=chunk_map,
+                                     tyre=_tyre_settings(context))
             playback.build_scene()
 
             # Two INDEPENDENT knobs (see runtime.frame_handler for the mapping):
@@ -258,10 +273,14 @@ class BEAMNG_OT_import_cache(Operator):
             output_fps = max(1, int(getattr(context.scene.beamng, "output_fps", 60)))
             context.scene.render.fps = output_fps
             context.scene.render.fps_base = 1.0
-            frame_start = int(context.scene.beamng.start_second * output_fps)
+            # Pass the offset in FRAMES — that is what the "Start at Frame"
+            # field means and what frame_handler stores, so the slider can
+            # retune it live (frame_handler.update_start_frame) with no
+            # re-import and no seconds↔frames round-trip.
+            start_frame = int(getattr(context.scene.beamng, "start_frame", 0))
             frame_handler.attach(
                 playback,
-                frame_start=frame_start,
+                frame_start=start_frame,
                 playback_fps=playback_fps,
                 output_fps=output_fps,
             )
@@ -292,6 +311,16 @@ class BEAMNG_OT_import_cache(Operator):
                             obj.location.z += dz
                     sys.stderr.write(f"[BeamNG] auto-ground: shifted up {dz:.4f} Z\n")
                     sys.stderr.flush()
+                    # Remember the shift: it lives in obj.location, outside the
+                    # cache data, so the Alembic bake has to be told about it to
+                    # measure tyre-to-ground distance the same way playback does.
+                    context.scene["_beamng_ground_shift"] = float(dz)
+                    # Auto-ground runs AFTER build_scene's set_frame(0), so the
+                    # frame-0 tyre deform measured heights before this shift.
+                    # Redo frame 0 now that the objects sit on Z=0.
+                    if playback.tyre.enabled:
+                        playback.set_tyre_settings(playback.tyre)
+                        playback.set_frame(0)
 
         except Exception as exc:
             self.report({"ERROR"}, f"Import failed: {exc}")
@@ -378,9 +407,14 @@ class BEAMNG_OT_export_alembic(Operator):
 
             # --- bake stable objects to .mdd in temp dir ---
             mdd_dir = tempfile.mkdtemp(prefix="beamng_mdd_")
+            # Bake the SAME tyre deformation the viewport shows, including the
+            # auto-ground shift that the import operator put in obj.location —
+            # otherwise the export would come out with round tyres.
             baked_names = bake_to_mdd(
                 reader, mdd_dir,
                 frame_start=0, frame_end=n_frames - 1,
+                tyre=_tyre_settings(context),
+                height_bias=float(scene.get("_beamng_ground_shift", 0.0)),
             )
             if not baked_names:
                 self.report({"ERROR"}, "No stable objects to bake — nothing to export")
@@ -433,12 +467,23 @@ class BEAMNG_OT_export_alembic(Operator):
                 filepath, start, end))
             sys.stderr.flush()
 
+            # face_sets=True is REQUIRED for materials to survive: Alembic
+            # carries per-material face assignments as face sets, and the
+            # operator default is False — without it a re-imported .abc has
+            # ZERO material slots (measured: 235 slots -> 0) and every part
+            # renders with the default grey.  uvs/normals default to True but
+            # are passed explicitly so a Blender default change can't silently
+            # strip them.
             bpy.ops.wm.alembic_export(
                 filepath=filepath,
                 start=start,
                 end=end,
                 selected=True,
                 flatten=False,
+                face_sets=True,
+                uvs=True,
+                packuv=True,
+                normals=True,
             )
 
             # deselect + restore prior visibility state
@@ -515,13 +560,33 @@ class BEAMNG_OT_assign_textures(Operator):
             _alternate_keys,
             build_material_node_tree,
             build_material_from_params,
+            build_search_roots,
+            find_beamng_install,
         )
 
         car_prefix = os.path.basename(os.path.normpath(vehicle_dir)).lower()
 
-        json_map = parse_materials_json(vehicle_dir)
-        params_map = parse_material_shader_params(vehicle_dir)
-        filename_lookup = build_filename_lookup(vehicle_dir)
+        # Materials a mod inherits from the base game (tyres, brake discs,
+        # mirrors, licence plates) are defined in content/vehicles/*.zip, not in
+        # the mod folder — search both.  See materials.build_search_roots.
+        props = context.scene.beamng
+        game_dir = (props.game_dir or "").strip() or None
+        use_game = bool(props.use_game_textures)
+        install = find_beamng_install(game_dir) if use_game else None
+        if use_game and not install:
+            sys.stderr.write(
+                "[BeamNG] Could not locate a BeamNG install with "
+                "content/vehicles — set 'Game Folder' to fix base-game "
+                "materials (tyres, brakes, mirrors)\n"
+            )
+        roots = build_search_roots(vehicle_dir, game_dir, include_game=use_game)
+
+        # Zip members get extracted here on demand so Blender can load them.
+        extract_dir = os.path.join(vehicle_dir, "_beamng_extracted_textures")
+
+        json_map = parse_materials_json(roots)
+        params_map = parse_material_shader_params(roots)
+        filename_lookup = build_filename_lookup(roots)
 
         assigned_json = 0
         assigned_file = 0
@@ -559,7 +624,17 @@ class BEAMNG_OT_assign_textures(Operator):
             base_key = base_name.lower()
 
             if raw_name != base_name and base_key in base_tex_cache:
-                build_material_node_tree(mat, base_tex_cache[base_key])
+                # The cache holds two shapes — texture maps and shader params —
+                # which need different builders.  Tagging the kind avoids
+                # feeding a params dict to the texture builder (it would try to
+                # unpack a float as a (path, is_normal) pair).
+                kind, cached = base_tex_cache[base_key]
+                if kind == "tex":
+                    build_material_node_tree(
+                        mat, cached, extract_dir=extract_dir,
+                    )
+                else:
+                    build_material_from_params(mat, cached)
                 deduped += 1
                 continue
 
@@ -571,8 +646,8 @@ class BEAMNG_OT_assign_textures(Operator):
                 source = "file"
 
             if tex_paths:
-                build_material_node_tree(mat, tex_paths)
-                base_tex_cache[base_key] = tex_paths
+                build_material_node_tree(mat, tex_paths, extract_dir=extract_dir)
+                base_tex_cache[base_key] = ("tex", tex_paths)
                 if source == "json":
                     assigned_json += 1
                 else:
@@ -581,7 +656,7 @@ class BEAMNG_OT_assign_textures(Operator):
                 shader_params = _lookup_any(base_key, params_map)
                 if shader_params:
                     build_material_from_params(mat, shader_params)
-                    base_tex_cache[base_key] = shader_params
+                    base_tex_cache[base_key] = ("params", shader_params)
                     assigned_params += 1
                 else:
                     skipped.append(raw_name)

@@ -123,14 +123,123 @@ Patched with `beamng_capture_quiet` flag to suppress GE console spam.
 | `importer/materials.py` | ⚠️ | Blender 4.0+ Specular socket issue |
 | `runtime/cache_reader.py` | ✅ | BVC memmap reader |
 | `runtime/mesh_update.py` | ✅ | Per-frame vertex update, sharp edge marking |
-| `runtime/frame_handler.py` | ✅ | Timeline handler, undo/reload recovery |
+| `runtime/tyre_deform.py` | ✅ | Fake tyre ground-contact flattening (see below) |
+| `runtime/frame_handler.py` | ✅ | Timeline handler, undo/reload recovery, live start/fps/tyre retune |
 | `addon/operators.py` | ✅ | Scan/build/import/export/texture operators |
-| `addon/ui.py` | ✅ | Panel + scene properties |
+| `addon/ui.py` | ✅ | Panel + scene properties + Tyre Contact sub-panel |
 | `tools/capture_gltf_sequence.py` | ✅ | beamngpy driver, slowmo + deterministic |
 | `tools/v5_capture.lua` | ✅ | BMC capture, origin-relative anti-drag |
 
+---
+
+## Live-retunable UI knobs (no re-import)
+
+These panel fields have `update=` callbacks that push straight into the running
+`frame_handler`, so dragging them retunes the imported cache in place:
+
+| Field | Entry point |
+|-------|-------------|
+| Start at Second | `frame_handler.update_start_second()` |
+| Playback Speed / Output FPS | `frame_handler.update_fps()` |
+| all Tyre Contact fields | `frame_handler.update_tyre()` |
+
+**The start offset is stored in SECONDS** (`_start_second`), never in frames.
+`_frame_start` is always re-derived as `round(start_second * output_fps)` by
+`_apply_timeline()`, so changing Output FPS keeps cache frame 0 on the same
+*time* instead of silently sliding the animation. Storing frames was the trap.
+
+Retunes must call `_refresh_current_frame()`: the playhead usually does not
+move, so no frame-change handler fires and the viewport would keep showing the
+old settings. `_apply_timeline` also clamps the playhead back inside the new
+range — outside it, every frame maps to cache frame 0 and the car looks frozen.
+
+Everything is persisted as `_beamng_*` scene custom props so undo/reload
+recovery restores the *live* values, not the ones present at import.
+
+## Reload recovery (`_try_recover`)
+
+Two separate failure modes, both of which look like "the animation vanished":
+
+1. **The add-on must be enabled in saved preferences.** Recovery hangs off
+   `load_post`, so a disabled add-on registers nothing and the reopened file has
+   97 objects, an empty `frame_change_pre`, and zero motion. Nothing is wrong
+   with the .blend. Verified: with the add-on ticked, both the double-click and
+   File > Open paths recover fully.
+2. **`_try_recover` must rebind EVERY piece of module state**, not just the mesh
+   dicts. It rebuilds `_objects` / `_chunks` / `_chunk_member_ranges`, and it
+   must also re-bind `playback._transform_empty` to the `<collection>__root`
+   Empty. That field is module state; the Empty and the parenting *are* saved in
+   the .blend, so missing it produces the deceptive symptom **"car deforms
+   correctly but sits at the origin"** — `_apply_transform` returns early on
+   `_transform_empty is None` while vertex playback carries on normally.
+
+Deformation and rigid motion travel through different paths, so **a
+deformation-only assertion cannot see a dead root**. `tests/blender_reload_root.py`
+asserts both, in per-object and chunked mode (measured 8.828 m of root travel;
+0.000 m before the fix).
+
+The recovery link is **soft**: the .blend stores only the BVC *path* (46 MB, not
+4.27 GB). Move or rename the cache and `_try_recover` returns False silently.
+
+## Tyre ground contact (`runtime/tyre_deform.py`)
+
+BeamNG's tyre mesh is **rigid** — a loaded tyre never shows a contact patch, the
+round mesh just sinks into the ground as the hub deflects. This fakes the
+missing rubber at playback time, driven only by how the cached wheel geometry
+sits relative to a horizontal ground plane. Four terms:
+
+| Term | UI field | What it does |
+|------|----------|--------------|
+| contact patch | (implicit) | verts below ground projected onto it — patch width tracks real physics load, needs no tuning |
+| static deflection | Static Deflection | extra squash of the lower carcass, weighted by depth below the axle, so a *resting* tyre also flattens |
+| sidewall bulge | Sidewall Bulge | displaced rubber pushed out **horizontally** along the axle (see gotcha) |
+| lift-off release | Lift-off Release | ramps every term to exactly 0 by `release` metres above ground |
+
+**Stateless by design.** Each frame is computed from that frame's geometry
+alone — nothing accumulates. That's what makes a lifted car's tyres go
+*bit-exactly* round again instead of holding a flat spot from the start.
+
+**`amount=0` short-circuits before any work** and returns the input array
+identity, so the feature off is byte-identical to pre-feature playback.
+
+### Gotchas
+- **Bulge must be horizontal.** A cambered/steered axle tilts out of the ground
+  plane; bulging along it shoves sidewall verts back *down through* the ground
+  the patch step just lifted them onto (measured 3.5 mm of re-penetration on
+  real data). `flatten_tyre` projects the axle into the ground plane first.
+- **Heights in float64.** `height_offset` carries the vehicle's world position
+  (can be 100s of m) while the deformation is sub-cm; float32 cancellation cost
+  ~0.5 mm and visibly roughened the patch.
+- **Chunked mode deforms per *member*, not per chunk.** All four tyres plus the
+  rigid rims/hubs/brakes share one `wheels` mesh; a whole-chunk deform would
+  smear one axle+depth across all of them.
+- **Auto-ground runs after `build_scene`'s `set_frame(0)`**, and lives in
+  `obj.location` (outside the vertex data). Playback folds in `obj.location @ up`
+  and re-runs frame 0; the Alembic bake needs it passed as `height_bias`.
+- `MAX_SQUASH_RATIO = 0.35` caps the patch depth so a wrong `ground_z` gives a
+  slightly over-squashed tyre, not a pancake.
+
+Name filter (`tire,tyre` by default) keeps rims/hubs/brakes rigid. Alembic
+export bakes the same deformation into the .mdd, so renders match the viewport.
+
 ### Validation
-- 13/13 tests pass (`python -m pytest -q`)
+- 57/57 tests pass (`python -m pytest -q`)
+- Tyre contact verified headless against real capture data (97 objects, 4 tyres):
+  flat patch spans 0.000 mm, no ground penetration, 93 non-tyre objects
+  bit-identical, all 20 rigid members inside the merged `wheels` chunk
+  untouched, airborne tyres restored exactly, live slider retune reaches the
+  mesh. Run:
+  `blender --background --python tests/blender_tyre_contact.py -- <cache.bvc>`
+  (the script evicts an installed add-on's bundled `runtime`/`importer` from
+  `sys.modules` — otherwise it silently tests the deployed build)
+- Live "Start at Second" verified headless (21 checks, 97 objects): range shifts
+  by exactly the offset with duration unchanged, geometry at `frame_start+k` is
+  bit-identical before and after the shift (slid in time, not resampled), the
+  parked playhead's mesh updates without scrubbing, 2 s survives an output-fps
+  change as a different frame number, undo recovery keeps the live offset. Run:
+  `blender --background --python tests/blender_start_second.py -- <cache.bvc>`
+- Deform cost ~2.2 ms/frame for 4 tyres / 1024 verts (bulge dominates; the
+  `axle_axis` eigensolve is 0.36 ms of it)
 - GLB pipeline: 2000-frame capture at 10x slowmo, 97 objects, 7.4 GB BVC — verified
 - BMC pipeline: 700-frame capture, 88 objects, 533K verts, 4.5 GB BVC — verified
 - Detached-part drag fixed via origin-relative translation in v5_capture.lua

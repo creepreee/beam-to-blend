@@ -31,11 +31,12 @@ Usage::
 import os
 import sys
 import tempfile
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 import numpy as np
 
 from .cache_reader import CacheReader
+from .tyre_deform import TyreSettings, flatten_tyre, height_basis_from_transform
 
 
 class MddWriter:
@@ -85,6 +86,9 @@ def bake_to_mdd(reader: CacheReader,
                 frame_start: int = 0,
                 frame_end: Optional[int] = None,
                 blend_file_relative: bool = True,
+                tyre: Optional[TyreSettings] = None,
+                height_bias: float = 0.0,
+                source_frames: Optional[Sequence[int]] = None,
                 ) -> List[str]:
     """Sample cache frames and write .mdd files for every stable object.
 
@@ -104,7 +108,20 @@ def bake_to_mdd(reader: CacheReader,
         0-based cache frame range (default: all frames).
     blend_file_relative:
         If true, ``output_dir`` is treated as Blender-relative (``//``).
+    tyre:
+        Tyre ground-contact settings.  When enabled, tyre objects are baked
+        *deformed*, exactly as the viewport shows them — otherwise the exported
+        Alembic would have round tyres while the preview had flat ones.  The
+        deformation is applied here rather than by the MESH_CACHE modifier
+        because the modifier only replays the .mdd it is given.
+    height_bias:
+        Extra world-Z metres applied to the objects *outside* the cache data
+        (the import operator's auto-ground shift, which lives in
+        ``obj.location.z``).  Needed so the bake measures the same distance to
+        the ground the viewport does; getting it wrong shifts the contact patch.
     """
+    if tyre is None:
+        tyre = TyreSettings()
     if object_names is None:
         object_names = [o.name for o in reader.stable_objects()]
 
@@ -131,11 +148,25 @@ def bake_to_mdd(reader: CacheReader,
             name, len(fi), frame_end - frame_start + 1))
         sys.stderr.flush()
 
+        deform = tyre.enabled and tyre.matches(name)
+        n_contact = 0
         for f in range(frame_start, frame_end + 1):
             pos = reader.frame_positions(name, f)
+            if deform:
+                up, offset = height_basis_from_transform(
+                    reader.frame_transform(f), ground_z=tyre.ground_z)
+                offset += float(height_bias) * float(up[2])
+                pos, squash = flatten_tyre(pos, up, offset, tyre)
+                if squash > 0.0:
+                    n_contact += 1
             writer.add_frame(pos)
 
         writer.write()
+        if deform:
+            sys.stderr.write(
+                "[baker] tyre deform on {0}: {1}/{2} frames in contact\n".format(
+                    name, n_contact, frame_end - frame_start + 1))
+            sys.stderr.flush()
         baked.append(name)
 
     return baked

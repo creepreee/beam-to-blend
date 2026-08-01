@@ -12,8 +12,9 @@ Adapted from "BeamNG Auto Texture Assign" by Probler (v2.4).
 import json
 import os
 import re
+import zipfile
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 # JSON field → (Blender socket name, is_normal)
@@ -70,71 +71,335 @@ def strip_blender_index(name: str) -> str:
     return re.sub(r'\.\d{3}$', '', name)
 
 
-def resolve_texture_path(json_path: str, vehicle_folder: str) -> Optional[str]:
-    """Find actual file on disk from a JSON texture path.
+# --- Search roots: mod folders + base-game zips ---------------------------
+#
+# WHY THIS EXISTS
+# ---------------
+# A capture carries only material *names*; textures are resolved at import
+# time by matching those names against ``*.materials.json``.  Scanning just the
+# vehicle folder loses every material the mod inherits from the base game.
+# Measured on a real 46-material capture: 8 resolved to nothing, and 5 of
+# those 8 (``tire_01a``, ``disc_brake``, ``mirror``, ``licenseplate``,
+# ``invis``) live in ``content/vehicles/common.zip``.  ``tire_01a`` is the
+# material on all four tyres — hence bare, normal-map-less tyres.
+#
+# So resolution spans an ordered list of roots: the mod folder first (a mod may
+# legitimately override a base material), then the game's vehicle zips.
 
-    BeamNG JSON paths look like ``/vehicles/flanje_e180/textures/color.dds``.
-    We strip the path, keep the filename + stem, and try extensions in a
-    list of candidate directories under *vehicle_folder*.
+TEXTURE_EXTS = (".dds", ".png", ".jpg", ".jpeg", ".tga")
+
+# Relative to a BeamNG install root, where vehicle content zips live.
+_GAME_VEHICLE_SUBDIR = os.path.join("content", "vehicles")
+
+
+class SearchRoot:
+    """A place to look for ``*.materials.json`` and texture files.
+
+    Unifies a plain directory and a zip archive behind one tiny interface so
+    :func:`parse_materials_json` and friends don't care which they're reading.
+    Texture paths returned for zip members use Blender's ``archive.zip``
+    +``/inner/path`` convention, which ``bpy.data.images.load`` understands
+    only after extraction — see :func:`materialize_texture`.
     """
-    if not json_path or json_path.startswith("@"):
+
+    def iter_materials_json(self) -> Iterable[Tuple[str, dict]]:
+        """Yield ``(display_path, parsed_json)`` for each materials.json."""
+        raise NotImplementedError
+
+    def find_texture(self, stem: str) -> Optional[str]:
+        """Return a path for the first texture file matching *stem*, or None."""
+        raise NotImplementedError
+
+    def iter_texture_stems(self) -> Iterable[Tuple[str, str]]:
+        """Yield ``(file_stem, path)`` for every texture file in this root."""
+        raise NotImplementedError
+
+
+class DirSearchRoot(SearchRoot):
+    """A directory on disk (an extracted mod / vehicle folder)."""
+
+    def __init__(self, folder: str):
+        self.folder = str(folder)
+
+    def iter_materials_json(self):
+        for json_file in Path(self.folder).rglob("*.materials.json"):
+            try:
+                with open(json_file, "r", encoding="utf-8") as f:
+                    yield str(json_file), json.load(f)
+            except Exception as e:
+                import sys
+                sys.stderr.write(f"[BeamNG] Could not read {json_file}: {e}\n")
+
+    def find_texture(self, stem: str) -> Optional[str]:
+        # Fast path: same directory layout as the JSON reference.
+        for ext in TEXTURE_EXTS:
+            for cand in (stem + ext, stem + ext.upper()):
+                p = os.path.join(self.folder, cand)
+                if os.path.isfile(p):
+                    return p
+        # Recursive search by stem.
+        try:
+            for f in Path(self.folder).rglob(stem + ".*"):
+                if f.suffix.lower() in TEXTURE_EXTS:
+                    return str(f)
+        except OSError:
+            pass
         return None
-    filename = os.path.basename(json_path)
-    stem = Path(filename).stem
-    # Try same directory as JSON file
-    for ext in (".dds", ".DDS", ".png", ".jpg", ".PNG", ".JPG"):
-        candidate = os.path.join(vehicle_folder, stem + ext)
-        if os.path.isfile(candidate):
-            return candidate
-    # Recursive search
-    for f in Path(vehicle_folder).rglob(stem + ".*"):
-        if f.suffix.lower() in (".dds", ".png", ".jpg"):
-            return str(f)
+
+    def iter_texture_stems(self):
+        for f in Path(self.folder).rglob("*"):
+            if f.suffix.lower() in TEXTURE_EXTS:
+                yield f.stem, str(f)
+
+
+class ZipSearchRoot(SearchRoot):
+    """A BeamNG content ``.zip`` (e.g. ``content/vehicles/common.zip``).
+
+    Reads members directly — no extraction — so indexing 123 game zips costs
+    ~0.3s.  Only textures actually referenced get extracted, and only when
+    Blender needs to load them.
+    """
+
+    def __init__(self, zip_path: str):
+        self.zip_path = str(zip_path)
+        self._names: Optional[List[str]] = None
+        self._by_stem: Optional[Dict[str, str]] = None
+
+    def _namelist(self) -> List[str]:
+        if self._names is None:
+            try:
+                with zipfile.ZipFile(self.zip_path) as z:
+                    self._names = z.namelist()
+            except Exception:
+                self._names = []
+        return self._names
+
+    def _stem_index(self) -> Dict[str, str]:
+        if self._by_stem is None:
+            idx: Dict[str, str] = {}
+            for n in self._namelist():
+                ext = os.path.splitext(n)[1].lower()
+                if ext in TEXTURE_EXTS:
+                    stem = os.path.basename(n)[: -len(ext)] if ext else ""
+                    # First occurrence wins — matches DirSearchRoot behaviour.
+                    idx.setdefault(stem.lower(), n)
+            self._by_stem = idx
+        return self._by_stem
+
+    def iter_materials_json(self):
+        names = [n for n in self._namelist() if n.endswith("materials.json")]
+        if not names:
+            return
+        try:
+            with zipfile.ZipFile(self.zip_path) as z:
+                for n in names:
+                    try:
+                        raw = z.read(n).decode("utf-8", errors="replace")
+                        yield f"{self.zip_path}!{n}", json.loads(raw)
+                    except Exception:
+                        # BeamNG ships some materials.json with trailing commas
+                        # / comments that strict json rejects.  Skip quietly —
+                        # 39 of 332 game files, none of them ones we need.
+                        continue
+        except Exception:
+            return
+
+    def find_texture(self, stem: str) -> Optional[str]:
+        member = self._stem_index().get(stem.lower())
+        return f"{self.zip_path}!{member}" if member else None
+
+    def iter_texture_stems(self):
+        for stem, member in self._stem_index().items():
+            yield stem, f"{self.zip_path}!{member}"
+
+
+def split_zip_path(path: str) -> Tuple[Optional[str], Optional[str]]:
+    """Split a ``archive.zip!inner/member.png`` path.
+
+    Returns ``(zip_path, member)`` or ``(None, None)`` for a plain file path.
+    """
+    if "!" not in path:
+        return None, None
+    zp, member = path.rsplit("!", 1)
+    return (zp, member) if zp.lower().endswith(".zip") else (None, None)
+
+
+def materialize_texture(path: str, extract_dir: str) -> Optional[str]:
+    """Ensure *path* is a real file on disk, extracting from a zip if needed.
+
+    Zip members are extracted to *extract_dir* (mirroring their inner path) and
+    cached — a second call for the same member reuses the extracted file.
+    Returns a plain filesystem path, or None if extraction failed.
+    """
+    zip_path, member = split_zip_path(path)
+    if zip_path is None:
+        return path if os.path.isfile(path) else None
+
+    dest = os.path.join(extract_dir, member.replace("/", os.sep))
+    if os.path.isfile(dest) and os.path.getsize(dest) > 0:
+        return dest
+    try:
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with zipfile.ZipFile(zip_path) as z:
+            with z.open(member) as src, open(dest, "wb") as out:
+                out.write(src.read())
+        return dest
+    except Exception as e:
+        import sys
+        sys.stderr.write(f"[BeamNG] Could not extract {member} from {zip_path}: {e}\n")
+        return None
+
+
+def find_beamng_install(hint: Optional[str] = None) -> Optional[str]:
+    """Locate a BeamNG.drive install containing ``content/vehicles``.
+
+    Tries *hint* first, then walks up from it (a user may point at any depth),
+    then a handful of common install locations.  Returns the install root or
+    None.
+    """
+    candidates: List[str] = []
+    if hint:
+        h = os.path.normpath(hint)
+        candidates.append(h)
+        # Walk up — the hint may be .../BeamNG.drive/content/vehicles or deeper.
+        p = Path(h)
+        candidates.extend(str(a) for a in p.parents)
+
+    for env in ("BEAMNG_INSTALL", "BEAMNG_PATH"):
+        v = os.environ.get(env)
+        if v:
+            candidates.append(os.path.normpath(v))
+
+    candidates += [
+        r"D:\danish\Games\beamng\BeamNG.drive",
+        r"C:\Program Files (x86)\Steam\steamapps\common\BeamNG.drive",
+        r"C:\Program Files\Steam\steamapps\common\BeamNG.drive",
+        r"D:\Steam\steamapps\common\BeamNG.drive",
+        r"D:\SteamLibrary\steamapps\common\BeamNG.drive",
+        r"E:\SteamLibrary\steamapps\common\BeamNG.drive",
+    ]
+
+    for c in candidates:
+        if c and os.path.isdir(os.path.join(c, _GAME_VEHICLE_SUBDIR)):
+            return c
     return None
 
 
-def parse_materials_json(vehicle_folder: str) -> Dict[str, Dict[str, Tuple[str, bool]]]:
-    """Parse all ``*.materials.json`` files under *vehicle_folder*.
+def build_search_roots(
+    vehicle_folder: str,
+    game_dir: Optional[str] = None,
+    include_game: bool = True,
+) -> List[SearchRoot]:
+    """Ordered roots to resolve materials/textures against.
+
+    The vehicle folder comes first so a mod can override a base-game material.
+    Then ``common.zip`` (where shared tyre/brake/mirror materials live), then
+    the remaining vehicle zips.
+    """
+    roots: List[SearchRoot] = [DirSearchRoot(vehicle_folder)]
+    if not include_game:
+        return roots
+
+    install = find_beamng_install(game_dir)
+    if not install:
+        return roots
+
+    vdir = os.path.join(install, _GAME_VEHICLE_SUBDIR)
+    try:
+        zips = sorted(
+            os.path.join(vdir, f)
+            for f in os.listdir(vdir)
+            if f.lower().endswith(".zip")
+        )
+    except OSError:
+        return roots
+
+    # common.zip holds the shared materials (tire_01a, disc_brake, ...) — put it
+    # ahead of the per-vehicle zips so it wins ties.
+    common = [z for z in zips if os.path.basename(z).lower() == "common.zip"]
+    others = [z for z in zips if z not in common]
+    roots.extend(ZipSearchRoot(z) for z in common + others)
+    return roots
+
+
+def _as_roots(
+    folder_or_roots: "str | Sequence[SearchRoot]",
+) -> List[SearchRoot]:
+    """Accept either a plain folder path (legacy) or a list of roots."""
+    if isinstance(folder_or_roots, (str, os.PathLike)):
+        return [DirSearchRoot(str(folder_or_roots))]
+    return list(folder_or_roots)
+
+
+def resolve_texture_path(
+    json_path: str,
+    folder_or_roots: "str | Sequence[SearchRoot]",
+) -> Optional[str]:
+    """Find an actual texture file from a JSON texture path.
+
+    BeamNG JSON paths look like ``/vehicles/flanje_e180/textures/color.dds``.
+    We strip the directory, keep the stem, and search each root in order.
+    Accepts a plain folder path (legacy callers) or a list of
+    :class:`SearchRoot`.  A returned path may be a ``archive.zip!member`` ref —
+    pass it through :func:`materialize_texture` before loading.
+    """
+    if not json_path or json_path.startswith("@"):
+        return None
+    stem = Path(os.path.basename(json_path)).stem
+    for root in _as_roots(folder_or_roots):
+        hit = root.find_texture(stem)
+        if hit:
+            return hit
+    return None
+
+
+def parse_materials_json(
+    folder_or_roots: "str | Sequence[SearchRoot]",
+) -> Dict[str, Dict[str, Tuple[str, bool]]]:
+    """Parse all ``*.materials.json`` across the given roots.
 
     Returns a dict keyed by *lowercase* ``mapTo`` name, where each value is
-    ``{socket_name: (abs_path, is_normal)}``.
+    ``{socket_name: (path, is_normal)}``.
     Only includes entries that have at least one resolved texture.
+
+    Roots are searched in order and *earlier roots win* per socket, so a mod's
+    own definition overrides the base game's.
     """
+    roots = _as_roots(folder_or_roots)
     material_map: Dict[str, Dict[str, Tuple[str, bool]]] = {}
-    for json_file in Path(vehicle_folder).rglob("*.materials.json"):
-        try:
-            with open(json_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception as e:
-            import sys
-            sys.stderr.write(f"[BeamNG] Could not read {json_file}: {e}\n")
-            continue
 
-        for mat_key, mat_def in data.items():
-            if not isinstance(mat_def, dict):
+    for root in roots:
+        for _display, data in root.iter_materials_json():
+            if not isinstance(data, dict):
                 continue
-            map_to = mat_def.get("mapTo") or mat_def.get("name") or mat_key
-            map_to_lower = map_to.lower()
-            tex_paths: Dict[str, Tuple[str, bool]] = {}
-
-            for stage in mat_def.get("Stages", []):
-                if not isinstance(stage, dict):
+            for mat_key, mat_def in data.items():
+                if not isinstance(mat_def, dict):
                     continue
-                for field, (socket, is_normal) in JSON_FIELD_MAP.items():
-                    val = stage.get(field)
-                    if val and isinstance(val, str) and not val.startswith("@"):
-                        resolved = resolve_texture_path(val, vehicle_folder)
-                        if resolved and socket not in tex_paths:
-                            tex_paths[socket] = (resolved, is_normal)
+                map_to = mat_def.get("mapTo") or mat_def.get("name") or mat_key
+                map_to_lower = map_to.lower()
+                tex_paths: Dict[str, Tuple[str, bool]] = {}
 
-            if tex_paths:
-                existing = material_map.get(map_to_lower)
-                if existing is None:
-                    material_map[map_to_lower] = tex_paths
-                else:
-                    for socket, val in tex_paths.items():
-                        if socket not in existing:
-                            existing[socket] = val
+                for stage in mat_def.get("Stages", []):
+                    if not isinstance(stage, dict):
+                        continue
+                    for field, (socket, is_normal) in JSON_FIELD_MAP.items():
+                        val = stage.get(field)
+                        if val and isinstance(val, str) and not val.startswith("@"):
+                            # Resolve against ALL roots, not just the one that
+                            # held the JSON: a mod material can reference a
+                            # base-game texture and vice versa.
+                            resolved = resolve_texture_path(val, roots)
+                            if resolved and socket not in tex_paths:
+                                tex_paths[socket] = (resolved, is_normal)
+
+                if tex_paths:
+                    existing = material_map.get(map_to_lower)
+                    if existing is None:
+                        material_map[map_to_lower] = tex_paths
+                    else:
+                        for socket, val in tex_paths.items():
+                            if socket not in existing:
+                                existing[socket] = val
 
     return material_map
 
@@ -151,22 +416,21 @@ def parse_stem_filename(stem: str) -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 
-def build_filename_lookup(vehicle_folder: str) -> Dict[str, Dict[str, str]]:
-    """Fallback: scan texture files by name.
+def build_filename_lookup(
+    folder_or_roots: "str | Sequence[SearchRoot]",
+) -> Dict[str, Dict[str, str]]:
+    """Fallback: scan texture files by name across all roots.
 
-    Returns ``{material_name_lower: {suffix: abs_path}}``.
+    Returns ``{material_name_lower: {suffix: path}}``.  Earlier roots win, so a
+    mod's texture shadows a base-game one of the same name.
     """
     lookup: Dict[str, Dict[str, str]] = {}
-    for f in Path(vehicle_folder).rglob("*"):
-        if f.suffix.lower() not in (".dds", ".png", ".jpg"):
-            continue
-        mat_name, suffix_key = parse_stem_filename(f.stem)
-        if mat_name is None:
-            continue
-        if mat_name not in lookup:
-            lookup[mat_name] = {}
-        if suffix_key not in lookup[mat_name]:
-            lookup[mat_name][suffix_key] = str(f)
+    for root in _as_roots(folder_or_roots):
+        for stem, path in root.iter_texture_stems():
+            mat_name, suffix_key = parse_stem_filename(stem)
+            if mat_name is None:
+                continue
+            lookup.setdefault(mat_name, {}).setdefault(suffix_key, path)
     return lookup
 
 
@@ -271,55 +535,50 @@ def _extract_shader_params(mat_def: dict) -> Dict[str, object]:
 
 
 def parse_material_shader_params(
-    vehicle_folder: str,
+    folder_or_roots: "str | Sequence[SearchRoot]",
 ) -> Dict[str, Dict[str, object]]:
-    """Parse all ``*.materials.json`` files and return shader parameters for
+    """Parse all ``*.materials.json`` and return shader parameters for
     materials that do NOT have any resolvable texture files.
 
     Returns ``{lowercase_mapTo: {blender_socket: value}}``.
     """
-    from pathlib import Path as _Path
-    import json as _json
-
+    roots = _as_roots(folder_or_roots)
     material_params: Dict[str, Dict[str, object]] = {}
-    for json_file in _Path(vehicle_folder).rglob("*.materials.json"):
-        try:
-            with open(json_file, "r", encoding="utf-8") as f:
-                data = _json.load(f)
-        except Exception:
-            continue
 
-        for mat_key, mat_def in data.items():
-            if not isinstance(mat_def, dict):
+    for root in roots:
+        for _display, data in root.iter_materials_json():
+            if not isinstance(data, dict):
                 continue
-            map_to = mat_def.get("mapTo") or mat_def.get("name") or mat_key
-            map_to_lower = map_to.lower()
-
-            # Skip if this material already has texture paths.
-            has_textures = False
-            for stage in mat_def.get("Stages", []):
-                if not isinstance(stage, dict):
+            for mat_key, mat_def in data.items():
+                if not isinstance(mat_def, dict):
                     continue
-                for field in JSON_FIELD_MAP:
-                    val = stage.get(field)
-                    if val and isinstance(val, str) and not val.startswith("@"):
-                        resolved = resolve_texture_path(val, vehicle_folder)
-                        if resolved:
-                            has_textures = True
-                            break
+                map_to = mat_def.get("mapTo") or mat_def.get("name") or mat_key
+                map_to_lower = map_to.lower()
+
+                # Skip if this material already has texture paths.
+                has_textures = False
+                for stage in mat_def.get("Stages", []):
+                    if not isinstance(stage, dict):
+                        continue
+                    for field in JSON_FIELD_MAP:
+                        val = stage.get(field)
+                        if val and isinstance(val, str) and not val.startswith("@"):
+                            if resolve_texture_path(val, roots):
+                                has_textures = True
+                                break
+                    if has_textures:
+                        break
+
                 if has_textures:
-                    break
+                    continue
 
-            if has_textures:
-                continue
-
-            params = _extract_shader_params(mat_def)
-            if params:
-                existing = material_params.get(map_to_lower)
-                if existing is None:
-                    material_params[map_to_lower] = params
-                else:
-                    existing.update(params)
+                params = _extract_shader_params(mat_def)
+                if params:
+                    existing = material_params.get(map_to_lower)
+                    if existing is None:
+                        material_params[map_to_lower] = params
+                    else:
+                        existing.update(params)
 
     return material_params
 
@@ -387,11 +646,14 @@ def build_material_from_params(
 def build_material_node_tree(
     mat: "bpy.types.Material",  # noqa: F821 — only called from Blender
     tex_paths: Dict[str, Tuple[str, bool]],
+    extract_dir: Optional[str] = None,
 ) -> None:
     """Build a Principled BSDF node tree for *mat* from a texture map.
 
     *tex_paths* is the output of :func:`parse_materials_json` or
-    :func:`find_by_filename`: ``{socket_name: (abs_path, is_normal)}``.
+    :func:`find_by_filename`: ``{socket_name: (path, is_normal)}``.  A path may
+    be a ``archive.zip!member`` reference; *extract_dir* is where such members
+    get extracted so Blender can load them (required if any zip refs present).
 
     This function requires ``bpy`` (Blender Python API) and should only be
     called from addon operators or Blender scripts.
@@ -412,11 +674,28 @@ def build_material_node_tree(
     x_offset = -400
     y_offset = 600
 
-    for socket_name, (abs_path, is_normal) in tex_paths.items():
+    for socket_name, (raw_path, is_normal) in tex_paths.items():
         img_node = nodes.new("ShaderNodeTexImage")
         img_node.location = (x_offset, y_offset)
         img_node.label = socket_name
         y_offset -= 300
+
+        # Zip members must hit the filesystem before Blender can load them.
+        abs_path = raw_path
+        if split_zip_path(raw_path)[0] is not None:
+            if not extract_dir:
+                import sys
+                sys.stderr.write(
+                    f"[BeamNG] {raw_path} is inside a zip but no extract_dir "
+                    f"was given; skipping\n"
+                )
+                nodes.remove(img_node)
+                continue
+            extracted = materialize_texture(raw_path, extract_dir)
+            if not extracted:
+                nodes.remove(img_node)
+                continue
+            abs_path = extracted
 
         img_name = os.path.basename(abs_path)
         img = bpy.data.images.get(img_name)

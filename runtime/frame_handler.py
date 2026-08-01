@@ -16,6 +16,7 @@ change — so the animation keeps playing after Ctrl+Z or file reload.
 from typing import Optional
 
 from .mesh_update import CachePlayback
+from .tyre_deform import TyreSettings
 
 try:  # pragma: no cover - only inside Blender
     import bpy
@@ -27,6 +28,19 @@ _ACTIVE_COLLECTION = "BeamNG Cache"
 
 _active: Optional[CachePlayback] = None
 _frame_start: int = 0
+# The "Start at Frame" knob, in Blender FRAMES — this is the canonical storage
+# and _frame_start is just a copy of it.
+#
+# It used to be held in SECONDS (_frame_start = start_second * output_fps) so
+# the offset kept cache frame 0 at the same *time* across an output_fps change.
+# That is defensible, but it surprised the user: typing 500 meant 500 SECONDS,
+# which at 60 output fps put frame 0 at frame 30000.  Frames are what the
+# timeline actually shows, so frames is what the field now means.
+#
+# The tradeoff this re-introduces on purpose: changing Output FPS now keeps the
+# same frame NUMBER, so the start moves in time (frame 500 is 8.3 s at 60 fps
+# but 20.8 s at 24 fps).  Set the start after settling on Output FPS.
+_start_frame: int = 0
 # Time-based mapping: one *source* (captured) frame plays every
 # (output_fps / playback_fps) Blender frames.  This decouples the animation's
 # SPEED (playback_fps — how many captured frames advance per real second) from
@@ -88,6 +102,83 @@ def _set_realtime_sync() -> None:
         pass
 
 
+def _apply_timeline(scene, keep_playhead: bool = True) -> None:
+    """Re-derive ``scene.frame_start``/``frame_end`` from the live settings.
+
+    ``_frame_start`` is simply ``_start_frame`` — the offset is stored in
+    Blender frames, so the animation starts on the frame number the user typed.
+    The end is ``frame_start + duration_s * output_fps`` with
+    ``duration_s = (n_src - 1) / playback_fps``, so the DURATION still tracks
+    playback speed even though the START is a fixed frame.
+
+    With ``keep_playhead`` the playhead is nudged back inside the new range when
+    the offset pushed it outside; otherwise every frame before ``frame_start``
+    clamps to cache frame 0 and the car looks frozen/broken.
+    """
+    global _frame_start
+    _frame_start = int(_start_frame)
+    scene.frame_start = _frame_start
+    scene["_beamng_frame_start"] = _frame_start
+    scene["_beamng_start_frame"] = _frame_start
+
+    if _active is None:
+        return
+    n_src = _active.reader.frame_count
+    duration_s = (n_src - 1) / _playback_fps if n_src > 1 else 0.0
+    scene.frame_end = _frame_start + int(round(duration_s * _output_fps))
+
+    if keep_playhead:
+        clamped = min(max(scene.frame_current, scene.frame_start), scene.frame_end)
+        if clamped != scene.frame_current:
+            scene.frame_current = clamped
+
+
+def _refresh_current_frame(scene) -> None:
+    """Re-run the frame the playhead sits on and redraw the 3D views.
+
+    Used by the live-retune entry points: the playhead may not have moved, so no
+    frame-change handler fires on its own and the viewport would keep showing
+    the geometry from the previous settings.
+    """
+    if _active is None:
+        return
+    _active.set_frame(_cache_frame_for(scene.frame_current))
+    for area in getattr(getattr(bpy.context, "screen", None), "areas", ()) or ():
+        if area.type == "VIEW_3D":
+            area.tag_redraw()
+
+
+def update_start_frame(start_frame: int) -> None:
+    """Move cache frame 0 to Blender frame ``start_frame`` on the LIVE timeline.
+
+    Called from the add-on's "Start at Frame" property callback so the offset is
+    retunable without re-importing the cache: the mapping in
+    :func:`_cache_frame_for` is pure arithmetic on ``_frame_start``, so shifting
+    the whole animation is just a matter of re-deriving the frame range and
+    re-running the current frame.
+    """
+    global _start_frame
+    _start_frame = max(0, int(round(float(start_frame))))
+
+    if bpy is None:
+        return
+    scene = bpy.context.scene
+    if scene is None:
+        return
+    _apply_timeline(scene)
+    _refresh_current_frame(scene)
+
+
+def update_start_second(start_second: float) -> None:
+    """Deprecated seconds-based alias for :func:`update_start_frame`.
+
+    The panel field is frames now.  This is kept so an older saved .blend, or
+    any caller that still thinks in seconds, converts instead of breaking.
+    """
+    fps = _output_fps if _output_fps > 0 else 1.0
+    update_start_frame(int(round(max(0.0, float(start_second)) * fps)))
+
+
 def update_fps(playback_fps: Optional[float] = None,
                output_fps: Optional[float] = None) -> None:
     """Update the playback/output frame rates on the LIVE handler.
@@ -117,12 +208,56 @@ def update_fps(playback_fps: Optional[float] = None,
     scene["_beamng_playback_fps"] = _playback_fps
     scene["_beamng_output_fps"] = _output_fps
 
-    # Recompute timeline length so the whole cache still fits and the duration
-    # reflects the new speed (duration_s = (n_src - 1) / playback_fps).
-    if _active is not None:
-        n_src = _active.reader.frame_count
-        duration_s = (n_src - 1) / _playback_fps if n_src > 1 else 0.0
-        scene.frame_end = _frame_start + int(round(duration_s * _output_fps))
+    # Recompute the timeline: the start offset is held in FRAMES, so a new
+    # output_fps keeps frame_start fixed and only re-derives frame_end (the
+    # duration still tracks the fps ratio).
+    _apply_timeline(scene)
+
+
+_TYRE_KEYS = ("amount", "extra", "bulge", "release", "ground_z", "names")
+
+
+def update_tyre(**kwargs) -> None:
+    """Push tyre ground-contact settings to the LIVE playback and redraw.
+
+    Called from the add-on's tyre property callbacks so the sliders update the
+    viewport immediately (no re-import).  Accepts any subset of
+    :class:`TyreSettings` fields; unknown/None values are ignored.  The values
+    are also stored on the scene so undo/reload recovery restores them.
+    """
+    if _active is None:
+        if bpy is not None and bpy.context.scene is not None:
+            _store_tyre(bpy.context.scene, TyreSettings().update(**kwargs))
+        return
+
+    tyre = TyreSettings.from_dict(_active.tyre.to_dict()).update(**kwargs)
+    _active.set_tyre_settings(tyre)
+
+    if bpy is None:
+        return
+    scene = bpy.context.scene
+    if scene is None:
+        return
+    _store_tyre(scene, tyre)
+    # Re-run the current frame so the change is visible without scrubbing.
+    _refresh_current_frame(scene)
+
+
+def _store_tyre(scene, tyre: TyreSettings) -> None:
+    """Persist tyre settings as scene custom props (survives undo/reload)."""
+    data = tyre.to_dict()
+    for key in _TYRE_KEYS:
+        scene[f"_beamng_tyre_{key}"] = data[key]
+
+
+def _load_tyre(scene) -> TyreSettings:
+    """Restore tyre settings from scene custom props (undo/reload recovery)."""
+    stored = {}
+    for key in _TYRE_KEYS:
+        val = scene.get(f"_beamng_tyre_{key}")
+        if val is not None:
+            stored[key] = val
+    return TyreSettings.from_dict(stored)
 
 
 def set_force_depsgraph(enabled: bool) -> None:
@@ -158,7 +293,7 @@ def _try_recover(scene) -> bool:
 
     Returns True if recovery succeeded (or wasn't needed).
     """
-    global _active, _frame_start, _playback_fps, _output_fps
+    global _active, _frame_start, _start_frame, _playback_fps, _output_fps
 
     # Already active — nothing to do
     if _active is not None:
@@ -181,6 +316,15 @@ def _try_recover(scene) -> bool:
         use_chunked = bool(scene.get("_beamng_use_chunked", False))
         _playback_fps = float(scene.get("_beamng_playback_fps", _playback_fps))
         _output_fps = float(scene.get("_beamng_output_fps", _output_fps))
+        # Frames are canonical.  A .blend saved by the older seconds-based build
+        # only has "_beamng_start_second", so convert it with the recovered
+        # output_fps — otherwise reopening such a file would reset the offset.
+        stored_frame = scene.get("_beamng_start_frame")
+        if stored_frame is None:
+            legacy_second = scene.get("_beamng_start_second")
+            stored_frame = (float(legacy_second) * _output_fps
+                            if legacy_second is not None else frame_start)
+        _start_frame = max(0, int(round(float(stored_frame))))
 
         reader = CacheReader(cache_path)
         chunk_map = None
@@ -190,7 +334,8 @@ def _try_recover(scene) -> bool:
             chunk_map = {k: list(v) for k, v in CHUNK_MAP_E180.items()}
 
         # Mesh objects already exist after undo — just reconnect the reader
-        playback = CachePlayback(reader, chunk_map=chunk_map)
+        playback = CachePlayback(reader, chunk_map=chunk_map,
+                                tyre=_load_tyre(scene))
         # Rebuild internal name→object lookup from existing scene objects
         collection = bpy.data.collections.get(_ACTIVE_COLLECTION)
         if collection is None:
@@ -199,6 +344,30 @@ def _try_recover(scene) -> bool:
         # Source objects (chunked mode keeps individual meshes in source coll)
         source_coll = bpy.data.collections.get(f"{_ACTIVE_COLLECTION} (Source)")
         playback_coll = collection  # visible playback collection
+
+        # --- reconnect the rigid-transform parent empty ---------------------
+        # build_scene() creates a "<collection>__root" Empty and drives its
+        # matrix_basis per frame from the BVC transform block; every mesh is
+        # parented to it.  The Empty and the parenting are saved in the .blend,
+        # but _transform_empty is module state, so after a reload it is None and
+        # _apply_transform() returns early — the car then deforms correctly but
+        # sits at the origin instead of following the captured motion.
+        # Re-bind it by name (it is only present when the cache HAS transform
+        # data, matching _create_transform_empty's own guard).
+        if reader.header.get("transform_data_offset", 0):
+            root_name = f"{_ACTIVE_COLLECTION}__root"
+            root = playback_coll.objects.get(root_name)
+            if root is None:
+                root = bpy.data.objects.get(root_name)
+            if root is None:
+                # Parenting survives even if the Empty was moved out of the
+                # collection, so fall back to the meshes' shared parent.
+                for obj in playback_coll.objects:
+                    if obj.type == "MESH" and obj.parent is not None \
+                            and obj.parent.type == "EMPTY":
+                        root = obj.parent
+                        break
+            playback._transform_empty = root
 
         # --- rebuild _objects (source / individual meshes) ---
         for obj in source_coll.objects if source_coll else collection.objects:
@@ -284,10 +453,15 @@ def _on_frame_change(scene, _depsgraph=None) -> None:  # pragma: no cover - Blen
 
 
 def attach(playback: CachePlayback, frame_start: int = 0,
-           playback_fps: float = 24.0, output_fps: float = 24.0) -> None:
+           playback_fps: float = 24.0, output_fps: float = 24.0,
+           start_second: Optional[float] = None) -> None:
     """Register ``playback`` as the active sequence and hook the timeline.
 
-    ``frame_start`` is the Blender frame that maps to cache frame 0.
+    ``frame_start`` is the Blender frame that maps to cache frame 0 — the
+    canonical form (see :data:`_start_frame`), and what
+    :func:`update_start_frame` retunes live.  ``start_second`` is the deprecated
+    seconds spelling of the same thing; when given it is converted with
+    ``output_fps`` and takes precedence, so old callers keep working.
     ``playback_fps`` is the capture/source rate (animation SPEED — how many
     captured frames advance per real second).  ``output_fps`` is the scene's
     render frame rate (smoothness).  The two are independent: the timeline is
@@ -299,17 +473,21 @@ def attach(playback: CachePlayback, frame_start: int = 0,
     """
     if bpy is None:
         raise RuntimeError("frame handler requires Blender (bpy)")
-    global _active, _frame_start, _playback_fps, _output_fps
+    global _active, _frame_start, _start_frame, _playback_fps, _output_fps
     _active = playback
-    _frame_start = frame_start
     _playback_fps = max(0.001, float(playback_fps))
     _output_fps = max(0.001, float(output_fps))
+    # Frames are canonical; the deprecated seconds spelling converts into them.
+    _start_frame = (int(round(max(0.0, float(start_second)) * _output_fps))
+                    if start_second is not None
+                    else max(0, int(round(float(frame_start)))))
+    _frame_start = _start_frame
 
     detach_handler()  # avoid duplicate registrations
     bpy.app.handlers.frame_change_pre.append(_on_frame_change)
 
     scene = bpy.context.scene
-    scene.frame_start = frame_start
+    scene.frame_start = _frame_start
 
     # THE RENDER-SPEED FIX (the part that actually governs the RENDER, not the
     # viewport): the rendered clip plays Blender frames [frame_start, frame_end]
@@ -328,7 +506,7 @@ def attach(playback: CachePlayback, frame_start: int = 0,
     # duration_seconds = (frame_count - 1) / playback_fps.
     n_src = playback.reader.frame_count
     duration_s = (n_src - 1) / _playback_fps if n_src > 1 else 0.0
-    scene.frame_end = frame_start + int(round(duration_s * _output_fps))
+    scene.frame_end = _frame_start + int(round(duration_s * _output_fps))
 
     # Viewport-only nicety: play at real wall-clock speed (drop frames instead
     # of crawling) so the PREVIEW matches the render.  Has NO effect on the
@@ -337,10 +515,12 @@ def attach(playback: CachePlayback, frame_start: int = 0,
 
     # Store state for undo/reload recovery
     scene["_beamng_cache_path"] = str(playback.reader.path)
-    scene["_beamng_frame_start"] = frame_start
+    scene["_beamng_frame_start"] = _frame_start
+    scene["_beamng_start_frame"] = _frame_start
     scene["_beamng_use_chunked"] = playback._chunk_map is not None
     scene["_beamng_playback_fps"] = _playback_fps
     scene["_beamng_output_fps"] = _output_fps
+    _store_tyre(scene, playback.tyre)
 
 
 def detach_handler() -> None:
@@ -360,7 +540,10 @@ def detach() -> None:
     _active = None
     # Clear stored state so _try_recover doesn't fire stale data
     if bpy is not None and bpy.context.scene is not None:
-        for key in ("_beamng_cache_path", "_beamng_frame_start", "_beamng_use_chunked",
-                    "_beamng_playback_fps", "_beamng_output_fps"):
+        keys = ["_beamng_cache_path", "_beamng_frame_start", "_beamng_start_frame",
+                "_beamng_start_second",  # legacy key from the seconds-based build
+                "_beamng_use_chunked", "_beamng_playback_fps", "_beamng_output_fps"]
+        keys += [f"_beamng_tyre_{k}" for k in _TYRE_KEYS]
+        for key in keys:
             if key in bpy.context.scene:
                 del bpy.context.scene[key]

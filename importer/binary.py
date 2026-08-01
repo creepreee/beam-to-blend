@@ -9,6 +9,20 @@ The cache stores, for a sequence of frames:
 V3 adds UV coordinates, material names, and per-face material ids to the
 base mesh (stable objects) and per-frame dynamic data.
 
+V5 adds PER-LOOP (per-face-corner) UVs.  Why this matters
+---------------------------------------------------------
+A UV seam is two mesh corners at the SAME position carrying DIFFERENT UVs.
+With only per-vertex UVs (v3/v4) a seam *requires* two separate vertices, so
+the build-time weld had to keep coincident-but-different-UV vertices apart —
+costing ~78K vertices on the E180 that Blender's own "merge by distance"
+happily collapses.  Blender stores UVs per loop, which is exactly how it
+merges those vertices without tearing the texture.
+
+So v5 writes a ``(face_count, 3, 2)`` f32 loop-UV block per stable object.
+The weld is then free to merge on POSITION alone, and the seam lives in the
+loop UVs instead of in duplicate geometry.  Per-vertex UV blocks are still
+written for backward compatibility / fallback.
+
 Dynamic (topology-changing) objects store per-frame full mesh data
 (positions + indices + uvs + materials) in a separate section after the frame
 blocks.
@@ -21,6 +35,7 @@ V3 file layout
     [Object table]           one entry per object, stable objects first
     [Base mesh blocks]       indices for each stable object, in table order
     [UV blocks]              (N,2) f32 per stable object, in table order — NEW v3
+    [Loop UV blocks]         (F,3,2) f32 per stable object, in table order — NEW v5
     [Material name table]    global dedup of all material names — NEW v3
     [Material blocks]        per stable object: local_names + per-face ids — NEW v3
     [Frame directory]        frame_count * uint64 absolute offsets
@@ -60,6 +75,8 @@ Object table entry (v3)
                                   object's positions start; for stable objects)
     uint64   uv_offset         (abs offset of this object's (N,2) f32 UV block; 0 if none) — NEW v3
     uint64   material_offset   (abs offset of this object's material block; 0 if none) — NEW v3
+    uint64   loop_uv_offset    (abs offset of this object's (F,3,2) f32 loop-UV
+                                block; 0 if none) — NEW v5
 
 Dynamic directory entry  (one per (frame, dynamic_object), in frame-major order)
     uint32   vertex_count
@@ -84,7 +101,7 @@ Material block (one per object, at uv_offset)
 import struct
 
 MAGIC = b"BVC1"
-VERSION = 4
+VERSION = 5
 
 FLAG_STABLE = 1 << 0
 FLAG_WELDED = 1 << 1  # diagnostic: this object's vertices were welded at build time
@@ -226,6 +243,7 @@ def pack_object_entry(
     welded: bool = False,
     uv_offset: int = 0,
     material_offset: int = 0,
+    loop_uv_offset: int = 0,
 ) -> bytes:
     name_bytes = name.encode("utf-8")
     flags = FLAG_STABLE if stable else 0
@@ -244,11 +262,18 @@ def pack_object_entry(
             index_count,
             frame_vertex_offset,
         )
-        + struct.pack("<QQ", uv_offset, material_offset)
+        + struct.pack("<QQQ", uv_offset, material_offset, loop_uv_offset)
     )
 
 
-def unpack_object_entry(data: bytes, offset: int, is_v3: bool = True) -> tuple[dict, int]:
+# Per-object entry tail sizes, by feature level.
+OBJ_EXTRA_V3 = 16  # uv_offset + material_offset
+OBJ_EXTRA_V5 = 24  # + loop_uv_offset
+
+
+def unpack_object_entry(
+    data: bytes, offset: int, is_v3: bool = True, is_v5: bool = False,
+) -> tuple[dict, int]:
     (name_len,) = struct.unpack_from("<H", data, offset)
     offset += 2
     name = data[offset : offset + name_len].decode("utf-8")
@@ -265,9 +290,13 @@ def unpack_object_entry(data: bytes, offset: int, is_v3: bool = True) -> tuple[d
     offset += _OBJ_TAIL.size
     uv_offset = 0
     material_offset = 0
+    loop_uv_offset = 0
     if is_v3:
         uv_offset, material_offset = struct.unpack_from("<QQ", data, offset)
-        offset += 16
+        offset += OBJ_EXTRA_V3
+        if is_v5:
+            (loop_uv_offset,) = struct.unpack_from("<Q", data, offset)
+            offset += 8
     return (
         {
             "name": name,
@@ -281,6 +310,7 @@ def unpack_object_entry(data: bytes, offset: int, is_v3: bool = True) -> tuple[d
             "frame_vertex_offset": frame_vertex_offset,
             "uv_offset": uv_offset,
             "material_offset": material_offset,
+            "loop_uv_offset": loop_uv_offset,
         },
         offset,
     )

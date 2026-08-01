@@ -19,6 +19,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from .cache_reader import CacheReader
+from .tyre_deform import TyreSettings, flatten_tyre, height_basis_from_transform
 
 try:
     import bpy
@@ -235,27 +236,38 @@ def _get_or_create_material(name: str) -> "bpy.types.Material":
 def _apply_uvs_and_materials(
     mesh: "bpy.types.Mesh",
     uvs: Optional[np.ndarray],
+    loop_uvs: Optional[np.ndarray],
     matnames: Optional[List[str]],
     matids: Optional[np.ndarray],
 ) -> None:
     """Set up UV layer and material slots on *mesh*.
 
-    *uvs* is (N,2) float32.  *matnames* is a list of material names for this
-    mesh's material slots.  *matids* is (face_count,) uint16 indices into
-    *matnames*, one per polygon.
+    *uvs* is (N,2) float32 per-vertex UVs (v3/v4 fallback).
+    *loop_uvs* is (F,3,2) float32 per-face-corner UVs (v5).  When present
+    these are used directly — they preserve UV seams after a position-only
+    weld because each face corner carries its own UV.
+    *matnames* is a list of material names for this mesh's material slots.
+    *matids* is (face_count,) uint16 indices into *matnames*, one per polygon.
 
     glTF uses top-left UV origin; Blender uses bottom-left, so the V
     coordinate is flipped (v = 1 - v).
     """
-    if uvs is not None and uvs.shape[0] == len(mesh.vertices):
+    if loop_uvs is not None and len(mesh.loops) == loop_uvs.shape[0] * 3:
+        # v5 loop UVs: expand (F,3,2) -> (F*3, 2) flat for foreach_set
+        flat = loop_uvs.reshape(-1, 2).astype(np.float32)
+        loop_uvs_flat = np.empty(len(mesh.loops) * 2, dtype=np.float32)
+        loop_uvs_flat[0::2] = flat[:, 0]
+        loop_uvs_flat[1::2] = 1.0 - flat[:, 1]
         uv_layer = mesh.uv_layers.new(name="UVMap", do_init=False)
-        loop_uvs = np.empty(len(mesh.loops) * 2, dtype=np.float32)
-        mesh.loops.foreach_get("vertex_index", np.empty(len(mesh.loops), dtype=np.int32))
+        uv_layer.data.foreach_set("uv", loop_uvs_flat)
+    elif uvs is not None and uvs.shape[0] == len(mesh.vertices):
+        uv_layer = mesh.uv_layers.new(name="UVMap", do_init=False)
         loop_vidx = np.empty(len(mesh.loops), dtype=np.int32)
         mesh.loops.foreach_get("vertex_index", loop_vidx)
-        loop_uvs[0::2] = uvs[loop_vidx, 0]
-        loop_uvs[1::2] = 1.0 - uvs[loop_vidx, 1]
-        uv_layer.data.foreach_set("uv", loop_uvs)
+        loop_uvs_flat = np.empty(len(mesh.loops) * 2, dtype=np.float32)
+        loop_uvs_flat[0::2] = uvs[loop_vidx, 0]
+        loop_uvs_flat[1::2] = 1.0 - uvs[loop_vidx, 1]
+        uv_layer.data.foreach_set("uv", loop_uvs_flat)
 
     if matnames:
         for mn in matnames:
@@ -310,11 +322,18 @@ class CachePlayback:
     def __init__(self, reader: CacheReader,
                  collection_name: str = "BeamNG Cache",
                  log_path: Optional[str] = None,
-                 chunk_map: Optional[Dict[str, List[str]]] = None):
+                 chunk_map: Optional[Dict[str, List[str]]] = None,
+                 tyre: Optional[TyreSettings] = None):
         if bpy is None:
             raise RuntimeError("CachePlayback requires Blender (bpy)")
         self.reader = reader
         self.collection_name = collection_name
+        self.tyre = tyre if tyre is not None else TyreSettings()
+        # Cache of which object names the tyre filter matches, plus the per-frame
+        # height basis, so the hot path does no string work and reads the rigid
+        # transform once per frame instead of once per object.
+        self._is_tyre: Dict[str, bool] = {}
+        self._tyre_basis: Optional[Tuple[np.ndarray, float]] = None
         self._objects: Dict[str, "bpy.types.Object"] = {}
         self._dynamic_objects: Dict[str, "bpy.types.Object"] = {}
         self._chunk_map: Optional[Dict[str, List[str]]] = chunk_map
@@ -529,14 +548,22 @@ class CachePlayback:
             ranges[mname] = (vert_offset, vert_offset + n_verts)
             vert_offset += n_verts
 
-            # Merge UVs: per-loop UVs from each member, concatenated
+            # Merge UVs: v5 loop UVs (F,3,2) when available, else expand
+            # per-vertex UVs.  Always append n_faces*3*2 entries so the
+            # concatenation stays aligned with the merged face/loop order.
             uvs = self.reader.base_uvs(mname)
-            if uvs.shape[0] == n_verts:
+            lu = self.reader.base_loop_uvs(mname)
+            loop_uvs = np.zeros(n_faces * 3 * 2, dtype=np.float32)
+            if lu is not None and lu.shape[0] == n_faces:
+                # v5 loop UVs: flip V and flatten (F,3,2) -> (F*3, 2)
+                flat = lu.reshape(-1, 2)
+                loop_uvs[0::2] = flat[:, 0]
+                loop_uvs[1::2] = 1.0 - flat[:, 1]
+            elif uvs is not None and uvs.shape[0] == n_verts:
                 loop_vidx = idx.reshape(-1)
-                loop_uvs = np.empty(n_faces * 3 * 2, dtype=np.float32)
                 loop_uvs[0::2] = uvs[loop_vidx, 0]
                 loop_uvs[1::2] = 1.0 - uvs[loop_vidx, 1]
-                all_loop_uvs.append(loop_uvs)
+            all_loop_uvs.append(loop_uvs)
 
             # Merge material ids: remap local material ids into chunk-level ids
             matnames = self.reader.base_material_names(mname)
@@ -559,6 +586,26 @@ class CachePlayback:
         faces = np.concatenate(all_faces, axis=0)
 
         mesh = _mesh_from_data(verts, faces, chunk_name)
+
+        # Apply the merged material slots + per-face ids and per-loop UVs that we
+        # accumulated above.  Without this the chunk mesh has no materials and
+        # _finalize_mesh falls back to a single "BeamNG_Default" slot — the
+        # long-standing "chunk collection has no material slots" bug (the hidden
+        # Source collection had them because the individual path applies them).
+        if chunk_mat_names and all_mat_ids:
+            merged_matids = np.concatenate(all_mat_ids, axis=0)
+            for mn in chunk_mat_names:
+                if mesh.materials.get(mn) is None:
+                    mesh.materials.append(_get_or_create_material(mn))
+            if len(merged_matids) == len(mesh.polygons):
+                mesh.polygons.foreach_set(
+                    "material_index", merged_matids.astype(np.int32))
+        if all_loop_uvs:
+            merged_loop_uvs = np.concatenate(all_loop_uvs, axis=0)
+            if len(merged_loop_uvs) == len(mesh.loops) * 2:
+                uv_layer = mesh.uv_layers.new(name="UVMap", do_init=False)
+                uv_layer.data.foreach_set("uv", merged_loop_uvs)
+
         _finalize_mesh(mesh)
 
         obj = bpy.data.objects.new(chunk_name, mesh)
@@ -602,9 +649,10 @@ class CachePlayback:
         # cache without material data still imports cleanly.
         try:
             uvs = self.reader.base_uvs(name)
+            loop_uvs = self.reader.base_loop_uvs(name)
             matnames = self.reader.base_material_names(name)
             matids = self.reader.base_material_ids(name)
-            _apply_uvs_and_materials(mesh, uvs, matnames, matids)
+            _apply_uvs_and_materials(mesh, uvs, loop_uvs, matnames, matids)
         except Exception as exc:  # pragma: no cover - defensive
             self._log(f"  UV/material apply skipped for {name}: {exc}")
         _finalize_mesh(mesh)
@@ -657,6 +705,55 @@ class CachePlayback:
         self._transform_empty.matrix_basis = mat
         self._transform_empty.rotation_mode = "QUATERNION"
 
+    # --- tyre ground-contact deformation -------------------------------
+    def set_tyre_settings(self, tyre: TyreSettings) -> None:
+        """Replace the tyre tunables and force the next set_frame to redraw.
+
+        Called from the add-on's property callbacks so dragging a slider updates
+        the viewport live.  The name filter may have changed, so the match cache
+        is dropped too.
+        """
+        self.tyre = tyre
+        self._is_tyre.clear()
+        self._current_frame = None  # defeat the "same frame, return early" guard
+
+    def _tyre_match(self, name: str) -> bool:
+        hit = self._is_tyre.get(name)
+        if hit is None:
+            hit = self.tyre.matches(name)
+            self._is_tyre[name] = hit
+        return hit
+
+    def _update_tyre_basis(self, frame: int) -> None:
+        """Recompute the local→world-height basis for *frame* (once per frame).
+
+        The meshes' vertices live in the cache's space; the parent empty (when
+        present) carries the rigid transform, and the importer's auto-ground adds
+        a Z shift on each object.  Both have to be folded in before we can ask
+        "how far is this vertex above the ground".
+        """
+        if not self.tyre.enabled:
+            self._tyre_basis = None
+            return
+        tf = self.reader.frame_transform(frame)
+        up, offset = height_basis_from_transform(tf, ground_z=self.tyre.ground_z)
+        self._tyre_basis = (up, offset)
+
+    def _deform_tyre(self, name: str, obj: "bpy.types.Object",
+                     pos: np.ndarray, frame: int) -> np.ndarray:
+        """Apply ground-contact flattening to *pos* if *name* is a tyre."""
+        if self._tyre_basis is None or not self._tyre_match(name):
+            return pos
+        up, offset = self._tyre_basis
+        if obj is not None:
+            # The auto-ground shift (and any manual move) lives on the object,
+            # outside the vertex data — include it in the height measurement.
+            offset += float(np.asarray(obj.location, dtype=np.float32) @ up)
+        out, squash = flatten_tyre(pos, up, offset, self.tyre)
+        if squash > 0.0:
+            self._log(f"  TYRE {name:40s}  frame {frame}:  squash={squash*1000:.1f} mm")
+        return out
+
     # --- per-frame update ---------------------------------------------
     def set_frame(self, frame: int) -> None:
         frame = max(0, min(frame, self.reader.frame_count - 1))
@@ -676,9 +773,11 @@ class CachePlayback:
         """Original per-object position update (96 calls)."""
         logging = self._log_fh is not None
         self._apply_transform(frame)
+        self._update_tyre_basis(frame)
         for name, obj in self._objects.items():
             raw = self.reader.frame_positions(name, frame)
             positions = self._gltf_to_blender(raw)
+            positions = self._deform_tyre(name, obj, positions, frame)
             flat = np.ascontiguousarray(positions, dtype=np.float32).reshape(-1)
             _write_positions(obj.data, flat, obj)
 
@@ -710,6 +809,7 @@ class CachePlayback:
             existing_fc = len(mesh.polygons)
             new_fc = indices.shape[0]
             pos_blender = self._gltf_to_blender(positions.copy())
+            pos_blender = self._deform_tyre(name, obj, pos_blender, frame)
             if existing_vc != new_vc or existing_fc != new_fc:
                 mesh.clear_geometry()
                 _fill_mesh_via_bmesh(mesh, pos_blender, indices)
@@ -729,12 +829,18 @@ class CachePlayback:
     def _set_frame_chunked(self, frame: int) -> None:
         """Update chunk meshes (one foreach_set per chunk)."""
         self._apply_transform(frame)
+        self._update_tyre_basis(frame)
         for chunk_name, obj in self._chunks.items():
             member_ranges = self._chunk_member_ranges[chunk_name]
             parts = []
             for mname, (start, end) in member_ranges.items():
                 raw = self.reader.frame_positions(mname, frame)
                 pos = self._gltf_to_blender(raw)
+                # Deform per MEMBER, not per chunk: each tyre needs its own axle
+                # axis and its own contact depth, which a merged 'wheels' chunk
+                # would smear across all four wheels.  The chunk object carries
+                # the auto-ground offset for its members.
+                pos = self._deform_tyre(mname, obj, pos, frame)
                 parts.append(pos)
             combined = np.concatenate(parts, axis=0)
 
@@ -757,15 +863,15 @@ class CachePlayback:
             new_vc = positions.shape[0]
             existing_fc = len(mesh.polygons)
             new_fc = indices.shape[0]
+            pos_blender = self._deform_tyre(
+                name, obj, self._gltf_to_blender(positions.copy()), frame)
             if existing_vc != new_vc or existing_fc != new_fc:
-                pos_blender = self._gltf_to_blender(positions.copy())
                 mesh.clear_geometry()
                 _fill_mesh_via_bmesh(mesh, pos_blender, indices)
                 _finalize_mesh(mesh)
                 mesh.update_tag()
                 obj.update_tag()
             else:
-                pos_blender = self._gltf_to_blender(positions.copy())
                 self._log_bounds("AFTER_XFORM", name, frame, pos_blender)
                 flat = np.ascontiguousarray(pos_blender, dtype=np.float32).reshape(-1)
                 _write_positions(mesh, flat, obj)

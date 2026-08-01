@@ -30,6 +30,7 @@ temp.txt
 *.log
 newcapture*.txt
 2026-*.txt
+massages-below.txt
 
 # Tooling internals
 .opencode/

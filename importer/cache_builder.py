@@ -190,12 +190,25 @@ def _weld_object(
     indices: Optional[np.ndarray],
     uvs: Optional[np.ndarray],
     epsilon: float = 1e-5,
+    uv_epsilon: float = 1e-4,
 ) -> Tuple[np.ndarray, Optional[np.ndarray], Optional[np.ndarray], np.ndarray]:
-    """Remove exact-duplicate vertices (position-only, tight epsilon).
+    """Remove exact-duplicate vertices (position AND UV, tight epsilon).
 
     Snaps positions to a grid of ``epsilon`` precision, finds unique rows,
-    and builds a remap table.  Only vertices at nearly identical positions
-    are merged — UV seams, glass interiors, and headlight faces are safe.
+    and builds a remap table.
+
+    THE UV SEAM FIX
+    ---------------
+    A UV seam is *by definition* two vertices at the SAME position carrying
+    DIFFERENT UVs — that's how a tyre tread wraps (u=0 meets u=1).  A
+    position-only weld merges them and then keeps a single arbitrary survivor
+    UV (``uvs[unique_ids]``), which tears the texture across the seam.
+    Measured on a real capture, 44 of 49 merges on ``tire_01a_16x7_26``
+    collapsed a genuine seam with a UV jump of ~1.0 — the whole texture width.
+
+    So the merge key is ``(snapped position, snapped uv)``: vertices fuse only
+    when they agree on both.  Coincident vertices that share a UV (the bulk of
+    the win — e.g. 818/818 merges on ``flanje_e180_wheelcap``) still merge.
 
     Returns:
       * welded_positions  (K, 3) float32 — K unique vertices
@@ -207,12 +220,18 @@ def _weld_object(
     if n == 0:
         return positions, indices, uvs, np.zeros(0, dtype=np.int32)
 
-    # Snap to grid and find unique rows
-    snapped = np.round(positions / epsilon) * epsilon
+    # Snap to grid and find unique rows.  When UVs are present they join the
+    # key so seam-split vertices survive as distinct vertices.
+    snapped = np.round(positions / epsilon).astype(np.int64)
+    if uvs is not None and uvs.size > 0 and uvs.shape[0] == n:
+        snapped_uv = np.round(uvs / uv_epsilon).astype(np.int64)
+        key = np.column_stack([snapped, snapped_uv])
+    else:
+        key = snapped
     _, unique_ids, inverse = np.unique(
-        snapped, axis=0, return_index=True, return_inverse=True
+        key, axis=0, return_index=True, return_inverse=True
     )
-    remap = inverse.astype(np.int32)
+    remap = inverse.astype(np.int32).ravel()
 
     k = unique_ids.shape[0]
     welded_positions = positions[unique_ids].astype(np.float32, copy=False)
@@ -231,6 +250,8 @@ def _weld_object(
 def _weld_keep_remap_multiframe(
     pos_frames: List[np.ndarray],
     epsilon: float = 1e-4,
+    uvs: Optional[np.ndarray] = None,
+    uv_epsilon: float = 1e-4,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Cross-frame-safe vertex weld: merge only vertices that stay coincident
     across EVERY sampled frame.
@@ -250,10 +271,16 @@ def _weld_keep_remap_multiframe(
     A windshield vertex and a body vertex that ever move apart get different
     signatures and are kept distinct.  Safe by construction.
 
+    UV seams are also preserved: when *uvs* is given, the signature is seeded
+    with the snapped UV, so two coincident vertices carrying different UVs never
+    merge.  See :func:`_weld_object` for why that matters (tyre tread wrap).
+
     Args:
       pos_frames: list of (N,3) float arrays, one per sampled frame, all in the
                   SAME vertex order (this object's local order).
       epsilon:    merge distance (grid cell size).
+      uvs:        optional (N,2) float array — when present, vertices only merge
+                  if their UVs agree to *uv_epsilon* as well.
 
     Returns:
       keep:  (K,) int64 — indices of the vertices to KEEP (first of each group)
@@ -267,6 +294,14 @@ def _weld_keep_remap_multiframe(
     # all frames at once).  Two verts keep the same label only while they share
     # the same snapped cell in every processed frame.
     labels = np.zeros(n, dtype=np.int64)
+
+    # Seed the signature with the UV so seam-split vertices start out in
+    # different groups and can never be fused by later frames.
+    if uvs is not None and uvs.size > 0 and uvs.shape[0] == n:
+        snapped_uv = np.round(uvs / uv_epsilon).astype(np.int64)
+        _, labels = np.unique(snapped_uv, axis=0, return_inverse=True)
+        labels = labels.astype(np.int64).ravel()
+
     for pos in pos_frames:
         snapped = np.round(pos / epsilon).astype(np.int64)
         # combine current label with this frame's cell -> refined label
@@ -280,6 +315,27 @@ def _weld_keep_remap_multiframe(
     )
     remap = inverse.astype(np.int64)
     return keep.astype(np.int64), remap
+
+
+def _loop_uvs_from_vertex_uvs(
+    uvs: Optional[np.ndarray], indices: Optional[np.ndarray],
+) -> Optional[np.ndarray]:
+    """Expand per-vertex UVs into per-face-corner (loop) UVs.
+
+    Returns ``(face_count, 3, 2)`` float32 — ``out[f, c]`` is the UV of corner
+    *c* of face *f*.  This is the form that survives a position-only weld: two
+    corners landing on the same merged vertex keep their own UV, which is
+    exactly how Blender's "merge by distance" preserves seams.
+
+    Must be called with the PRE-weld ``uvs``/``indices`` so the original seam
+    UVs are captured before any vertices are fused.
+    """
+    if uvs is None or indices is None or uvs.size == 0 or indices.size == 0:
+        return None
+    idx = np.asarray(indices).reshape(-1, 3)
+    if idx.size == 0 or int(idx.max()) >= uvs.shape[0]:
+        return None
+    return np.ascontiguousarray(uvs[idx], dtype=np.float32)
 
 
 class CacheBuilder:
@@ -382,14 +438,28 @@ class CacheBuilder:
             vcounts[name] = obj.vertex_count
             face_counts[name] = obj.face_count
 
+        # --- LOOP UVs (v5) ----------------------------------------------
+        # Snapshot per-corner UVs BEFORE the weld.  Once these exist the
+        # weld no longer has to keep seam vertices apart to protect the
+        # texture, so it can merge on position alone.
+        pre_weld_loop_uvs: Dict[str, np.ndarray] = {}
+        for name in obj_names:
+            lu = _loop_uvs_from_vertex_uvs(
+                base_uvs.get(name), base_indices.get(name))
+            if lu is not None:
+                pre_weld_loop_uvs[name] = lu
+
         # --- Weld pass: merge near-duplicate vertices per object ----------
         weld_remaps: Dict[str, np.ndarray] = {}
         total_before = sum(vcounts[n] for n in obj_names)
         if weld:
             for name in obj_names:
+                # Position-only weld: the seam now lives in the loop UVs
+                # (captured above), so fusing coincident vertices that
+                # differ only in UV is safe and saves real memory.
                 wpos, widx, wuv, remap = _weld_object(
                     base_positions[name], base_indices.get(name),
-                    base_uvs.get(name),
+                    None,  # uvs=None -> position-only weld
                 )
                 base_positions[name] = wpos
                 if widx is not None:
@@ -412,6 +482,17 @@ class CacheBuilder:
                 flush=True,
             )
 
+        # --- Rebuild loop UVs for welded geometry -------------------------
+        # After position-only weld the indices changed, so we rebuild loop UVs
+        # from the welded indices (the seam UVs are preserved because they were
+        # captured per-corner before the weld).
+        post_weld_loop_uvs: Dict[str, np.ndarray] = {}
+        for name in obj_names:
+            lu = _loop_uvs_from_vertex_uvs(
+                base_uvs.get(name), base_indices.get(name))
+            if lu is not None:
+                post_weld_loop_uvs[name] = lu
+
         # --- Layout computation ----------------------------------------
         frame_vertex_offset: Dict[str, int] = {}
         cursor = 0
@@ -432,7 +513,8 @@ class CacheBuilder:
             return idx
 
         initial_table_size = sum(
-            2 + len(n.encode("utf-8")) + binary._OBJ_TAIL.size + 16
+            2 + len(n.encode("utf-8")) + binary._OBJ_TAIL.size
+            + binary.OBJ_EXTRA_V5
             for n in obj_names
         )
         padded_table_size = initial_table_size + 4096
@@ -466,6 +548,23 @@ class CacheBuilder:
             off += len(ub)
 
         uv_blocks_offset = off
+
+        # --- Loop (per-face-corner) UV blocks, v5 -------------------------
+        loop_uv_block_bytes: Dict[str, bytes] = {}
+        loop_uv_off: Dict[str, int] = {}
+        for name in obj_names:
+            lu = post_weld_loop_uvs.get(name)
+            ok = (
+                lu is not None and lu.size > 0
+                and lu.shape[0] == face_counts[name]
+            )
+            lb = (
+                np.ascontiguousarray(lu, dtype=np.float32).tobytes()
+                if ok else b""
+            )
+            loop_uv_block_bytes[name] = lb
+            loop_uv_off[name] = off if lb else 0
+            off += len(lb)
 
         # --- Register EVERY object's material names FIRST, then pack the table.
         # THE "<unknown> material" FIX (2026-07-24): the global name table must be
@@ -542,6 +641,8 @@ class CacheBuilder:
                 fh.write(base_index_bytes[name])
             for name in obj_names:
                 fh.write(uv_block_bytes[name])
+            for name in obj_names:
+                fh.write(loop_uv_block_bytes[name])
 
             fh.write(mat_table_bytes)
             for name in obj_names:
@@ -635,6 +736,7 @@ class CacheBuilder:
                         welded=(weld and name in weld_remaps),
                         uv_offset=uv_off[name],
                         material_offset=mat_off[name],
+                        loop_uv_offset=loop_uv_off[name],
                     )
                 )
 
@@ -702,6 +804,20 @@ class CacheBuilder:
                 face_counts[name] = info.index_count
                 index_range[name] = np.asarray(info.index_range, dtype=np.int64)
 
+            # --- LOOP UVs (v5) --------------------------------------------
+            # Snapshot per-corner UVs BEFORE the weld.  Once these exist the
+            # weld no longer has to keep seam vertices apart to protect the
+            # texture, so it can merge on position alone (recovering ~78K
+            # vertices on the E180 that Blender's own merge-by-distance also
+            # collapses).  Face order is preserved through the weld's
+            # degenerate-triangle filter below, so this stays aligned.
+            base_loop_uvs: Dict[str, np.ndarray] = {}
+            for name in obj_names:
+                lu = _loop_uvs_from_vertex_uvs(
+                    base_uvs.get(name), base_indices.get(name))
+                if lu is not None:
+                    base_loop_uvs[name] = lu
+
             # --- CROSS-FRAME-SAFE WELD (optional) --------------------------
             # Merge seam-split duplicate vertices that stay coincident in EVERY
             # sampled frame.  Parts whose edges separate during the crash (e.g.
@@ -721,7 +837,13 @@ class CacheBuilder:
                 for name in obj_names:
                     ir = index_range[name]
                     per_frame = [sh[ir] for sh in sampled_shared]
-                    keep, remap = _weld_keep_remap_multiframe(per_frame, epsilon=1e-4)
+                    # Position-only weld: the seam now lives in the loop UVs
+                    # (captured above), so fusing coincident vertices that
+                    # differ only in UV is safe and saves real memory.
+                    keep, remap = _weld_keep_remap_multiframe(
+                        per_frame, epsilon=1e-4,
+                        uvs=None if name in base_loop_uvs else base_uvs.get(name),
+                    )
                     if len(keep) == vcounts[name]:
                         continue  # nothing merged for this object
                     # Rewrite geometry with welded vertex set.
@@ -735,6 +857,10 @@ class CacheBuilder:
                     fmids = base_matids[name]
                     if fmids is not None and len(fmids) == len(valid):
                         base_matids[name] = fmids[valid]
+                    # Keep loop UVs aligned with the surviving faces.
+                    lu = base_loop_uvs.get(name)
+                    if lu is not None and lu.shape[0] == len(valid):
+                        base_loop_uvs[name] = lu[valid]
                     base_indices[name] = new_idx
                     vcounts[name] = int(len(keep))
                     face_counts[name] = int(new_idx.shape[0])
@@ -799,6 +925,9 @@ class CacheBuilder:
                     )
                     base_matnames[pname] = [mname]
                     base_matids[pname] = np.zeros(idx.shape[0], dtype=np.uint16)
+                    plu = _loop_uvs_from_vertex_uvs(base_uvs[pname], idx)
+                    if plu is not None:
+                        base_loop_uvs[pname] = plu
                     vcounts[pname] = vc
                     face_counts[pname] = int(idx.shape[0])
                     prop_frozen_pos[pname] = frozen
@@ -840,7 +969,8 @@ class CacheBuilder:
                 return idx
 
             initial_table_size = sum(
-                2 + len(n.encode("utf-8")) + binary._OBJ_TAIL.size + 16
+                2 + len(n.encode("utf-8")) + binary._OBJ_TAIL.size
+                + binary.OBJ_EXTRA_V5
                 for n in current_stable
             )
             padded_table_size = initial_table_size + 4096
@@ -872,6 +1002,23 @@ class CacheBuilder:
                 off += len(ub)
 
             uv_blocks_offset = off
+
+            # --- Loop (per-face-corner) UV blocks, v5 ---------------------
+            loop_uv_block_bytes: Dict[str, bytes] = {}
+            loop_uv_off: Dict[str, int] = {}
+            for name in current_stable:
+                lu = base_loop_uvs.get(name)
+                ok = (
+                    lu is not None and lu.size > 0
+                    and lu.shape[0] == face_counts[name]
+                )
+                lb = (
+                    np.ascontiguousarray(lu, dtype=np.float32).tobytes()
+                    if ok else b""
+                )
+                loop_uv_block_bytes[name] = lb
+                loop_uv_off[name] = off if lb else 0
+                off += len(lb)
 
             # --- Per-object materials (from the BMC primitive/material tables) --
             # The capture records, per primitive, a material id into a 90-entry
@@ -952,6 +1099,8 @@ class CacheBuilder:
                     fh.write(base_index_bytes[name])
                 for name in current_stable:
                     fh.write(uv_block_bytes[name])
+                for name in current_stable:
+                    fh.write(loop_uv_block_bytes[name])
 
                 fh.write(mat_table_bytes)
                 for name in current_stable:
@@ -1155,6 +1304,7 @@ class CacheBuilder:
                             welded=False,
                             uv_offset=uv_off[name],
                             material_offset=mat_off[name],
+                            loop_uv_offset=loop_uv_off[name],
                         )
                     )
 
