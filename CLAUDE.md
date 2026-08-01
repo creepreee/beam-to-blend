@@ -139,19 +139,31 @@ These panel fields have `update=` callbacks that push straight into the running
 
 | Field | Entry point |
 |-------|-------------|
-| Start at Second | `frame_handler.update_start_second()` |
+| Start at Frame | `frame_handler.update_start_frame()` |
 | Playback Speed / Output FPS | `frame_handler.update_fps()` |
 | all Tyre Contact fields | `frame_handler.update_tyre()` |
 
-**The start offset is stored in SECONDS** (`_start_second`), never in frames.
-`_frame_start` is always re-derived as `round(start_second * output_fps)` by
-`_apply_timeline()`, so changing Output FPS keeps cache frame 0 on the same
-*time* instead of silently sliding the animation. Storing frames was the trap.
+**The start offset is stored in FRAMES** (`_start_frame`), and `_frame_start` is
+just a copy of it. It used to be seconds, so that cache frame 0 held its *time*
+across an Output FPS change — but typing 500 then meant 500 *seconds* (frame
+30000 at 60 fps). The timeline shows frames, so the field means frames. The
+deliberate tradeoff: an Output FPS change now keeps the frame NUMBER, so set the
+start after settling on Output FPS. `update_start_second()` still converts, for
+older .blends.
 
-Retunes must call `_refresh_current_frame()`: the playhead usually does not
-move, so no frame-change handler fires and the viewport would keep showing the
-old settings. `_apply_timeline` also clamps the playhead back inside the new
-range — outside it, every frame maps to cache frame 0 and the car looks frozen.
+**Every retune must end in `_refresh_current_frame()`.** This is the one rule
+that gets forgotten, and it fails identically for all three knobs: the playhead
+usually does *not* move, so no frame-change handler fires and the viewport keeps
+showing the previous settings. The field then looks dead and the only apparent
+fix is a re-import — which costs re-linking all the materials.
+
+Both fps values are inputs to `_cache_frame_for`, so this bites `update_fps` as
+hard as the others: at frame 300, Playback Speed 24 → 15 remaps cache frame
+120 → 75. Refresh in place rather than sliding the playhead to hold the current
+cache frame — that also gives the slider feedback while dragging.
+
+`_apply_timeline` also clamps the playhead back inside the new range — outside
+it, every frame maps to cache frame 0 and the car looks frozen.
 
 Everything is persisted as `_beamng_*` scene custom props so undo/reload
 recovery restores the *live* values, not the ones present at import.
@@ -223,7 +235,7 @@ Name filter (`tire,tyre` by default) keeps rims/hubs/brakes rigid. Alembic
 export bakes the same deformation into the .mdd, so renders match the viewport.
 
 ### Validation
-- 57/57 tests pass (`python -m pytest -q`)
+- 74/74 tests pass (`python -m pytest -q`)
 - Tyre contact verified headless against real capture data (97 objects, 4 tyres):
   flat patch spans 0.000 mm, no ground penetration, 93 non-tyre objects
   bit-identical, all 20 rigid members inside the merged `wheels` chunk
@@ -232,12 +244,23 @@ export bakes the same deformation into the .mdd, so renders match the viewport.
   `blender --background --python tests/blender_tyre_contact.py -- <cache.bvc>`
   (the script evicts an installed add-on's bundled `runtime`/`importer` from
   `sys.modules` — otherwise it silently tests the deployed build)
-- Live "Start at Second" verified headless (21 checks, 97 objects): range shifts
+- Live "Start at Frame" verified headless (21 checks, 97 objects): range shifts
   by exactly the offset with duration unchanged, geometry at `frame_start+k` is
   bit-identical before and after the shift (slid in time, not resampled), the
-  parked playhead's mesh updates without scrubbing, 2 s survives an output-fps
-  change as a different frame number, undo recovery keeps the live offset. Run:
+  parked playhead's mesh updates without scrubbing, the offset survives an
+  output-fps change as the same frame number, undo recovery keeps the live
+  offset. Run:
   `blender --background --python tests/blender_start_second.py -- <cache.bvc>`
+- Live "Playback Speed" / "Output FPS" verified headless (20 checks, 97 objects,
+  1200-frame capture): the parked playhead's mesh refreshes without scrubbing and
+  matches scrubbing to the remapped cache frame bit-identically, half speed
+  doubles the duration, Output FPS moves `render.fps` without changing wall-clock
+  duration, the start offset survives, a round trip restores range + geometry
+  exactly, undo recovery keeps the live fps. Run:
+  `blender --background --python tests/blender_playback_fps.py -- <cache.bvc>`
+  Negative control: deleting the `_refresh_current_frame` call fails exactly the
+  3 staleness assertions and nothing else — the other 17 pass without it, so only
+  those 3 actually cover the bug.
 - Deform cost ~2.2 ms/frame for 4 tyres / 1024 verts (bulge dominates; the
   `axle_axis` eigensolve is 0.36 ms of it)
 - GLB pipeline: 2000-frame capture at 10x slowmo, 97 objects, 7.4 GB BVC — verified

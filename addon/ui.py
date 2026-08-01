@@ -148,7 +148,9 @@ class BeamNGSceneProperties(PropertyGroup):
                     "The capture is recorded at 60 fps (realtime); lower values "
                     "give slow motion (24 = 2.5x slow-mo, 15 = 4x slow-mo). "
                     "This is INDEPENDENT of Output FPS, so the render plays at "
-                    "exactly the speed you tuned in the viewport.",
+                    "exactly the speed you tuned in the viewport. LIVE: drag it "
+                    "after importing and the speed changes in place, no "
+                    "re-import (and no re-linking materials) needed.",
         default=24,
         min=1,
         max=240,
@@ -161,7 +163,8 @@ class BeamNGSceneProperties(PropertyGroup):
                     "playback/render is, NOT how fast. Higher = smoother motion "
                     "with in-between Blender frames; the animation still lasts "
                     "the same wall-clock time set by Playback Speed. Set to 60 "
-                    "for smooth 60fps renders that play at the tuned speed.",
+                    "for smooth 60fps renders that play at the tuned speed. "
+                    "LIVE: takes effect immediately, no re-import needed.",
         default=60,
         min=1,
         max=240,

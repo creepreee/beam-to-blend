@@ -187,6 +187,17 @@ def update_fps(playback_fps: Optional[float] = None,
     effect immediately (no re-import needed).  Recomputes the timeline end so
     the sequence duration tracks ``playback_fps``, keeps ``scene.render.fps`` in
     sync with ``output_fps``, and re-asserts realtime viewport sync.
+
+    Like the other live-retune entry points this MUST end in
+    :func:`_refresh_current_frame`.  Both fps values are inputs to
+    :func:`_cache_frame_for`, so changing either one re-points the *parked*
+    playhead at a different cache frame (at frame 300, playback_fps 24 -> 15
+    moves cache frame 120 -> 75).  The playhead itself usually does not move, so
+    no frame-change handler fires and the viewport would keep displaying the old
+    cache frame — which is exactly what made this field look dead and forced a
+    re-import.  Refreshing in place (rather than sliding the playhead to hold
+    the current cache frame) also gives the slider visible feedback while
+    dragging.
     """
     global _playback_fps, _output_fps
     if playback_fps is not None:
@@ -212,6 +223,11 @@ def update_fps(playback_fps: Optional[float] = None,
     # output_fps keeps frame_start fixed and only re-derives frame_end (the
     # duration still tracks the fps ratio).
     _apply_timeline(scene)
+
+    # Re-run the frame the playhead sits on — see the docstring: the new fps
+    # remaps the parked playhead to a different cache frame, and nothing else
+    # would push that to the mesh.
+    _refresh_current_frame(scene)
 
 
 _TYRE_KEYS = ("amount", "extra", "bulge", "release", "ground_z", "names")
