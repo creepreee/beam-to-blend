@@ -59,6 +59,19 @@ except ImportError:  # pragma: no cover
     bpy = None
     mathutils = None
 
+import zlib
+
+
+def _stable_hash(text: str) -> int:
+    """Deterministic cross-session string hash.
+
+    Python's built-in ``hash()`` is randomized per process (PYTHONHASHSEED),
+    so a seed derived from it rebuilds a *different* scene every Blender
+    session.  crc32 is stable everywhere, which is what "a given scene always
+    rebuilds identically" actually requires.
+    """
+    return zlib.crc32(text.encode("utf-8", "surrogatepass"))
+
 
 DEBRIS_COLLECTION = "BeamNG Debris"
 SHARD_COLLECTION = "BeamNG Debris Shards"
@@ -228,6 +241,15 @@ class DebrisSettings:
     #: small patch the way material peeling off a panel does.  Far too small to
     #: read as a throw.
     scatter: float = 0.45
+    #: Floor on the RANDOM launch velocity (m/s) for every impact, including
+    #: below-blast grazes.  The blast machinery only hands out directed speed
+    #: above :attr:`min_blast_severity`; below it the spray previously got
+    #: whatever ``scatter`` alone provided and a ground-level graze puddled —
+    #: its particles barely moved (measured: 25 of 121 emitters with centroid
+    #: travel under 0.10 m).  This guarantees the cloud visibly travels in every
+    #: direction.  Deliberately random, not a directed cone, so it reads as a
+    #: puff instead of the firework the blast threshold exists to suppress.
+    min_launch_speed: float = 1.0
     #: Cone half-angle (degrees) the debris sprays into.
     spread: float = 55.0
     #: Ground plane height.
@@ -931,9 +953,15 @@ def _spawn_fine_particles(event: ImpactEvent, count: int,
     # Sub-stepping the solver: at 10-25 m/s a particle covers up to 0.4 m per
     # frame, several times its own size, and would tunnel through the ground.
     st.subframes = int(max(0, settings.particle_subframes))
-    # Collide against the particle's real radius rather than a point, so shards
-    # rest ON the ground instead of half-buried in it.
-    st.use_size_deflect = True
+    # Point collision, NOT ``use_size_deflect``.  That flag inflates the
+    # collision radius to ``particle_size`` (~0.5 m with size_random to 1.5x),
+    # so shards came to rest at z=0.35-0.75 — hovering half a metre in the air
+    # forever (measured).  ``particle_size`` must stay ~1.0 because the shard
+    # templates are modelled at true size and it doubles as the render scale,
+    # so the only way to keep the collision radius sane is to collide as a
+    # point against the ground's COLLISION surface.  The slab's thickness and
+    # the subframes above stop fast particles from tunnelling.
+    st.use_size_deflect = False
 
     # NORMAL_FACTOR is emission ALONG THE EMITTER'S NORMAL — i.e. every particle
     # leaving in the same direction at the same speed from the same point.  That
@@ -946,6 +974,10 @@ def _spawn_fine_particles(event: ImpactEvent, count: int,
     # from each other rather than all flying outward together.  Random velocity
     # has no preferred direction, so it cannot produce a shell.
     scatter = max(0.0, float(settings.scatter)) * (0.4 + 0.6 * intensity)
+    # FLOOR so even a grazing impact sheds material that visibly travels
+    # (see ``min_launch_speed``): a puff in every direction, not a cone.
+    scatter = max(scatter,
+                  settings.min_launch_speed * (0.4 + 0.6 * intensity))
     st.factor_random = (scatter
                         + speed * float(np.clip(settings.speed_spread, 0.0, 2.0)))
     # Inherit the part's momentum so the spray trails the moving wreck. This is
@@ -1061,7 +1093,7 @@ def _spawn_glass_pane(part: str, tier: str, event: ImpactEvent,
         fragments=count,
         thickness=profile_for("glass").thickness,
         edge_retain=glass_settings.edge_retain,
-        seed=settings.seed + (abs(hash(part)) % 100000),
+        seed=settings.seed + (_stable_hash(str(part)) % 100000),
     )
     if not fragments:
         return [], 0
@@ -1271,7 +1303,7 @@ def build_debris(reader, events: Sequence[ImpactEvent],
             event.part, event.material,
             np.asarray(verts, dtype=np.float64), tris,
             variants=settings.variants,
-            seed=settings.seed + abs(hash(key)) % 100000,
+            seed=settings.seed + (_stable_hash(str(key)) % 100000),
             source_objects=source_objects,
             collection=shard_coll,
         )
