@@ -32,6 +32,68 @@ def _tyre_settings(context):
     ).update(names=getattr(props, "tyre_names", "tire,tyre"))
 
 
+def _debris_settings(context):
+    """Build a DebrisSettings from the scene's debris UI properties."""
+    from runtime.debris_spawn import DebrisSettings
+
+    props = context.scene.beamng_debris
+    return DebrisSettings(
+        density=float(getattr(props, "debris_density", 1.0)),
+        scale=float(getattr(props, "debris_scale", 1.0)),
+        hero_count=int(getattr(props, "debris_hero_count", 14)),
+        fine_count=int(getattr(props, "debris_fine_count", 90)),
+        max_hero_total=int(getattr(props, "debris_max_hero", 240)),
+        speed=float(getattr(props, "debris_speed", 0.0)),
+        spread=float(getattr(props, "debris_spread", 55.0)),
+        bounciness=float(getattr(props, "debris_bounciness", 0.25)),
+        scatter=float(getattr(props, "debris_scatter", 0.45)),
+        min_severity=float(getattr(props,
+"debris_min_severity", 0.12)),
+        min_blast_severity=float(getattr(props,
+"debris_min_blast_severity", 0.35)),
+        variants=int(getattr(props, "debris_variants", 8)),
+        settle_frames=int(getattr(props, "debris_settle_frames", 260)),
+        seed=int(getattr(props, "debris_seed", 12345)),
+        shatter_glass=bool(getattr(props, "debris_shatter_glass", True)),
+    )
+
+
+def _glass_settings(context):
+    """Build a GlassSettings from the scene's glass UI properties."""
+    from runtime.impact_detect import GlassSettings
+
+    props = context.scene.beamng_debris
+    return GlassSettings(
+        crack_deform=float(getattr(props, "glass_crack_deform", 0.006)),
+        shatter_deform=float(getattr(props, "glass_shatter_deform", 0.022)),
+        shatter_ground_depth=float(getattr(props, "glass_shatter_ground_depth", 0.03)),
+        edge_retain=float(getattr(props, "glass_edge_retain", 0.05)),
+    )
+
+
+def _live_timing(context):
+    """Live frame mapping from the running handler, else the scene props.
+
+    Returns ``(frame_start, playback_fps, output_fps)``.  The frame handler
+    stores the values the user tuned live (including after a reload); before an
+    import the scene properties hold the intended values.
+    """
+    from runtime import frame_handler
+
+    scene = context.scene
+    if frame_handler._active is not None:
+        return (
+            int(frame_handler._frame_start),
+            float(frame_handler._playback_fps),
+            float(frame_handler._output_fps),
+        )
+    return (
+        int(getattr(scene.beamng, "start_frame", 0)),
+        float(getattr(scene.beamng, "playback_fps", 24)),
+        float(getattr(scene.beamng, "output_fps", 60)),
+    )
+
+
 def _iter_layer_collections(layer_coll):
     """Yield a LayerCollection and all of its descendants."""
     yield layer_coll
@@ -532,6 +594,132 @@ class BEAMNG_OT_export_alembic(Operator):
         return {"FINISHED"}
 
 
+class BEAMNG_OT_build_debris(Operator):
+    """Detect impacts, spawn hero/fine debris and bake it to keyframes.
+
+    Pipeline: detect_impacts (reads the BVC cache directly, pure numpy) →
+    build_debris (cuts shard geometry from the cache, spawns rigid bodies +
+    particle emitters) → bake_debris (simulates the rigid bodies and freezes
+    them into F-curves, with all frame handlers detached so the vertex
+    playback cannot corrupt the bake).  The car's animated geometry is never
+    touched.
+    """
+    bl_idname = "beamng.build_debris"
+    bl_label = "Build Impact Debris"
+    bl_description = "Detect impacts, spawn debris and bake it to keyframes"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        import traceback
+
+        cache_path = context.scene.beamng.cache_path
+        if not cache_path:
+            # After a reload-recovery the UI props are empty but the imported
+            # cache is still live — read the path the frame handler stored.
+            cache_path = context.scene.get("_beamng_cache_path", "")
+        if not cache_path or not os.path.exists(cache_path):
+            self.report({"ERROR"}, "Cache file not found — import the cache first")
+            return {"CANCELLED"}
+
+        scene = context.scene
+        ground_shift = float(scene.get("_beamng_ground_shift", 0.0))
+        frame_start, playback_fps, output_fps = _live_timing(context)
+
+        from runtime.cache_reader import CacheReader
+        from runtime.impact_detect import detect_impacts, summarise
+        from runtime.debris_spawn import build_debris, bake_debris
+        from runtime import frame_handler
+
+        def _progress(done, total, name):
+            if done % 10 == 0 or done >= total - 1:
+                sys.stderr.write(f"[BeamNG]  debris {done + 1}/{total}: {name}\n")
+                sys.stderr.flush()
+
+        reader = None
+        try:
+            reader = CacheReader(cache_path)
+            # Best-effort part→object map so shards reuse the car's materials.
+            source_objects = {
+                o.name: o for o in bpy.data.objects if o.type == "MESH"
+            }
+
+            events = detect_impacts(
+                reader,
+                ground_shift=ground_shift,
+                playback_fps=float(playback_fps),
+                progress=_progress,
+            )
+            if not events:
+                self.report({"INFO"}, "No impacts detected — nothing to build")
+                return {"FINISHED"}
+
+            settings = _debris_settings(context)
+            summary = build_debris(
+                reader, events, settings,
+                glass_settings=_glass_settings(context),
+                frame_start=int(frame_start),
+                playback_fps=float(playback_fps),
+                output_fps=float(output_fps),
+                ground_shift=ground_shift,
+                source_objects=source_objects,
+                progress=_progress,
+            )
+            bake = bake_debris(
+                summary.get("hero_objects", []),
+                summary.get("bake_start", scene.frame_start),
+                summary.get("bake_end", scene.frame_end),
+            )
+
+            # Register which panes shattered so the intact glass collapses out
+            # of the car from its break frame onward during playback.
+            shattered = summary.get("shattered_panes") or {}
+            if shattered:
+                frame_handler.set_shattered_panes(shattered)
+
+            sys.stderr.write(f"[BeamNG] {summarise(events)}\n")
+            sys.stderr.flush()
+            msg = (
+                f"{summary.get('events', 0)} events -> "
+                f"{summary.get('hero', 0)} hero, "
+                f"{summary.get('emitters', 0)} emitters, "
+                f"{summary.get('shards', 0)} shards; "
+                f"{summary.get('glass', 0)} glass fragments "
+                f"({summary.get('retained', 0)} edge, all fall) from "
+                f"{len(summary.get('shattered_panes', {}))} panes; "
+                f"{bake.get('baked', 0)} baked over "
+                f"{bake.get('frames', 0)} frames"
+            )
+        except Exception as exc:
+            sys.stderr.write(
+                "[BeamNG] debris build error:\n" + traceback.format_exc() + "\n")
+            sys.stderr.flush()
+            self.report({"ERROR"}, f"Debris build failed: {exc}")
+            return {"CANCELLED"}
+        finally:
+            if reader is not None:
+                try:
+                    reader.close()
+                except Exception:
+                    pass
+
+        self.report({"INFO"}, msg)
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_clear_debris(Operator):
+    """Remove everything the debris feature created."""
+    bl_idname = "beamng.clear_debris"
+    bl_label = "Clear Impact Debris"
+    bl_description = "Remove all spawned debris and the rigid body world"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        from runtime.debris_spawn import clear_debris
+        removed = clear_debris()
+        self.report({"INFO"}, f"Removed {removed} debris objects")
+        return {"FINISHED"}
+
+
 class BEAMNG_OT_assign_textures(Operator):
     """Auto-assign BeamNG PBR textures from a vehicle folder to the imported materials.
 
@@ -685,6 +873,8 @@ _CLASSES = (
     BEAMNG_OT_import_cache,
     BEAMNG_OT_export_alembic,
     BEAMNG_OT_assign_textures,
+    BEAMNG_OT_build_debris,
+    BEAMNG_OT_clear_debris,
 )
 
 

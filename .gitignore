@@ -24,13 +24,9 @@ diag/
 .pytest_cache/
 
 # Temp / scratch files at repo root
-session.md
 continue.txt
-temp.txt
-*.log
 newcapture*.txt
-2026-*.txt
-massages-below.txt
+*.log
 
 # Tooling internals
 .opencode/

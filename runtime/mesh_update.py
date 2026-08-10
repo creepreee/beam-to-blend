@@ -342,6 +342,13 @@ class CachePlayback:
         self._current_frame: Optional[int] = None
         self._log_fh = None
         self._transform_empty: Optional["bpy.types.Object"] = None
+        # Panes that have shattered: {member_name: cache_frame_it_broke}.  From
+        # that frame on the member's vertices are collapsed to a point so the
+        # intact glass disappears from the car and the spawned fragments take
+        # over.  See :meth:`set_shattered_panes`.
+        self._shattered: Dict[str, int] = {}
+        #: Cache-local collapse target (pane centroid at its shatter frame).
+        self._shattered_centres: Dict[str, np.ndarray] = {}
         if log_path:
             self._log_fh = open(Path(log_path), "w", encoding="utf-8")
             self._log("=== CachePlayback debug log ===")
@@ -705,6 +712,45 @@ class CachePlayback:
         self._transform_empty.matrix_basis = mat
         self._transform_empty.rotation_mode = "QUATERNION"
 
+    # --- glass shatter ---------------------------------------------------
+    def set_shattered_panes(self, panes: Dict[str, int]) -> None:
+        """Register which glass panes shattered and when (cache frames).
+
+        From ``panes[name]`` onward the member's vertices are collapsed to its
+        centroid at the shatter frame, so the intact glass disappears from the
+        car and the spawned fragments take over.  The collapse target is
+        computed here from the cache, so callers only need the name→frame map
+        (see :func:`runtime.impact_detect.resolve_glass_damage`).
+
+        Called from the debris builder while the playback is live; the pane
+        vanishes the moment the playhead passes the recorded shatter frame.
+        """
+        registered: Dict[str, int] = {}
+        for name, frame in panes.items():
+            frame = int(frame)
+            if not (0 <= frame < self.reader.frame_count):
+                continue
+            try:
+                raw = self.reader.frame_positions(name, frame)
+            except ValueError:  # pragma: no cover - not a stable object
+                continue
+            pos = self._gltf_to_blender(raw)
+            if len(pos):
+                registered[name] = frame
+                self._shattered_centres[name] = pos.mean(axis=0)
+        if registered:
+            self._shattered.update(registered)
+            # Defeat the "same frame, return early" guard so a pane already
+            # past its shatter frame disappears on the next refresh.
+            self._current_frame = None
+
+    def _collapse_shattered(self, name: str, pos: np.ndarray) -> np.ndarray:
+        """Collapse a shattered member's vertices onto its stored centroid."""
+        centre = self._shattered_centres.get(name)
+        if centre is None:
+            return pos
+        return np.broadcast_to(centre, pos.shape).copy()
+
     # --- tyre ground-contact deformation -------------------------------
     def set_tyre_settings(self, tyre: TyreSettings) -> None:
         """Replace the tyre tunables and force the next set_frame to redraw.
@@ -778,6 +824,10 @@ class CachePlayback:
             raw = self.reader.frame_positions(name, frame)
             positions = self._gltf_to_blender(raw)
             positions = self._deform_tyre(name, obj, positions, frame)
+            # Shattered panes collapse to a point from their break frame, so the
+            # intact glass leaves the car and the spawned fragments take over.
+            if self._shattered and frame >= self._shattered.get(name, 1 << 30):
+                positions = self._collapse_shattered(name, positions)
             flat = np.ascontiguousarray(positions, dtype=np.float32).reshape(-1)
             _write_positions(obj.data, flat, obj)
 
@@ -841,6 +891,10 @@ class CachePlayback:
                 # would smear across all four wheels.  The chunk object carries
                 # the auto-ground offset for its members.
                 pos = self._deform_tyre(mname, obj, pos, frame)
+                # Per MEMBER, so one shattered pane vanishes without touching
+                # the other panes sharing the merged 'glass' chunk.
+                if self._shattered and frame >= self._shattered.get(mname, 1 << 30):
+                    pos = self._collapse_shattered(mname, pos)
                 parts.append(pos)
             combined = np.concatenate(parts, axis=0)
 

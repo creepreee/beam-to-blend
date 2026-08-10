@@ -255,6 +255,189 @@ class BeamNGSceneProperties(PropertyGroup):
     )
 
 
+class BeamNGDebrisProperties(PropertyGroup):
+    """Tunables for the impact-debris feature (see runtime.debris_spawn)."""
+
+    debris_density: FloatProperty(
+        name="Debris Density",
+        description="Global multiplier on how much debris every impact sheds",
+        default=1.0,
+        min=0.1,
+        max=5.0,
+        step=5,
+        precision=2,
+    )
+    debris_scale: FloatProperty(
+        name="Shard Scale",
+        description="Global multiplier on shard size",
+        default=1.0,
+        min=0.2,
+        max=3.0,
+        step=5,
+        precision=2,
+    )
+    debris_hero_count: IntProperty(
+        name="Hero Pieces",
+        description="Pieces simulated as real rigid bodies, per impact",
+        default=14,
+        min=0,
+        max=200,
+    )
+    debris_max_hero: IntProperty(
+        name="Max Hero Pieces (total)",
+        description="Cap on total rigid bodies across all impacts, so a huge "
+                    "capture cannot hang Blender; raise it only for "
+                    "shorter/sparser captures",
+        default=240,
+        min=0,
+        max=2000,
+    )
+    debris_fine_count: IntProperty(
+        name="Fine Particles",
+        description="Small chips emitted per impact",
+        default=90,
+        min=0,
+        max=1000,
+    )
+    debris_speed: FloatProperty(
+        name="Launch Speed",
+        description="Extra outward launch speed (m/s at severity 1.0) fired "
+                    "from the impact point. 0 (the default) means debris is "
+                    "only shed — it separates and falls, carrying the panel's "
+                    "own momentum. Raising this fires it outward in a cone, "
+                    "which looks like an explosion",
+        default=0.0,
+        min=0.0,
+        max=20.0,
+        step=5,
+        precision=2,
+    )
+    debris_bounciness: FloatProperty(
+        name="Particles + Debris Bounciness",
+        description="How much every piece of debris bounces — hero shards, "
+                    "glass fragments and fine particles alike. 0 means no "
+                    "bounce at all: a piece touches the ground once and stays "
+                    "there. 1 lets pieces bounce and skitter several times "
+                    "before settling",
+        default=0.25,
+        min=0.0,
+        max=1.0,
+        step=2,
+        precision=2,
+        subtype="FACTOR",
+    )
+    debris_scatter: FloatProperty(
+        name="Scatter",
+        description="Small separation speed (m/s) given to shed material so it "
+                    "spreads over a patch instead of stacking in one column. "
+                    "This is not a launch — raise Launch Speed for that",
+        default=0.45,
+        min=0.0,
+        max=5.0,
+        step=5,
+        precision=2,
+    )
+    debris_spread: FloatProperty(
+        name="Spray Spread",
+        description="Cone half-angle (degrees) the debris sprays into",
+        default=55.0,
+        min=5.0,
+        max=180.0,
+        step=5,
+        precision=1,
+    )
+    debris_min_severity: FloatProperty(
+        name="Min Severity",
+        description="Only spawn for impacts at or above this severity",
+        default=0.12,
+        min=0.0,
+        max=1.0,
+        step=2,
+        precision=2,
+        subtype="FACTOR",
+    )
+    debris_min_blast_severity: FloatProperty(
+        name="Min Blast Severity",
+        description="Impacts BELOW this severity drop debris straight down "
+                    "with no launch blast (no firework spray); impacts at or "
+                    "above it fire the full blast. Measured: back-landing "
+                    "0.20-0.23, door-smash 0.41-0.55",
+        default=0.35,
+        min=0.0,
+        max=1.0,
+        step=2,
+        precision=2,
+        subtype="FACTOR",
+    )
+    debris_variants: IntProperty(
+        name="Shard Variants",
+        description="Distinct shard meshes generated per part and material",
+        default=8,
+        min=1,
+        max=32,
+    )
+    debris_settle_frames: IntProperty(
+        name="Settle Frames",
+        description="Extra frames simulated past the last impact so debris settles",
+        default=260,
+        min=0,
+        max=2000,
+    )
+    debris_seed: IntProperty(
+        name="Random Seed",
+        description="A given scene always rebuilds identically with the same seed",
+        default=12345,
+        min=0,
+        max=2 ** 31 - 1,
+    )
+    debris_shatter_glass: BoolProperty(
+        name="Shatter Glass",
+        description="Break glass panes out of the car when they shatter and "
+                    "spawn fragments (disabled: glass keeps its pane mesh)",
+        default=True,
+    )
+    glass_crack_deform: FloatProperty(
+        name="Crack Threshold",
+        description="Deformation (m) at which a glass pane starts to craze; "
+                    "below this it is untouched",
+        default=0.006,
+        min=0.0,
+        max=0.2,
+        precision=4,
+    )
+    glass_shatter_deform: FloatProperty(
+        name="Shatter Threshold",
+        description="Deformation (m) at which the pane leaves the car and breaks up",
+        default=0.022,
+        min=0.0,
+        max=0.5,
+        precision=4,
+    )
+    glass_shatter_ground_depth: FloatProperty(
+        name="Ground Strike Depth",
+        description="A pane whose lowest vertex goes at least this far below the "
+                    "ground plane has struck the road face-on and shatters "
+                    "regardless of measured deformation",
+        default=0.03,
+        min=0.0,
+        max=1.0,
+        precision=4,
+    )
+    glass_edge_retain: FloatProperty(
+        name="Edge Retain",
+        description="Width of the glass fringe kept in the frame, as a fraction "
+                    "of the pane's half-extent measured inward from the outline "
+                    "— 0.05 keeps a thin ring around the whole aperture, larger "
+                    "values keep more",
+        default=0.05,
+        min=0.0,
+        max=0.5,
+        step=2,
+        precision=2,
+        subtype="FACTOR",
+    )
+
+
 class BEAMNG_PT_main(Panel):
     bl_label = "BeamNG"
     bl_idname = "BEAMNG_PT_main"
@@ -343,10 +526,68 @@ class BEAMNG_PT_tyres(Panel):
             note.label(text="Live — updates as you drag.", icon="INFO")
 
 
+class BEAMNG_PT_debris(Panel):
+    """Impact debris: detect impacts, spawn hero/fine debris, bake it."""
+    bl_label = "Debris"
+    bl_idname = "BEAMNG_PT_debris"
+    bl_parent_id = "BEAMNG_PT_main"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "BeamNG"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw_header(self, context):
+        # Only show the header icon when the scene actually has debris.
+        from runtime.debris_spawn import DEBRIS_COLLECTION
+        has = bpy.data.collections.get(DEBRIS_COLLECTION) is not None
+        self.layout.label(
+            text="", icon="CHECKBOX_HLT" if has else "CHECKBOX_DEHLT")
+
+    def draw(self, context):
+        props = context.scene.beamng_debris
+        layout = self.layout
+        layout.use_property_split = True
+
+        layout.prop(props, "debris_density")
+        col = layout.column(align=True)
+        col.prop(props, "debris_hero_count")
+        col.prop(props, "debris_max_hero")
+        col.prop(props, "debris_fine_count")
+        phys = layout.box()
+        phys.label(text="Physics", icon="PHYSICS")
+        phys.prop(props, "debris_bounciness")
+        phys.prop(props, "debris_scatter")
+        phys.prop(props, "debris_speed")
+        phys.prop(props, "debris_spread")
+
+        layout.prop(props, "debris_min_severity")
+        layout.prop(props, "debris_min_blast_severity")
+        layout.prop(props, "debris_variants")
+        layout.prop(props, "debris_settle_frames")
+        layout.prop(props, "debris_seed")
+
+        glass = layout.box()
+        glass.label(text="Glass", icon="SHADING_RENDERED")
+        glass.prop(props, "debris_shatter_glass")
+        sub = glass.column(align=True)
+        sub.active = props.debris_shatter_glass
+        sub.prop(props, "glass_crack_deform")
+        sub.prop(props, "glass_shatter_deform")
+        sub.prop(props, "glass_shatter_ground_depth")
+        sub.prop(props, "glass_edge_retain")
+
+        col = layout.column(align=True)
+        col.scale_y = 1.2
+        col.operator("beamng.build_debris", text="Build Debris", icon="MOD_PARTICLES")
+        col.operator("beamng.clear_debris", text="Clear Debris", icon="TRASH")
+
+
 _classes = [
     BeamNGSceneProperties,
+    BeamNGDebrisProperties,
     BEAMNG_PT_main,
     BEAMNG_PT_tyres,
+    BEAMNG_PT_debris,
 ]
 
 
@@ -356,12 +597,14 @@ def register():
         bpy.utils.register_class(cls)
         print(f"[BeamNG] registered {cls.__name__}")
     bpy.types.Scene.beamng = bpy.props.PointerProperty(type=BeamNGSceneProperties)
-    print("[BeamNG] Scene.beamng property set")
+    bpy.types.Scene.beamng_debris = bpy.props.PointerProperty(type=BeamNGDebrisProperties)
+    print("[BeamNG] Scene.beamng / Scene.beamng_debris properties set")
 
 
 def unregister():
     print("[BeamNG] unregistering...")
     del bpy.types.Scene.beamng
+    del bpy.types.Scene.beamng_debris
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)
     print("[BeamNG] done")

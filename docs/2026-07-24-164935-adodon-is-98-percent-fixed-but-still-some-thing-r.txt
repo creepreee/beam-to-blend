@@ -1,0 +1,801 @@
+ ▐▛███▜▌   Claude Code v2.1.154
+▝▜█████▛▘  stealth · API Usage Billing
+  ▘▘ ▝▝    ~\Downloads\beamng-cache-importer
+
+
+ ⚠Auth conflict: Both a token (ANTHROPIC_AUTH_TOKEN) and an API key (/login managed key) are set. This may lead to unexpected behavior.
+    · Trying to use ANTHROPIC_AUTH_TOKEN? claude /logout
+    · Trying to use /login managed key? Unset the ANTHROPIC_AUTH_TOKEN environment variable.
+
+❯ adodon is 98 percent fixed but still some thing reamaing. FIRST those rigid   
+  props? those arent shown when i import the bvc. AND IF for some reason, then  
+  still the objects like steering wheel, indicatiors, pedals and lastly         
+  speedometer needles actually are on the differnet postion rather thatn on     
+  thier true postions fix. make theri psotion like exact in the car sice these  
+  all objects come to the center of the car. secondly, animation in viewport    
+  with 15 fps feles good but when render aniamtion. it is tooo fast fix. even   
+  the bledne addon UI the both fx field arent working corectly. i obviosuly     
+  want normal speed in car animation. THIRD: there are materials slots          
+  succesffuly BUT BUT they arent truly atached to their respective objects fix  
+  please. maybe that can be done via assign textures in blendoe adodon? anser   
+  me. pelase fix these al issues and most importantly the second issue needs to 
+  be fixed first. do it thanks                                                  
+
+  Thought for 12s (ctrl+o to expand)
+
+● I'll start by exploring the codebase to understand the current state of these
+  three issues. Let me look at the key files, prioritizing the dynamic
+  objects/rigid props issue (issue #1) since you want that fixed first.
+
+  Thought for 5m 49s, read 2 files (ctrl+o to expand)
+
+● This is a substantial codebase with three distinct issues. Let me explore the
+  key files to understand each before making changes. Let me look at the addon
+  operators, UI, and the mesh update / import path.
+
+  Read 2 files (ctrl+o to expand)
+
+❯ no prioritize the aniamtion speed problem 
+
+  Thought for 1m 42s (ctrl+o to expand)
+
+● The user wants me to prioritize the animation speed problem (issue #2) now.
+  Let me focus fully on that. Let me investigate how playback speed actually
+  behaves — the viewport vs render mismatch.
+
+  Thought for 1m 56s, searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Now I understand the architecture fully. Let me focus on the animation speed 
+  problem (issue #2), which you want prioritized.
+
+  Root cause analysis
+
+  Here's what's actually happening. The content timing is already frame-locked
+  and identical between viewport and render — both go through
+  _cache_frame_for(scene.frame_current), which deterministically maps each
+  Blender frame to a cache frame. So the same cache frame shows at the same
+  Blender frame in both.
+
+  The only difference is wall-clock playback rate:
+
+  - Render: outputs every frame → the video plays at exactly scene.render.fps
+  (true intended speed).
+  - Viewport: Blender's default playback sync is 'NONE' ("Play Every Frame"),
+  which is compute-bound. Your 550K-vertex-per-frame update can't hit 60 fps, so
+  the viewport plays in unintentional slow motion — which is why "15 feels
+  good."
+
+  So when you tune to "feels good" in a laggy viewport and then render, the
+  render runs at the true speed = too fast. The two fps fields are working
+  mathematically, but the viewport lag corrupts your tuning, so it feels like
+  they don't work.
+
+  The fix
+
+  Set the viewport to frame-drop (realtime) sync on import. Then the viewport
+  plays at exactly the same wall-clock speed as the render (dropping frames when
+  compute-bound instead of slowing down). What you tune in the viewport is
+  exactly what renders — no more "too fast."
+
+  Thought for 54s, read 1 file (ctrl+o to expand)
+
+● Let me check the capture script to understand the exact timing semantics —
+  this determines what "normal speed" actually means for playback.
+
+  Thought for 1m 32s, read 1 file (ctrl+o to expand)
+
+● I now have the complete picture. Let me diagnose the animation speed problem
+  precisely before writing code.
+
+  The actual bug
+
+  The timing math is already correct — both viewport and render run through the
+  same _cache_frame_for() mapping, so frame N always shows the same cache frame
+  in both. The mismatch is pure wall-clock playback rate:
+
+  - Render always emits every frame at scene.render.fps → plays at the true
+  tuned speed.
+  - Viewport uses Blender's default sync mode 'NONE' ("Play Every Frame"), which
+  is compute-bound. Your ~550K-vertex-per-frame update can't keep up, so the
+  viewport crawls in unintended slow-motion.
+
+  So "15 feels good in viewport" is you compensating for viewport lag. When you
+  render, the lag is gone → it plays at the real (much faster) speed → "too
+  fast." And the two fps fields are working — you just can't perceive their
+  effect because the laggy viewport lies about speed, and they only apply on
+  re-import.
+
+  The fix (two parts)
+
+  1. Enable frame-drop (realtime) viewport sync → viewport plays at the exact
+  same wall-clock speed as the render. What you tune is what renders.
+  2. Make the two fps fields live → changing them updates playback immediately
+  (and recomputes timeline length), instead of silently doing nothing until
+  re-import.
+
+  Let me implement.
+
+● Update(runtime\frame_handler.py)
+  ⎿  Added 70 lines
+       55      return int(round(rel * (_playback_fps / _output_fps)))
+       56  
+       57  
+       58 +def _set_realtime_sync() -> None:                             
+       59 +    """Force the viewport to play at real wall-clock speed (fr
+          +ame dropping).                                                
+       60 +                                                              
+       61 +    THE "RENDER TOO FAST" FIX (2026-07-24)                    
+       62 +    --------------------------------------                    
+       63 +    Blender's default playback sync is ``'NONE'`` ("Play Every
+          + Frame"), which                                               
+       64 +    is COMPUTE-BOUND: it shows every frame no matter how long 
+          +the frame handler                                             
+       65 +    takes.  With ~550K verts/frame our handler can't hit ``out
+          +put_fps``, so the                                             
+       66 +    viewport crawls in *unintended* slow-motion.  The render, 
+          +by contrast, emits                                            
+       67 +    every frame at exactly ``scene.render.fps`` — true speed. 
+          + So a speed tuned                                             
+       68 +    against the laggy viewport renders far too fast.          
+       69 +                                                              
+       70 +    ``'FRAME_DROP'`` makes the viewport target real wall-clock
+          + time and DROP                                                
+       71 +    frames it can't compute, so the viewport plays at the iden
+          +tical speed as the                                            
+       72 +    render.  Now what you tune in the viewport is exactly what
+          + renders.                                                     
+       73 +    """                                                       
+       74 +    if bpy is None:                                           
+       75 +        return                                                
+       76 +    scene = bpy.context.scene                                 
+       77 +    if scene is None:                                         
+       78 +        return                                                
+       79 +    # Modern API (Blender 2.8+): Scene.sync_mode enum.        
+       80 +    try:                                                      
+       81 +        scene.sync_mode = "FRAME_DROP"                        
+       82 +    except (AttributeError, TypeError):                       
+       83 +        pass                                                  
+       84 +    # Legacy boolean, harmless if absent.                     
+       85 +    try:                                                      
+       86 +        scene.render.use_frame_drop = True                    
+       87 +    except (AttributeError, TypeError):                       
+       88 +        pass                                                  
+       89 +                                                              
+       90 +                                                              
+       91 +def update_fps(playback_fps: Optional[float] = None,          
+       92 +               output_fps: Optional[float] = None) -> None:   
+       93 +    """Update the playback/output frame rates on the LIVE hand
+          +ler.                                                          
+       94 +                                                              
+       95 +    Called from the add-on's fps property callbacks so the two
+          + fps fields take                                              
+       96 +    effect immediately (no re-import needed).  Recomputes the 
+          +timeline end so                                               
+       97 +    the sequence duration tracks ``playback_fps``, keeps ``sce
+          +ne.render.fps`` in                                            
+       98 +    sync with ``output_fps``, and re-asserts realtime viewport
+          + sync.                                                        
+       99 +    """                                                       
+      100 +    global _playback_fps, _output_fps                         
+      101 +    if playback_fps is not None:                              
+      102 +        _playback_fps = max(0.001, float(playback_fps))       
+      103 +    if output_fps is not None:                                
+      104 +        _output_fps = max(0.001, float(output_fps))           
+      105 +                                                              
+      106 +    if bpy is None:                                           
+      107 +        return                                                
+      108 +    scene = bpy.context.scene                                 
+      109 +    if scene is None:                                         
+      110 +        return                                                
+      111 +                                                              
+      112 +    scene.render.fps = max(1, int(round(_output_fps)))        
+      113 +    scene.render.fps_base = 1.0                               
+      114 +    _set_realtime_sync()                                      
+      115 +                                                              
+      116 +    # Persist for undo/reload recovery.                       
+      117 +    scene["_beamng_playback_fps"] = _playback_fps             
+      118 +    scene["_beamng_output_fps"] = _output_fps                 
+      119 +                                                              
+      120 +    # Recompute timeline length so the whole cache still fits 
+          +and the duration                                              
+      121 +    # reflects the new speed (duration_s = (n_src - 1) / playb
+          +ack_fps).                                                     
+      122 +    if _active is not None:                                   
+      123 +        n_src = _active.reader.frame_count                    
+      124 +        duration_s = (n_src - 1) / _playback_fps if n_src > 1 
+          +else 0.0                                                      
+      125 +        scene.frame_end = _frame_start + int(round(duration_s 
+          +* _output_fps))                                               
+      126 +                                                              
+      127 +                                                              
+      128  def set_force_depsgraph(enabled: bool) -> None:
+      129      """When True, call view_layer.update() after every set_fra
+           me().
+      130  
+
+● Now enable realtime sync in attach() so it's set the moment a cache is
+  imported:
+
+● Update(runtime\frame_handler.py)
+  ⎿  Added 5 lines
+      316      duration_s = (n_src - 1) / _playback_fps if n_src > 1 else
+            0.0
+      317      scene.frame_end = frame_start + int(round(duration_s * _ou
+           tput_fps))
+      318  
+      319 +    # Make the viewport play at real wall-clock speed (drop fr
+          +ames instead of                                               
+      320 +    # crawling), so the viewport preview matches the final ren
+          +der EXACTLY —                                                 
+      321 +    # this is what fixes "viewport feels right but render is t
+          +oo fast".                                                     
+      322 +    _set_realtime_sync()                                      
+      323 +                                                              
+      324      # Store state for undo/reload recovery
+      325      scene["_beamng_cache_path"] = str(playback.reader.path)
+      326      scene["_beamng_frame_start"] = frame_start
+
+● Now let me make the two fps fields live in the UI via property update
+  callbacks. Let me update ui.py:
+
+● Update(addon\ui.py)
+  ⎿  Added 18 lines
+      14  print("[BeamNG] add-on loading...")
+      15  
+      16  
+      17 +def _on_playback_fps_update(self, context):                    
+      18 +    """Push the new playback speed to the live handler (no re-i
+         +mport needed)."""                                              
+      19 +    try:                                                       
+      20 +        from runtime import frame_handler                      
+      21 +        frame_handler.update_fps(playback_fps=int(self.playback
+         +_fps))                                                         
+      22 +    except Exception:                                          
+      23 +        pass                                                   
+      24 +                                                               
+      25 +                                                               
+      26 +def _on_output_fps_update(self, context):                      
+      27 +    """Push the new output/render fps to the live handler (no r
+         +e-import needed)."""                                           
+      28 +    try:                                                       
+      29 +        from runtime import frame_handler                      
+      30 +        frame_handler.update_fps(output_fps=int(self.output_fps
+         +))                                                             
+      31 +    except Exception:                                          
+      32 +        pass                                                   
+      33 +                                                               
+      34 +                                                               
+      35  class BeamNGSceneProperties(PropertyGroup):
+      36      sequence_dir: StringProperty(
+      37          name="Sequence Folder",
+
+● Update(addon\ui.py)
+  ⎿  Added 1 line
+      101          min=1,
+      102          max=240,
+      103          soft_max=60,
+      104 +        update=_on_playback_fps_update,                       
+      105      )
+      106      output_fps: IntProperty(
+      107          name="Output FPS (smoothness)",
+
+● Update(addon\ui.py)
+  ⎿  Added 1 line
+      114          min=1,
+      115          max=240,
+      116          soft_max=120,
+      117 +        update=_on_output_fps_update,                         
+      118      )
+      119  
+      120  
+
+  Thought for 18s (ctrl+o to expand)
+
+● The core fix is in. Now let me verify nothing broke and rebuild the addon. Let
+  me check existing tests reference these handler functions and run the suite.
+
+  Thought for 5s, searched for 1 pattern, ran 1 shell command (ctrl+o to expand)
+
+● All tests pass. Let me build the addon.
+
+  Thought for 6s, ran 1 shell command (ctrl+o to expand)
+
+● Done. Let me update the existing memory note on this bug since we found the
+  real root cause.
+
+  Recalled 1 memory, wrote 1 memory (ctrl+o to expand)
+
+● Done. Here's what I fixed for the animation speed problem (the one you
+  prioritized).
+
+  Root cause
+
+  The timing math was already correct. Both the viewport and the render use the
+  same _cache_frame_for() mapping, so any given Blender frame shows the same
+  cache frame in both — the content is frame-locked. The problem was purely
+  wall-clock speed:
+
+  - Render always emits every frame at scene.render.fps → plays at the true,
+  intended speed.
+  - Viewport used Blender's default sync mode 'NONE' ("Play Every Frame"), which
+  is compute-bound. Your ~550K-verts-per-frame handler can't keep up, so the
+  viewport crawls in unintended slow-motion.
+
+  So "15 fps feels good in viewport" was you compensating for viewport lag. When
+  you render, the lag disappears and it plays at the real speed → too fast. And
+  the two fps fields did work — they just only applied on re-import, and the
+  laggy viewport hid their effect, so they felt broken.
+
+  The fix (3 changes)
+
+  1. runtime/frame_handler.py — _set_realtime_sync(): sets scene.sync_mode = 
+  'FRAME_DROP' so the viewport targets real wall-clock time and drops frames it
+  can't compute, instead of crawling. Now the viewport plays at the exact same
+  speed as the render. Called automatically on import (attach()).
+  2. runtime/frame_handler.py — update_fps(): new function that applies
+  playback/output fps to the live handler, recomputes the timeline length, keeps
+  render.fps in sync, and re-asserts realtime sync.
+  3. addon/ui.py: added update= callbacks on both Playback Speed and Output FPS
+  fields → they now take effect immediately as you drag them, no re-import
+  needed.
+
+  Tests: 16/16 pass. Addon rebuilt → dist/beamng_cache_importer.zip.
+
+  To get normal-speed car animation
+
+  Reinstall the rebuilt zip, re-import the cache, then:
+  - Output FPS = 60 (smoothness).
+  - Playback Speed = the capture's real rate. If you captured with --mode slowmo
+  --timescale 0.1 (10× slower), the raw capture already ran at 1/10 real time;
+  set Playback Speed = 60 for true real-time crash speed, or lower for
+  deliberate slow-mo. Because the viewport is now realtime-synced, whatever you
+  pick will look identical in the render.
+
+  ---
+  Want me to move on to issue #1 (rigid props not importing + steering
+  wheel/indicators/pedals/speedo needles landing at the car center instead of
+  their true positions), then issue #3 (material slots not truly attached to
+  their objects)? And yes — on issue #3, "Assign Textures" in the addon is the
+  intended path, but only works if the slots are correctly bound first; I'll
+  confirm that when I get there.
+
+✻ Cooked for 15m 27s
+
+※ recap: Goal: fix three BeamNG cache importer issues. I fixed the animation speed problem (viewport now realtime-synced to match render, fps fields live, addon rebuilt, tests pass). Next: tackle issue #1, the rigid props not importing and misplaced steering wheel, indicators, pedals, and speedo needles. (disable recaps in /config)
+
+❯ yes fix al the issues                                                         
+  Thought for 17s (ctrl+o to expand)
+
+● Now let me tackle issues #1 (rigid props not showing + interior parts at car
+  center) and #3 (materials not attached). Let me investigate the GLB reader and
+  scanner to understand how these objects are handled.
+
+  Thought for 1m 50s, read 2 files (ctrl+o to expand)
+
+● This is a large, interconnected task. Let me set up task tracking and
+  investigate the remaining pieces in parallel: the material read-back path, the
+  prop/dynamic handling, and the exporter.
+
+  Thought for 12s (ctrl+o to expand)
+
+● For issue #1 I need to understand how positions and dynamic/prop objects flow
+  through the runtime. Let me read the binary format and the runtime cache
+  reader.
+
+  Thought for 33s, read 2 files (ctrl+o to expand)
+
+● Let me read the parallel reader — this is where per-frame positions are
+  actually written to the BVC, and it's the likely culprit for props landing at
+  origin.
+
+  Thought for 43s, read 1 file (ctrl+o to expand)
+
+● The GLB pipeline (build_from_gltf) only writes manifest.stable_objects —
+  dynamic objects are silently dropped (header always has
+  dynamic_directory_offset=0). That's a strong candidate for "rigid props not
+  shown." And the interior-parts-at-center symptom points to node-transform
+  handling for prop nodes. But I shouldn't theorize blindly — let me inspect the
+  actual capture data. Let me find it.
+
+  Listed 1 directory (ctrl+o to expand)
+
+● There's real data. Let me write a diagnostic to inspect the GLB node structure
+  — specifically to find the interior parts (steering, needles, pedals) and
+  understand their node transforms and whether the shared-pool extraction places
+  them correctly. This is the key to issue #1.
+
+  Thought for 17s, ran 2 shell commands (ctrl+o to expand)
+
+● Critical finding: the interior parts (needle_speedo, steer, gaspedal, etc.,
+  nodes 88–96) are the only nodes with their own local translation+rotation, and
+  there are duplicate node names (node 95 flanje_e180_steer with a mesh, and
+  node 153 flanje_e180_steer with no mesh). Let me map the parent/child
+  structure to see how these are placed and why they collapse to center.
+
+  Thought for 9s, ran 1 shell command (ctrl+o to expand)
+
+● The structure is clear: interior parts (nodes 88–96) carry their own local T+R
+  that positions them in the car; they parent up to body/root (near-identity).
+  So _node_world_matrix should place them. Let me actually run the reader and
+  check where these parts land versus the body — to see if they're really
+  collapsing to center.
+
+  Thought for 14s, ran 1 shell command (ctrl+o to expand)
+
+● The reader places them correctly at frame 0 — needle/steer/pedals are all near
+  the body, not at center. So the base mesh is fine. Let me check whether their
+  per-frame node transforms change — props move via node T+R, not vertex
+  deformation. If the T+R is baked only into frame 0 but the per-frame stream
+  reads static vertices, they'd detach.
+
+  Thought for 17s, ran 1 shell command (ctrl+o to expand)
+
+● Interior parts move via per-frame node transform (T+R), and read_glb bakes
+  that into vertices each frame — so the built cache should be correct. Let me
+  verify against the actual built BVC, and check the debug log which records
+  per-object bounds.
+
+  Thought for 28s, ran 2 shell commands (ctrl+o to expand)
+
+● The BVC data is provably correct — needle_speedo, steer, gaspedal all track
+  the body across all frames and sit at their true offsets (not at
+  origin/center). So the build is fine. The problem must be in the runtime 
+  import path. Let me check the debug log from the last import and look for what
+  happens to these parts.
+
+  Thought for 55s, ran 1 shell command (ctrl+o to expand)
+
+● The GLB-built BVC on disk is provably correct — I verified frame_positions for
+  needle_speedo, steer, gaspedal all track the body across frames 0/1000/1999
+  and sit at their true offsets (not center), and the debug log confirms all 97
+  objects are created at correct positions. So the data pipeline and GLB build
+  are not the bug.
+
+  That means the symptom must come from either the runtime rendering or the BMC 
+  pipeline (where props/interior parts are known to collapse). Let me get ground
+  truth by checking materials in the BVC and then running a headless Blender
+  import test.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Found issue #3's root cause. The per-object material blocks have the right
+  structure (correct count of slots, correct per-face ids), but every material
+  name resolves to <unknown>. That means the global material name table is 
+  broken — _resolve_material_name(gid) returns <unknown> because the gid is out
+  of range of _global_material_names.
+
+  Let me inspect the global material table directly:
+
+  Thought for 1m 18s, ran 1 shell command (ctrl+o to expand)
+
+● The BVC data is correct, but I found issue #3's root cause definitively: every
+  material resolves to <unknown>. The global material name table has only 1
+  entry (__no_material__), yet the per-object blocks reference material ids 0–8.
+  This is an ordering bug in build_from_gltf:
+  pack_material_name_table(all_material_names) is called at line 380 before the
+  per-object loop registers the real names via _ensure_name (lines 384–399). The
+  BMC path registers names first (correct); the GLB path packs first (broken).
+
+  Because all names come back as <unknown>, they dedupe to a single slot per
+  object → materials aren't bound per-object, and "Assign Textures" can't match
+  anything. Let me check the known culling issue for #1 too:
+
+  Thought for 34s, searched for 1 pattern (ctrl+o to expand)
+
+● The BVC data is correct, so issue #1's symptom lives in the runtime. My memory
+  notes flag a known bug here: position-attribute writes leave the object
+  bounding box stale → Blender frustum-culls parts ("parts vanish on camera
+  rotate"), and the documented fix (mesh.transform(Identity)) is not present in
+  the current _write_positions. Let me confirm with a headless Blender run to
+  see the real symptom. Let me find Blender.
+
+  Listed 2 directories (ctrl+o to expand)
+
+● Blender 4.5.9 is available. Let me write a focused diagnostic that imports the
+  actual BVC in real Blender and reports each interior part's world-space
+  bounding box + whether the object bbox is stale (the culling symptom). This
+  gives ground truth for issue #1.
+
+● Write(tests\diag_props_world.py)  ⎿  Wrote 74 lines to tests\diag_props_world.py
+       1 """Headless diagnostic: import a BVC and report interior/prop pa
+         rts' world-space
+       2 position and whether their object bounding box is stale.
+       4 Run:
+       5   blender.exe --background --python tests/diag_props_world.py --
+          <cache.bvc>
+       6 """
+       7 import sys
+       9 
+      10 # make importer/runtime importable
+     … +76 lines (ctrl+o to expand)
+
+● Let me mark task #1 in progress and run the diagnostic in real Blender.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● This is definitive ground truth. Two things confirmed:
+
+  Issue #1 is a stale-bounding-box bug. The vertices are correct —
+  true_world_ctr for every part (steer, needle_speedo, gaspedal) tracks the body
+  perfectly across frames 0/600/1200. But bbox_ctr is frozen at the frame-0 
+  values — BBOX_DRIFT grows from ~0 to 2.5+ by frame 1200. Because
+  _write_positions writes the position attribute directly but the object's
+  bounding box never updates, Blender frustum-culls these parts once they move
+  outside their stale bbox → they vanish or appear stuck. This is exactly the
+  memory note position-attr-stale-bbox-culling. The fix
+  (mesh.transform(Identity)) was documented but is missing from the current
+  _write_positions.
+
+  Let me fix _write_positions in mesh_update.py:
+
+● Update(runtime\mesh_update.py)
+  ⎿  Added 15 lines
+      133      attr = mesh.attributes.get("position")
+      134      if attr is not None:
+      135          attr.data.foreach_set("vector", flat)
+      136 +        # THE VANISHING-PARTS FIX (2026-07-24, proven with tes
+          +ts/diag_props_world.py)                                       
+      137 +        # ----------------------------------------------------
+          +---------------------                                         
+      138 +        # Writing the ``position`` attribute directly does NOT
+          + invalidate the                                               
+      139 +        # object's cached bounding box.  Blender frustum-culls
+          + objects by their                                             
+      140 +        # bbox, so once a part (steering wheel, needle, pedal,
+          + any rigid prop)                                              
+      141 +        # moves outside its FROZEN frame-0 bbox it disappears 
+          +— it looks like the                                           
+      142 +        # part is stuck at the car's start pose / center while
+          + everything else                                              
+      143 +        # moves.  Measured: bbox_ctr stayed at frame-0 while t
+          +rue vertex center                                             
+      144 +        # drifted 2.5 m by frame 1200.  ``mesh.transform(Ident
+          +ity)`` is the                                                 
+      145 +        # cheapest call that forces Blender to recompute the b
+          +box from the new                                              
+      146 +        # coordinates (it rewrites coords through an identity 
+          +matrix and dirties                                            
+      147 +        # the bbox).  ``mesh.vertices.foreach_set`` (the legac
+          +y path) already                                               
+      148 +        # dirties the bbox, so it only needs the guard here.  
+      149 +        if _IDENTITY_4X4 is not None:                         
+      150 +            mesh.transform(_IDENTITY_4X4)                     
+      151      else:  # pragma: no cover - only on pre-4.x Blender
+      152          mesh.vertices.foreach_set("co", flat)
+      153  
+
+● Now issue #3: the material-name-table ordering bug in build_from_gltf. The
+  table is packed at line 380 before the per-object loop registers real names.
+  Let me fix by moving name registration ahead of table packing. Let me re-read
+  that exact section:
+
+  Thought for 9s, read 1 file (ctrl+o to expand)
+
+● Confirmed: pack_material_name_table(all_material_names) runs at line 380 when
+  the list is still just ["__no_material__"]; the real names get registered at
+  line 390, too late. The fix is to register all object material names before
+  packing the table. Let me restructure:
+
+● Update(importer\cache_builder.py)
+  ⎿  Added 17 lines, removed 4 lines
+      377  
+      378          uv_blocks_offset = off
+      379  
+      380 +        # --- Register EVERY object's material names FIRST, th
+          +en pack the table.                                            
+      381 +        # THE "<unknown> material" FIX (2026-07-24): the globa
+          +l name table must be                                          
+      382 +        # packed AFTER all names are registered.  The old code
+          + packed the table                                             
+      383 +        # here (when it held only "__no_material__") and only 
+          +called _ensure_name                                           
+      384 +        # in the per-object loop below — so the on-disk table 
+          +had 1 name while the                                          
+      385 +        # per-object blocks referenced global ids 1..N.  At im
+          +port every name                                               
+      386 +        # resolved to "<unknown>", collapsing all slots into o
+          +ne and breaking                                               
+      387 +        # per-object material binding + texture assignment.  B
+          +MC's build already                                            
+      388 +        # registers names before packing; this brings GLB in l
+          +ine.                                                          
+      389 +        obj_global_ids: Dict[str, List[int]] = {}             
+      390 +        for name in obj_names:                                
+      391 +            mnames = base_mat_names.get(name, [])             
+      392 +            if not mnames:                                    
+      393 +                mnames = ["__no_material__"]                  
+      394 +            obj_global_ids[name] = [_ensure_name(mn) for mn in
+          + mnames]                                                      
+      395 +                                                              
+      396          mat_table_bytes = binary.pack_material_name_table(all_
+           material_names)
+      397          material_table_offset = off
+      398          off += len(mat_table_bytes)
+     ...
+      400          mat_block_bytes: Dict[str, bytes] = {}
+      401          mat_off: Dict[str, int] = {}
+      402          for name in obj_names:
+      387 -            mnames = base_mat_names.get(name, [])             
+      388 -            if not mnames:                                    
+      389 -                mnames = ["__no_material__"]                  
+      390 -            global_ids = [_ensure_name(mn) for mn in mnames]  
+      403 +            global_ids = obj_global_ids[name]                 
+      404              face_mats = base_face_mats.get(name)
+      405              if face_mats is not None and len(face_mats) == fac
+           e_counts[name]:
+      406                  mids = face_mats
+
+● Now let me verify the material fix by building a small BVC from a few GLB
+  frames and checking material names resolve. Let me build from just 3 frames to
+  be fast:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Issue #3 fixed. Materials now resolve to their real names (flanje_e180_paint,
+  flanje_e180_leather, flanje_e180_pedal, etc.), correctly bound per object with
+  proper per-face slots. The "Assign Textures" operator matches on these names,
+  so it will now work.
+
+  Now let me verify issue #1's bbox fix in real Blender. Let me re-run the
+  diagnostic — BBOX_DRIFT should now stay near 0:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Issue #1 fixed. BBOX_DRIFT now stays constant (0.131, 0.033, 0.012...) across
+  all frames instead of ballooning to 2.5+. The bbox now tracks the moving
+  vertices, so Blender no longer frustum-culls the interior parts. They'll
+  follow the car instead of appearing stuck at the start pose. (The small
+  constant drift ≈ half the difference between vertex-mean and bbox-center,
+  which is normal for asymmetric meshes.)
+
+  Now, one thing I want to address in your issue #1 description: "rigid props 
+  aren't shown." The GLB pipeline classifies everything as stable (0 dynamic),
+  so props ARE in the cache. Given the bbox culling bug, the most likely
+  explanation is they were being culled — now fixed. But you also mentioned
+  truly separate "rigid props." Let me check: are there objects present in later
+  frames but missing from frame 0 (detached debris), which the GLB builder
+  would silently drop? Let me verify against the scan.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● All 97 objects are present in every frame — no detached debris appears
+  mid-sequence, and none are dropped. So for the GLB pipeline, "rigid props not
+  shown" was entirely the bbox-culling bug (parts vanishing when they moved
+  outside their stale bbox), now fixed.
+
+  Note: your CLAUDE.md says the GLB pipeline is the superior/primary path, and
+  this capture confirms it. If you were also seeing missing props in the BMC 
+  pipeline, that path had a genuine gap — build_from_gltf never writes a dynamic
+  section, and neither does build_from_capture. But since your current data is
+  GLB and has zero dynamic objects, the fixes above cover it.
+
+  Now let me run the full test suite and rebuild the addon.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● All 16 pass. Let me add a focused test to lock in the material-name-table fix
+  (regression guard), then rebuild.
+
+  Thought for 7s, ran 3 shell commands (ctrl+o to expand)
+
+● There's already a blender_bbox_tracking.py test. Let me check how tests build
+  GLBs so I can add a proper regression test for the material fix:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● There's a build_glb fixture. Let me check if it supports materials so I can
+  write the regression test:
+
+  Thought for 11s, ran 1 shell command (ctrl+o to expand)
+
+● Let me look at the build_glb fixture signature to see whether I can extend it
+  minimally for a material regression test:
+
+  Thought for 10s, read 1 file (ctrl+o to expand)
+
+● The fixture doesn't support materials. Let me write a self-contained
+  regression test that builds a GLB with named materials, runs the builder, and
+  asserts names resolve (not <unknown>). This locks in the issue #3 fix.
+
+● Write(tests\test_material_table_order.py)
+  ⎿  Wrote 156 lines to tests\test_material_table_order.py
+      1 from __future__ import annotations
+      3 """Regression test for the GLB material-name-table ordering bug (
+        2026-07-24).
+      5 ``build_from_gltf`` used to pack the global material name table B
+        EFORE the
+        nly
+      7 ``__no_material__`` while per-object blocks referenced global ids
+      8 import every name resolved to ``<unknown>``, collapsing all mater
+        ial slots into
+        .
+     … +161 lines (ctrl+o to expand)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● The regression test passes and reproduces/locks the fix. Let me run the full
+  suite, then rebuild the addon.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● All 17 tests pass and the addon is rebuilt. Let me update the tasks and
+  refresh the two relevant memory notes.
+  Thought for 6s, recalled 1 memory (ctrl+o to expand)
+
+● This memory documents the exact bug and fix — but the fix had regressed out of
+  the code (likely during the "cleanup" in commit 5329917). My edit re-applied
+  it. Let me note that in the memory and verify the existing regression test
+  still guards it:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Confirmed: commit 5329917 ("cleanup") deleted the
+  mesh.transform(_IDENTITY_4X4) bbox fix that was added in 7846df8. That
+  regression is exactly what made the interior parts/props appear stuck. My edit
+  restored it. Let me run the existing bbox regression test in Blender to
+  confirm it guards this:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● The bbox test needs a testglt/ folder that doesn't exist. Let me point it at
+  the real data to confirm it validates the fix:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● The test uses a testglt/ fixture dir. Rather than depend on that, my
+  diag_props_world.py already proved the fix on real data (BBOX_DRIFT constant
+  vs ballooning). That's stronger evidence. Let me point the existing regression
+  test at the real GLB dir to get a clean pass/fail:
+
+  Thought for 6s, ran 1 shell command (ctrl+o to expand)
+
+● The full 2000-frame scan would be slow. Let me create a tiny 5-frame subset
+  and run the regression test against it for a definitive pass/fail:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● The sed mangled the path (\a escape). Let me just rewrite the line cleanly
+  with Python:
+
+  Thought for 9s, ran 2 shell commands (ctrl+o to expand)
+
+● The test writes positions directly via foreach_set, bypassing _write_positions
+  — so it's testing the raw Blender behavior, not our fix path. Let me see the
+  full test to confirm:
+
+  Thought for 18s, ran 1 shell command (ctrl+o to expand)
+
+● The test calls _write_positions (our fixed path) but reads obj.bound_box
+  synchronously with no depsgraph update. My diag_props_world used frame_set()
+  (full depsgraph eval) and showed correct tracking. Let me determine whether
+  obj.bound_box needs a depsgraph poke or the fix truly isn't firing:
+
+  Thought for 23s, ran 1 shell command (ctrl+o to expand)
+
+● mesh.transform(I) does refresh the bbox (1.0 → 501.0) in isolation. The test
+  fails because it reads obj.bound_box before the write (caching it), then
+  checks synchronously with no depsgraph update. My diag_props_world used
+  frame_set() (real playback path with depsgraph eval) and bbox tracked
+  perfectly. Let me confirm the object-level cache behavior matches the test's
+  read-before-then-after pattern:
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● _write_positions does correctly update obj.bound_box (1.0 → 501.0), even with
+  the read-before caching pattern. So my fix works exactly as intended.
+
+  Why did tests/_bbox_tmp.py fail? It uses chunked mode (CHUNK_MAP_E180) and
+  reads the body chunk. The chunk's mesh is built via
+  _mesh_from_data/_build_chunk, and its object's bbox behaves the same — but the
+  test builds from only 5 near-identical frames where the body barely moves,
+  and it manually shifts +500. Let me run my clean probe logic through the
+  actual chunk path to be certain, then discard the temp files. Actually, the
+  isolated probe already proves _write_positions is correct. The _bbox_tmp
+  failure must be environmental. Let me re-run it now that I've confirmed the
+  mechanism:
+
+  Ran 1 shell command (ctrl+o to expand)
+  ⎿  API Error: 400 You have exceeded your daily token limit. You can resume at 
+     2026-07-25 00:00 UTC.
+
+✻ Brewed for 17m 55s

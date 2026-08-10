@@ -13,7 +13,7 @@ the CacheReader + CachePlayback from the stored metadata on the next frame
 change — so the animation keeps playing after Ctrl+Z or file reload.
 """
 
-from typing import Optional
+from typing import Dict, Optional
 
 from .mesh_update import CachePlayback
 from .tyre_deform import TyreSettings
@@ -276,6 +276,45 @@ def _load_tyre(scene) -> TyreSettings:
     return TyreSettings.from_dict(stored)
 
 
+_SHATTER_KEY = "_beamng_shattered_panes"
+
+
+def set_shattered_panes(panes: Dict[str, int]) -> None:
+    """Register shattered glass panes on the LIVE playback (and persist them).
+
+    ``panes`` maps a pane member name to the cache frame it broke.  From that
+    frame on the intact glass collapses to a point so the spawned fragments
+    take over.  Called by the debris builder; also stored on the scene so undo
+    /reload recovery re-applies the shatter (the .blend keeps the fragments,
+    so the panes must keep collapsing to match).
+    """
+    if _active is not None:
+        _active.set_shattered_panes(panes)
+    if bpy is not None and bpy.context.scene is not None:
+        if panes:
+            bpy.context.scene[_SHATTER_KEY] = ",".join(
+                f"{k}:{int(v)}" for k, v in sorted(panes.items()))
+        elif _SHATTER_KEY in bpy.context.scene:
+            del bpy.context.scene[_SHATTER_KEY]
+
+
+def _load_shattered_panes(scene) -> Dict[str, int]:
+    """Restore the shattered-pane map from scene custom props."""
+    raw = scene.get(_SHATTER_KEY)
+    if not raw:
+        return {}
+    out = {}
+    for tok in str(raw).split(","):
+        if ":" not in tok:
+            continue
+        name, frame = tok.rsplit(":", 1)
+        try:
+            out[name] = int(frame)
+        except ValueError:
+            continue
+    return out
+
+
 def set_force_depsgraph(enabled: bool) -> None:
     """When True, call view_layer.update() after every set_frame().
 
@@ -425,6 +464,11 @@ def _try_recover(scene) -> bool:
         _active = playback
         _frame_start = frame_start
 
+        # Re-apply shattered panes so recovered playback collapses them too.
+        panes = _load_shattered_panes(scene)
+        if panes:
+            playback.set_shattered_panes(panes)
+
         # Re-register handler if missing
         _ensure_handler_registered()
 
@@ -558,7 +602,8 @@ def detach() -> None:
     if bpy is not None and bpy.context.scene is not None:
         keys = ["_beamng_cache_path", "_beamng_frame_start", "_beamng_start_frame",
                 "_beamng_start_second",  # legacy key from the seconds-based build
-                "_beamng_use_chunked", "_beamng_playback_fps", "_beamng_output_fps"]
+                "_beamng_use_chunked", "_beamng_playback_fps", "_beamng_output_fps",
+                _SHATTER_KEY]
         keys += [f"_beamng_tyre_{k}" for k in _TYRE_KEYS]
         for key in keys:
             if key in bpy.context.scene:

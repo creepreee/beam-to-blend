@@ -1,0 +1,1519 @@
+ ▐▛███▜▌   Claude Code v2.1.220
+▝▜█████▛▘  stealth · API Usage Billing
+  ▘▘ ▝▝    ~\Downloads\beamng-cache-importer
+
+
+ ⚠ Both ANTHROPIC_AUTH_TOKEN and /login managed key set · auth may not work as expected
+   · to use ANTHROPIC_AUTH_TOKEN: claude /logout
+   · to use /login managed key: Unset the ANTHROPIC_AUTH_TOKEN environment variable.
+
+❯ /clear                                                                        
+
+❯  i have some questions: blender ctrl + z combo is actually very much glithcy  
+  adn it is a known bug. devs are fixing it sicne that is wired to heh bakedn   
+  of teh beldner. this i shwy MANY and Many o fthe devs around the world        
+  including even teh famous mods of blender get glitched when ctrl z is         
+  clicked.in pur case, the anaimtion of the get vertices (not the root          
+  transformation) finishes and vanishes. so instead of ixign the ctrl z methid  
+  stuff, i have questions: first what wil hapend if i export to alebamic ? is   
+  that proven to be working? are aniamtion, uvs, materials, textures,           
+  normals,deformation and some pieces gonn abe on it?? secondly will i have     
+  some drastic changes in fps? pelase provide figures and proabablitis of what  
+  fps i wil get in the viewport in alebemic. third: will the alebemic file have 
+  proper aniamtion FOR reander? (incase of not ahving immensly fast or imesnly  
+  slow down the entire anaition sequence of the car)4th: in out ctrl z AND      
+  onetime proejct closure of blender, your anaimtion gone problem, should i use 
+  the "export to alebemic" afetrwards?                                          
+  ⎿  UserPromptSubmit hook error
+  ⎿  Failed with non-blocking status code: Assertion failed: !(handle->flags & 
+     UV_HANDLE_CLOSING), file src\win\async.c, line 94
+
+  Thought for 10s (ctrl+o to expand)
+
+● I'll check what the export actually does in the code before answering.
+
+  Thought for 9s, searched for 2 patterns, read 2 files (ctrl+o to expand)
+
+● Now let me see which path the UI export button actually takes.
+
+  Thought for 15s, searched for 1 pattern, read 2 files, ran 1 shell command (ctrl+o to expand)
+
+● The audit script exists but is untracked — let me check if it's ever been run,
+  and find a cache to run it against.
+
+  Thought for 9s, ran 3 shell commands, searched memories (ctrl+o to expand)
+
+● Found Blender. Let me run the actual audit — first the small test cache to
+  validate, and check disk headroom for the 4.27 GB one.
+
+  Thought for 12s, ran 2 shell commands (ctrl+o to expand)
+
+● Output got truncated. Let me capture to a file and read the report section.
+
+  Thought for 47s, ran 3 shell commands (ctrl+o to expand)
+
+● Now a proper benchmark on the real 1200-frame cache — the small-cache numbers
+  are cold-load artifacts (2-frame sample). Let me measure steady-state.
+
+● Write(tests\blender_abc_bench.py)
+  ⎿  Wrote 182 lines to tests\blender_abc_bench.py
+       1 """Steady-state Alembic vs BVC benchmark on a real capture.
+       3 ``blender_abc_audit.py`` answers *what survives*; it times only 
+         a couple of
+         n.  This script
+       5 answers *how fast it actually plays back* once warm, and *how bi
+       6 gets*, using a bounded frame range so a 1200-frame cache does no
+         t have to be
+       8 
+       9 Run:
+         <cache.bvc> [n_frames] [outdir]
+     … +197 lines (ctrl+o to expand)
+
+  Thought for 19s, ran 1 shell command (ctrl+o to expand)
+
+● Two big findings. Let me verify them properly — warm-vs-cold playback, the
+  lighter normals=False variant, and the actual question 4 (survives reload
+  without the addon).
+
+● Write(tests\blender_abc_bench2.py)
+  ⎿  Wrote 184 lines to tests\blender_abc_bench2.py
+       1 """Follow-up to blender_abc_bench.py: isolate WHY Alembic playba
+       2 and prove whether an .abc scene survives a .blend save/reload wi
+         th no add-on.
+       4 Run:
+       5     blender --background --python tests/blender_abc_bench2.py --
+       6 
+       7 Three questions the first bench left open:
+         tate?  Times a
+       9      cold sequential pass, then a warm re-scrub of the same fram
+      10      random-access pass.
+     … +198 lines (ctrl+o to expand)
+
+  Thought for 36s, ran 1 shell command (ctrl+o to expand)
+
+● Important: the ABC came back as 49 frames, not 120 — that's the retiming issue
+  (Q3). Let me confirm the mechanism and rule out addon noise in the fps
+  numbers.
+
+● Write(tests\blender_abc_bench3.py)
+  ⎿  Wrote 114 lines to tests\blender_abc_bench3.py
+       1 """Third Alembic probe: is the retime real, and is the slow play
+       2 
+         the timings:
+       4     blender --background --factory-startup --python tests/blende
+       5 
+           Two candidate
+       8   A) the .abc only has 49 samples  -> data was LOST, export is b
+         roken
+         s scene simply
+          fast
+     … +125 lines (ctrl+o to expand)
+
+● I need to regenerate an ABC (bench2 deleted them). Let me export one and keep
+  it for bench3.
+
+● Write(tests\blender_abc_make.py)
+  ⎿  Wrote 63 lines to tests\blender_abc_make.py
+       1 """Export one .abc from a cache and leave it on disk for other p
+         robes.
+       2 
+       4     blender --background --python tests/blender_abc_make.py -- <
+         cache.bvc> <n_frames> <out.abc> [normals0|normals1]
+       5 """
+       6 
+       8 import sys
+       9 import tempfile
+      10 import shutil
+     … +61 lines (ctrl+o to expand)
+
+  Thought for 24s, ran 2 shell commands (ctrl+o to expand)
+
+● Let me clean up and test whether chunked mode fixes the ABC playback cost,
+  since it's per-object.
+
+  Thought for 25s, searched for 1 pattern, ran 4 shell commands (ctrl+o to expand)
+
+● I measured all four answers on your real 1200-frame / 97-object / 316K-vert
+  capture rather than estimating. Everything below is from actual runs.
+
+  1. What survives the Alembic export — verified
+
+  Exported via the panel's operator, re-imported, audited:
+
+  ┌───────────────────────┬─────────────────────────────────────────────────┐
+  │         Thing         │                     Result                      │
+  ├───────────────────────┼─────────────────────────────────────────────────┤
+  │ Objects               │ 97 → 97 ✅                                      │
+  ├───────────────────────┼─────────────────────────────────────────────────┤
+  │ Per-frame deformation │ 97/97 objects carry a MESH_SEQUENCE_CACHE       │
+  │                       │ modifier, probe vertex moved 7.4 mm ✅          │
+  ├───────────────────────┼─────────────────────────────────────────────────┤
+  │ UVs                   │ 97/97 objects ✅                                │
+  ├───────────────────────┼─────────────────────────────────────────────────┤
+  │ Material slots + face │ 235 → 235 ✅                                    │
+  │  assignments          │                                                 │
+  ├───────────────────────┼─────────────────────────────────────────────────┤
+  │ Normals / sharp edges │ 28229 → 23315 ⚠️ (shading survives, but not     │
+  │                       │ edge-for-edge)                                  │
+  ├───────────────────────┼─────────────────────────────────────────────────┤
+  │ Tyre deformation      │ baked in, viewport and render match ✅          │
+  ├───────────────────────┼─────────────────────────────────────────────────┤
+  │ Textures / shader     │ ❌ Never — Alembic has no concept of them       │
+  │ nodes                 │                                                 │
+  └───────────────────────┴─────────────────────────────────────────────────┘
+
+  That last row is the one to plan around. Alembic stores which faces belong to 
+  which material, not the material. On re-import you get 235 correctly-assigned
+  but empty grey slots. Your existing Assign Textures operator repopulates them
+  — so it's a re-run, not a rebuild.
+
+  2. FPS — this is the bad news, and it's the opposite of what you'd expect
+
+  Measured warm, under --factory-startup (no third-party addons polluting it):
+
+  BVC (Python handler)     3.3 ms/frame   ->  ~210 fps ceiling
+  ABC (C++ sequence cache) 130-480 ms/f   ->  2-8 fps ceiling
+
+  Alembic is 25-100x SLOWER than your current BVC playback, not faster. Two
+  reasons I isolated:
+
+  - Per-frame normals dominate file size: normals=True (your operator's setting)
+  = 23.7 MB/frame → 480 ms/frame. normals=False = 4.0 MB/frame → 130 ms/frame.
+  6x smaller, 3.7x faster.
+  - Object count, not vertex count, is the bottleneck: dropping to the 10
+  heaviest objects kept 66% of the verts but cut time nearly in half — ~0.66 ms
+  of fixed overhead per object per frame. 97 separate MESH_SEQUENCE_CACHE
+  modifiers each re-open and re-read the archive.
+
+  Realistic viewport figures for your scene (headless numbers exclude GPU draw,
+  so shade them down): 2-4 fps with normals on, 5-8 fps with normals off. Your
+  BVC path already gives you a far better viewport.
+
+  Also: 28.5 GB for the full 1200 frames with normals on, 4.8 GB with them off.
+  Your BVC is 4.27 GB.
+
+  3. Render timing — correct, with one setting
+
+  No animation is lost. I imported the same file into 24/30/60 fps scenes and
+  the frame range scaled exactly with scene fps (60/24 ratio = 2.49 vs 2.50
+  expected) while wall-clock duration stayed 5.000 s. Alembic stores samples in
+  seconds, so the clip always renders at its authored real-time speed.
+
+  The catch: the bake writes one cache frame per Blender frame, so the .abc's 
+  authored fps is your scene's render.fps at export time, not your Playback 
+  Speed knob. The audit caught this as a 0.500 speed ratio — the clip came out
+  2x too fast because the scene was at 24 fps while the BVC clip was tuned at
+  60. Set render.fps = your Playback Speed before exporting, and the render
+  matches the viewport exactly.
+
+  4. Should you use it as the Ctrl+Z / reopen fix — yes
+
+  This is the strongest result. I saved the ABC scene to a .blend, then reopened
+  it in a fresh Blender with --factory-startup — no addon, nothing:
+
+  [CHILD] objects=97  with_cache_modifier=97
+  [CHILD] handlers frame_change_pre=0     <- zero Python handlers
+  [CHILD] ANIMATES=True  (max_delta 0.007363)
+  [CHILD] material_slots=226  objects_with_uvs=97
+
+  Animation plays with zero Python handlers registered. That's exactly why it's
+  immune to your problem — MESH_SEQUENCE_CACHE is a native C++ modifier plus a
+  CacheFile datablock, both saved into the .blend. Ctrl+Z can't unregister a
+  handler that doesn't exist, and there's no import step to re-run on reopen.
+
+  Recommended workflow
+
+  Use both, for what each is good at:
+
+  1. Tune in BVC — live sliders, ~210 fps, Ctrl+Z-fragile but you're actively
+  working
+  2. Set render.fps = Playback Speed
+  3. Export to Alembic with normals OFF (6x smaller, 3.7x faster; shading
+  survives via the material slots)
+  4. Re-run Assign Textures on the re-imported .abc
+  5. Render from the .abc — Ctrl+Z-proof and reopen-proof
+
+  Do the scrubbing-heavy work in BVC; switch to ABC once you're locked in. Don't
+  expect the .abc to be a pleasant viewport — it won't be.
+
+  Two things I'd flag as worth changing in the code, though I haven't touched
+  them since you didn't ask:
+  - operators.py:485 hardcodes normals=True. Given the measured 6x size and 3.7x
+  speed cost, that's worth a panel checkbox.
+  - Nothing warns that render.fps must equal Playback Speed before export. That
+  silently produces a wrongly-timed render — the exact failure the audit caught.
+
+  Four probe scripts are left in tests/ (blender_abc_bench.py, bench2, bench3,
+  abc_make.py) if you want to re-measure after changes. All 57 existing tests
+  still pass; I didn't modify any shipping code.
+
+● Ran 1 stop hook (ctrl+o to expand)
+  ⎿  Stop hook error: Failed with non-blocking status code: Assertion
+  failed: !(handle->flags & UV_HANDLE_CLOSING), file src\win\async.c,
+  line 94
+
+✻ Worked for 13m 28s
+
+❯ well unfortunatley there are limitations with abc. liek teh fps being sloed   
+  which we cant fix WIHOUT like leaving other thigns. so tradeoff. i was        
+  windering if ther was a way we could retian the aniamtion ATLEAST for the     
+  reopening blend file? like lets say we dont press ctrl z atleast can we fix   
+  the problem of the naiamtion being vanished off when the blend file is        
+  closed?? something like that?                                                 
+  ⎿  UserPromptSubmit hook error
+  ⎿  Failed with non-blocking status code: Assertion failed: !(handle->flags & 
+     UV_HANDLE_CLOSING), file src\win\async.c, line 94
+  Thought for 6s (ctrl+o to expand)
+
+● Good question — and there may already be machinery for this. CLAUDE.md claims
+  frame_handler has "undo/reload recovery". Let me find out why it isn't working
+  on reopen.
+
+  Thought for 11s, read 1 file (ctrl+o to expand)
+
+● The recovery machinery exists — but it's only reachable from inside the
+  frame-change handler. Let me check how the addon registers.
+
+  Thought for 18s, read 1 file (ctrl+o to expand)
+
+● The recovery path exists and load_post is wired. So why does it fail on
+  reopen? Let me test it directly — there's a suspicious line at
+  addon/__init__.py:57.
+
+● Write(tests\blender_reload_probe.py)
+  ⎿  Wrote 179 lines to tests\blender_reload_probe.py
+      1 """Does an imported BVC cache still animate after save -> reopen?
+      2 
+      3 The add-on already has reload recovery (`addon._on_load_post` ->
+        nishes on
+      5 reopen anyway, so this probe finds out WHERE that chain breaks ra
+        ther than
+      6 guessing.
+      8 Run:
+      9     blender --background --python tests/blender_reload_probe.py -
+        - <cache.bvc> [outdir]
+     … +194 lines (ctrl+o to expand)
+
+  Thought for 23s, ran 1 shell command (ctrl+o to expand)
+
+● Recovery worked in that test. So the repo code is fine — which points at the
+  deployed build. Let me check what's actually installed.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● There's an installed copy. Let me diff it against the repo, and check whether
+  it has the recovery code.
+
+  Thought for 25s, ran 3 shell commands (ctrl+o to expand)
+
+● Recovery worked in that probe — so let me test the two things that differ in
+  real use: chunked mode, and whether that persistent call at
+  addon/__init__.py:57 actually takes effect.
+
+● Write(tests\blender_reload_probe2.py)
+  ⎿  Wrote 196 lines to tests\blender_reload_probe2.py
+       1 """Why does reload recovery fail in real use when the basic prob
+       2 
+       3 Two suspects the first probe did not cover:
+       4 
+       6          bpy.app.handlers.persistent(_on_load_post)
+       7          bpy.app.handlers.load_post.append(_on_load_post)
+         alue is what
+       9      carries the flag.  Discarding it may leave the handler NON-
+         persistent, in
+         pened and
+     … +211 lines (ctrl+o to expand)
+
+  Thought for 15s, ran 1 shell command (ctrl+o to expand)
+
+● Both pass in the repo build. But you run the installed addon, which has an
+  older frame_handler.py. Let me test that one.
+
+● Write(tests\blender_reload_installed.py)
+  ⎿  Wrote 145 lines to tests\blender_reload_installed.py
+       1 """Does the INSTALLED add-on recover the animation on reopen?
+       3 The repo build passes `blender_reload_probe.py`, but the user ru
+         ns the copy in
+         dler.py` is an
+       5 older revision.  This probe deliberately does NOT evict the inst
+       6 (the opposite of every other test here) so it exercises exactly 
+         the code the
+       8 
+       9 Run:
+         .py -- <cache.bvc> [outdir]
+     … +154 lines (ctrl+o to expand)
+
+  Thought for 15s, ran 1 shell command (ctrl+o to expand)
+
+● Recovery works in every configuration I've tested — repo, installed, chunked.
+  So let me test the realistic failure modes that would explain what you're
+  seeing.
+
+● Write(tests\blender_reload_failmodes.py)
+  ⎿  Wrote 155 lines to tests\blender_reload_failmodes.py
+       1 """Reload recovery works in the lab — so what breaks it in real 
+       2 
+       3 Recovery is a *soft link*: the .blend stores only the BVC path, 
+       4 `_try_recover` rebuilds the playback from that file at load time
+       5 that invalidates the path, or changes when the load handler runs
+         , silently
+         es the
+       7 realistic ways that happens.
+       9   1. BVC renamed / moved / deleted after the .blend was saved.
+         hing.
+     … +170 lines (ctrl+o to expand)
+
+  Thought for 8s, ran 1 shell command (ctrl+o to expand)
+
+● Found it. Case 2 is the real-world failure. Let me see case 4 and confirm the
+  mechanism.
+
+  Thought for 15s, ran 1 shell command (ctrl+o to expand)
+
+● Case 4 was blocked by my own process holding the memmap. More importantly,
+  Case 2 used --factory-startup, which isn't how you actually launch. Let me
+  test the real double-click path with your actual preferences.
+
+  Thought for 28s, ran 1 shell command (ctrl+o to expand)
+
+● Write(tests\blender_reload_realworld.py)
+  ⎿  Wrote 143 lines to tests\blender_reload_realworld.py
+       1 """The decisive reload test: real user preferences, real launch 
+       2 
+         th the .blend
+       4 as a command-line argument) fails, but it ran `--factory-startup
+       5 add-on is enabled from inside the script — i.e. *after* Blender 
+       6 the file, so `load_post` could not possibly have fired.  That is
+       7 about the real double-click path, where the add-on is enabled fr
+         om user prefs
+       9 
+         -add-on set is
+     … +155 lines (ctrl+o to expand)
+
+  Thought for 8s, ran 1 shell command (ctrl+o to expand)
+
+● That's the root cause. Let me confirm it decisively with an isolated config
+  where the addon is enabled at startup.
+
+● Write(tests\blender_reload_proof.py)
+  ⎿  Wrote 149 lines to tests\blender_reload_proof.py
+       1 """Proof: enabling the add-on in saved preferences is what makes
+       2 
+         OT enabled in
+       4 the user's saved preferences — only `beamng_texture_assign` and 
+       5 sequence importer are.  So on every launch the add-on never load
+       6 is never armed, and `_try_recover` never runs.  The animation is
+       7 "lost on close" — it was never re-attached on open.
+       8 
+         s: it points
+         WITH the add-on
+     … +161 lines (ctrl+o to expand)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Proven. Let me clean up and run the test suite.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Auto mode lets Claude handle permission prompts automatically — Claude
+  checks each tool call for risky actions and prompt injection before 
+  executing. Actions Claude identifies as safe are executed, while 
+  actions Claude identifies as risky are blocked and Claude may try a 
+  different approach. Ideal for long-running tasks. Sessions are 
+  slightly more expensive. Claude can make mistakes that allow harmful 
+  commands to run, it's recommended to only use in isolated 
+  environments. Shift+Tab to change mode.
+
+● Yes — and it already works. The add-on just isn't enabled.
+
+  Your animation isn't being lost on close. It was never being re-attached on
+  open, because beamng_cache_importer is not enabled in your saved Blender 
+  preferences.
+
+  Here's what your prefs actually contain:
+
+  [P] enabled add-ons: ['beamng_texture_assign',
+                        'bl_ext.user_default.beamng_gltf_sequence_importer']
+  [P] beamng_cache_importer enabled: False
+
+  The addon is installed at AppData\Roaming\Blender 
+  Foundation\Blender\4.5\scripts\addons\beamng_cache_importer\ — it's just not
+  ticked. You've been enabling it manually per-session (or running it from a
+  script), so it works while you're in that session, and is simply absent the
+  next time Blender starts.
+
+  Why this exactly matches your symptom
+
+  addon/__init__.py:58 registers _on_load_post on load_post, which calls
+  frame_handler._try_recover() to rebuild the playback from the BVC path stored
+  in the scene. That recovery code is correct and works. But a disabled addon
+  registers nothing, so on reopen you get:
+
+  [K] meshes: 97                      <- geometry is all there
+  [K] frame_change_pre: []            <- no handler
+  [K] runtime not importable: No module named 'runtime'
+  [K] delta=0.000000  ANIMATES: False <- frozen
+
+  97 objects sitting there perfectly, completely static. That's the "animation
+  vanished" you're describing — the mesh survives, the motion doesn't.
+
+  Proof
+
+  I pointed Blender at a throwaway config with the addon enabled, saved prefs,
+  imported, saved, and relaunched — both via double-click and File > Open:
+
+  === double-click path, add-on enabled in prefs ===
+    [K] add-on module loaded at startup: True
+    [K] load_post at startup: ['_on_blendfile_load_post', '_on_load_post']
+    [K] frame_change_pre: ['_on_frame_change']
+    [K] _active is None: False
+    [K] delta=0.443926  ANIMATES: True     ✅
+
+  === File > Open path, add-on enabled in prefs ===
+    [K] delta=0.443926  ANIMATES: True     ✅
+
+  Same file, same cache, same Blender. The only variable changed was the
+  preference tick.
+
+  The fix
+
+  Edit > Preferences > Add-ons → search "BeamNG Cache" → tick it → Save 
+  Preferences.
+
+  That's it. Recovery then runs automatically on every reopen, restoring your
+  live Start Second, Playback Speed, and Tyre Contact values from the _beamng_*
+  scene props — not the import-time ones.
+
+  I also verified recovery holds in the configurations that could plausibly
+  break it:
+
+  ┌──────────────────────────────────────────────┬──────────────────────────┐
+  │                   Scenario                   │          Result          │
+  ├──────────────────────────────────────────────┼──────────────────────────┤
+  │ Repo build, per-object                       │ ✅ animates              │
+  ├──────────────────────────────────────────────┼──────────────────────────┤
+  │ Installed build (older frame_handler.py)     │ ✅ animates              │
+  ├──────────────────────────────────────────────┼──────────────────────────┤
+  │ Chunked mode (14 chunks rebuilt from         │ ✅ 14/14 chunks,         │
+  │ scratch)                                     │ animates                 │
+  ├──────────────────────────────────────────────┼──────────────────────────┤
+  │ Launched via double-click                    │ ✅ (once enabled)        │
+  ├──────────────────────────────────────────────┼──────────────────────────┤
+  │ File > Open in running session               │ ✅ (once enabled)        │
+  └──────────────────────────────────────────────┴──────────────────────────┘
+
+  One caveat worth knowing
+
+  Recovery is a soft link — the .blend stores only the path to the BVC, not the
+  data (that's why it's 46 MB instead of 4.27 GB). So keep name.bvc where it is.
+  If you move or rename it, _try_recover returns False silently and you get the
+  same frozen scene with no error. Worth knowing before you tidy up that
+  captures folder.
+
+  This doesn't help with Ctrl+Z, which stays fragile — but for the
+  close-and-reopen case you asked about, you don't need Alembic at all. You keep
+  the 210 fps BVC viewport and lose nothing.
+
+  Six probe scripts left in tests/ (blender_reload_probe.py, probe2, installed,
+  failmodes, realworld, proof) plus the three ABC benches from before. All 57
+  tests still pass; no shipping code changed.
+● Ran 1 stop hook (ctrl+o to expand)
+  ⎿  Stop hook error: Failed with non-blocking status code: Assertion
+  failed: !(handle->flags & UV_HANDLE_CLOSING), file src\win\async.c,
+  line 94
+
+✻ Sautéed for 8m 25s
+
+※ recap: You wanted the animation to survive reopening a .blend without Alembic's fps penalty. The BeamNG Cache Importer add-on simply isn't ticked in your Blender preferences. Enable it under Edit > Preferences > Add-ons and click Save Preferences. (disable recaps in /config)
+
+❯ after reopening the blend file, the car doesnt move of the root               
+  tranformation. liek car deforms in 3d soace on the origion but doesnt follow  
+  the postion of the root node tranfomr pipeline fix                            
+  ⎿  UserPromptSubmit hook error
+  ⎿  Failed with non-blocking status code: Assertion failed: !(handle->flags & 
+     UV_HANDLE_CLOSING), file src\win\async.c, line 94
+
+  Thought for 7s (ctrl+o to expand)
+
+● Let me find how the root transform is handled during playback and recovery.
+
+  Thought for 9s, searched for 1 pattern (ctrl+o to expand)
+
+● Found it. Let me confirm — _try_recover rebuilds _objects, _chunks,
+  _dynamic_objects... but does it rebuild _transform_empty?
+
+  Thought for 9s, read 1 file (ctrl+o to expand)
+
+● Confirmed the bug. _try_recover rebuilds _objects, _chunks, and
+  _dynamic_objects — but never reassigns _transform_empty, so it stays None and
+  _apply_transform returns early at line 689. Let me check the constructor for
+  the exact naming.
+
+  Read 1 file (ctrl+o to expand)
+
+● Now let me apply the fix in _try_recover.
+
+● Update(runtime\frame_handler.py)
+  ⎿  Added 24 lines
+      322          source_coll = bpy.data.collections.get(f"{_ACTIVE_COLL
+           ECTION} (Source)")
+      323          playback_coll = collection  # visible playback collect
+           ion
+      324  
+      325 +        # --- reconnect the rigid-transform parent empty -----
+          +----------------                                              
+      326 +        # build_scene() creates a "<collection>__root" Empty a
+          +nd drives its                                                 
+      327 +        # matrix_basis per frame from the BVC transform block;
+          + every mesh is                                                
+      328 +        # parented to it.  The Empty and the parenting are sav
+          +ed in the .blend,                                             
+      329 +        # but _transform_empty is module state, so after a rel
+          +oad it is None and                                            
+      330 +        # _apply_transform() returns early — the car then defo
+          +rms correctly but                                             
+      331 +        # sits at the origin instead of following the captured
+          + motion.                                                      
+      332 +        # Re-bind it by name (it is only present when the cach
+          +e HAS transform                                               
+      333 +        # data, matching _create_transform_empty's own guard).
+      334 +        if reader.header.get("transform_data_offset", 0):     
+      335 +            root_name = f"{_ACTIVE_COLLECTION}__root"         
+      336 +            root = playback_coll.objects.get(root_name)       
+      337 +            if root is None:                                  
+      338 +                root = bpy.data.objects.get(root_name)        
+      339 +            if root is None:                                  
+      340 +                # Parenting survives even if the Empty was mov
+          +ed out of the                                                 
+      341 +                # collection, so fall back to the meshes' shar
+          +ed parent.                                                    
+      342 +                for obj in playback_coll.objects:             
+      343 +                    if obj.type == "MESH" and obj.parent is no
+          +t None \                                                      
+      344 +                            and obj.parent.type == "EMPTY":   
+      345 +                        root = obj.parent                     
+      346 +                        break                                 
+      347 +            playback._transform_empty = root                  
+      348 +                                                              
+      349          # --- rebuild _objects (source / individual meshes) --
+           -
+      350          for obj in source_coll.objects if source_coll else col
+           lection.objects:
+      351              if obj.type == "MESH":
+
+● Now a regression test that would have caught this — checking root motion, not
+  just deformation.
+
+● Write(tests\blender_reload_root.py)
+  ⎿  Wrote 205 lines to tests\blender_reload_root.py
+      1 """Regression: does the rigid ROOT MOTION survive a save -> reope
+        n?
+      3 The earlier reload probes only checked that vertices *deform* aft
+        er a reload.
+      4 They passed while the car was still visibly broken, because defor
+      5 rigid motion travel through two different paths:
+      6 
+      7   * deformation -> mesh vertex positions, rewritten every frame
+        , driven by
+      9     `CachePlayback._apply_transform`
+     … +221 lines (ctrl+o to expand)
+
+● First let me confirm the test catches the bug by running it against the
+  installed (unfixed) addon.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● The fix works. Let me see the chunked half and verify the test genuinely fails
+  without the fix.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● The chunked pass crashed in my test harness. Let me see the actual error.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● That's my test harness double-registering, not a product bug. Let me fix it.
+
+● Update(tests\blender_reload_root.py)
+  ⎿  Added 6 lines, removed 1 line
+      112      """Import fresh and record the root motion the reopened fi
+           le must match."""
+      113      bpy.ops.wm.read_factory_settings(use_empty=True)
+      114      import addon
+      115 -    addon.register()                                          
+      115 +    # register() is not idempotent (register_class raises on a
+          + second call), and                                            
+      116 +    # this helper runs once per mode, so re-register only when
+          + needed.                                                      
+      117 +    try:                                                      
+      118 +        addon.register()                                      
+      119 +    except ValueError:                                        
+      120 +        pass                                                  
+      121      reader = CacheReader(cache_path)
+      122      chunk_map = ({k: list(v) for k, v in CHUNK_MAP_E180.items(
+           )}
+      123                   if chunked else None)
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Both modes pass. Now let me verify the test actually fails on the unfixed code
+  — otherwise it proves nothing.
+
+  Thought for 5s, ran 1 shell command (ctrl+o to expand)
+
+● Let me verify by temporarily reverting my edit in place.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● The fix is now removed. Let me confirm the test fails on this unfixed code.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+● Exactly your symptom reproduced: _transform_empty: None, deform works, root
+  motion 0.000 m. Let me restore the fix.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● The restore came back with LF line endings. Let me normalize and re-verify.
+
+  Read 1 file (ctrl+o to expand)
+
+● Fix is intact. Let me run the full verification.
+  Ran 1 shell command (ctrl+o to expand)
+
+● Now let me confirm the other reload tests still pass and rebuild the addon.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Let me verify the fix actually landed in the packaged zip, and clean up.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● Let me record this in CLAUDE.md and memory, since it's a non-obvious trap.
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● Update(CLAUDE.md)
+  ⎿  Added 25 lines
+      156  Everything is persisted as `_beamng_*` scene custom props so u
+           ndo/reload
+      157  recovery restores the *live* values, not the ones present at i
+           mport.
+      158  
+      159 +## Reload recovery (`_try_recover`)                           
+      160 +                                                              
+      161 +Two separate failure modes, both of which look like "the anima
+          +tion vanished":                                               
+      162 +                                                              
+      163 +1. **The add-on must be enabled in saved preferences.** Recove
+          +ry hangs off                                                  
+      164 +   `load_post`, so a disabled add-on registers nothing and the
+          + reopened file has                                            
+      165 +   97 objects, an empty `frame_change_pre`, and zero motion. N
+          +othing is wrong                                               
+      166 +   with the .blend. Verified: with the add-on ticked, both the
+          + double-click and                                             
+      167 +   File > Open paths recover fully.                           
+      168 +2. **`_try_recover` must rebind EVERY piece of module state**,
+          + not just the mesh                                            
+      169 +   dicts. It rebuilds `_objects` / `_chunks` / `_chunk_member_
+          +ranges`, and it                                               
+      170 +   must also re-bind `playback._transform_empty` to the `<coll
+          +ection>__root`                                                
+      171 +   Empty. That field is module state; the Empty and the parent
+          +ing *are* saved in                                            
+      172 +   the .blend, so missing it produces the deceptive symptom **
+          +"car deforms                                                  
+      173 +   correctly but sits at the origin"** — `_apply_transform` re
+          +turns early on                                                
+      174 +   `_transform_empty is None` while vertex playback carries on
+          + normally.                                                    
+      175 +                                                              
+      176 +Deformation and rigid motion travel through different paths, s
+          +o **a                                                         
+      177 +deformation-only assertion cannot see a dead root**. `tests/bl
+          +ender_reload_root.py`                                         
+      178 +asserts both, in per-object and chunked mode (measured 8.828 m
+          + of root travel;                                              
+      179 +0.000 m before the fix).                                      
+      180 +                                                              
+      181 +The recovery link is **soft**: the .blend stores only the BVC 
+          +*path* (46 MB, not                                            
+      182 +4.27 GB). Move or rename the cache and `_try_recover` returns 
+          +False silently.                                               
+      183 +                                                              
+      184  ## Tyre ground contact (`runtime/tyre_deform.py`)
+      185  
+      186  BeamNG's tyre mesh is **rigid** — a loaded tyre never shows a 
+           contact patch, the
+
+  Recalled 1 memory, wrote 2 memories (ctrl+o to expand)
+
+● Fixed and verified.
+
+  The bug
+
+  _try_recover rebuilt _objects, _chunks, and _chunk_member_ranges on reload —
+  but never rebound playback._transform_empty. That field is module state, so it
+  stayed None, and CachePlayback._apply_transform bails on its very first line:
+
+  if self._transform_empty is None:
+      return          # mesh_update.py:689
+
+  The BeamNG Cache__root Empty and all the mesh parenting are saved in your
+  .blend — only the Python reference to it was lost. So vertex playback carried
+  on normally while the rigid motion silently stopped. Hence: car deforms in
+  place at the origin.
+
+  Reproduced your exact symptom
+
+  Running the new test against the unfixed code:
+
+  [C] _transform_empty: None
+  [C] deform_delta=0.443926      <- deformation fine
+  [C] root_translation=0.000000  <- root dead
+  [C] root_pos_f0=[0.0, 0.0, 0.0]
+  [C] root_pos_f1=[0.0, 0.0, 0.0]
+
+  After the fix, same file, same cache:
+
+  [C] _transform_empty: BeamNG Cache__root
+  [C] deform_delta=0.443926
+  [C] root_translation=8.827765  <- matches fresh import exactly
+  [C] root_pos_f1=[6.232, 4.779, 4.031]
+
+  8.828 m of root travel, identical to a fresh import to within 0%. Passes in
+  both per-object and chunked mode.
+
+  The fix
+
+  runtime/frame_handler.py:325-347 — re-binds the Empty by name, guarded on
+  transform_data_offset so caches without a transform block behave as before,
+  with a fallback to the meshes' shared EMPTY parent in case the Empty was moved
+  out of the collection.
+
+  Why the earlier probes missed it
+
+  This is worth flagging: my reload tests from the previous turn all passed
+  while your car was visibly broken. They asserted only that vertices changed
+  between two frames — and deformation was never the thing that broke.
+  Deformation and rigid motion travel through two different paths (vertex writes
+  vs. the parent Empty's matrix_basis), so a deformation-only assertion is
+  structurally blind to a dead root. tests/blender_reload_root.py now asserts
+  both, and I confirmed it genuinely catches the bug by temporarily reverting
+  the fix and watching it fail 4/4.
+
+  Verification
+
+  - 57/57 pytest ✅
+  - blender_reload_root.py: all checks pass, per-object + chunked ✅
+  - blender_reload_probe2.py: 14/14 chunks recovered, still animates ✅
+  - Fix confirmed present in the rebuilt dist/beamng_cache_importer.zip ✅
+  - CLAUDE.md updated with both reload failure modes
+
+  Reinstall the zip — the copy in your scripts/addons is an older revision and
+  still has the bug. And keep the addon ticked in preferences from the last fix;
+  that's still required for recovery to run at all.
+
+● Ran 1 stop hook (ctrl+o to expand)
+  ⎿  Stop hook error: Failed with non-blocking status code: Assertion
+  failed: !(handle->flags & UV_HANDLE_CLOSING), file src\win\async.c,
+  line 94
+
+✻ Churned for 8m 33s
+
+※ recap: Goal was making the crash animation survive reopening the .blend; I fixed the root-motion loss so the car now follows its captured path instead of deforming at the origin. Next: reinstall dist/beamng_cache_importer.zip, since your installed copy still has the bug. (disable recaps in /config)
+
+❯ one problem: i wrote 500 in start at second filed and blender took me to the  
+  frame 3000. like animatinstarting form frame 3000. is this parater for        
+  seconds or for the frames?? please make it for frame                          
+  ⎿  UserPromptSubmit hook error
+  ⎿  Failed with non-blocking status code: Assertion failed: !(handle->flags & 
+     UV_HANDLE_CLOSING), file src\win\async.c, line 94
+
+  Thought for 13s (ctrl+o to expand)
+
+● Let me look at the field and work out where 500 → 3000 came from.
+
+  Thought for 53s, searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● The field is genuinely seconds — _frame_start = round(start_second × 
+  output_fps). Let me confirm the multiplier that gave you 3000.
+
+  Thought for 26s, read 2 files (ctrl+o to expand)
+
+● The field is seconds — frame_start = start_second × Output FPS. Let me check
+  the existing tests before changing the semantics.
+
+  Thought for 32s, read 1 file (ctrl+o to expand)
+
+● The field is genuinely seconds — frame_start = start_second × Output FPS. With
+  Output FPS 60, typing 500 asks for frame 30000.
+
+  One caveat before I change it: CLAUDE.md records storing frames as a
+  deliberately-rejected design, because changing Output FPS then silently slides
+  the animation in time. You're asking for frames explicitly, so I'll make
+  frames canonical and keep the timing note in the tooltip.
+
+● Update(runtime\frame_handler.py)
+  ⎿  Added 13 lines, removed 5 lines
+      28  
+      29  _active: Optional[CachePlayback] = None
+      30  _frame_start: int = 0
+      31 -# The "Start at Second" knob, kept in SECONDS (not frames) so i
+         -t survives an                                                  
+      32 -# output_fps change: _frame_start is always derived as start_se
+         -cond * output_fps.                                             
+      33 -# Storing frames instead would silently shift the animation in 
+         -time whenever the                                              
+      34 -# render rate changed.                                         
+      35 -_start_second: float = 0.0                                     
+      31 +# The "Start at Frame" knob, in Blender FRAMES — this is the ca
+         +nonical storage                                                
+      32 +# and _frame_start is just a copy of it.                       
+      33 +#                                                              
+      34 +# It used to be held in SECONDS (_frame_start = start_second * 
+         +output_fps) so                                                 
+      35 +# the offset kept cache frame 0 at the same *time* across an ou
+         +tput_fps change.                                               
+      36 +# That is defensible, but it surprised the user: typing 500 mea
+         +nt 500 SECONDS,                                                
+      37 +# which at 60 output fps put frame 0 at frame 30000.  Frames ar
+         +e what the                                                     
+      38 +# timeline actually shows, so frames is what the field now mean
+         +s.                                                             
+      39 +#                                                              
+      40 +# The tradeoff this re-introduces on purpose: changing Output F
+         +PS now keeps the                                               
+      41 +# same frame NUMBER, so the start moves in time (frame 500 is 8
+         +.3 s at 60 fps                                                 
+      42 +# but 20.8 s at 24 fps).  Set the start after settling on Outpu
+         +t FPS.                                                         
+      43 +_start_frame: int = 0                                          
+      44  # Time-based mapping: one *source* (captured) frame plays every
+      45  # (output_fps / playback_fps) Blender frames.  This decouples t
+          he animation's
+      46  # SPEED (playback_fps — how many captured frames advance per re
+          al second) from
+
+● Update(runtime\frame_handler.py)
+  ⎿  Added 7 lines, removed 7 lines
+      105  def _apply_timeline(scene, keep_playhead: bool = True) -> None
+           :
+      106      """Re-derive ``scene.frame_start``/``frame_end`` from the 
+           live settings.
+      107  
+      108 -    ``_frame_start`` is always ``round(start_second * output_f
+          -ps)`` — the offset                                            
+      109 -    is stored in seconds, so changing the output rate moves th
+          -e animation to the                                            
+      110 -    same *time* on the timeline rather than the same frame num
+          -ber.  The end is                                              
+      111 -    ``frame_start + duration_s * output_fps`` with            
+      112 -    ``duration_s = (n_src - 1) / playback_fps``.              
+      108 +    ``_frame_start`` is simply ``_start_frame`` — the offset i
+          +s stored in                                                   
+      109 +    Blender frames, so the animation starts on the frame numbe
+          +r the user typed.                                             
+      110 +    The end is ``frame_start + duration_s * output_fps`` with 
+      111 +    ``duration_s = (n_src - 1) / playback_fps``, so the DURATI
+          +ON still tracks                                               
+      112 +    playback speed even though the START is a fixed frame.    
+      113  
+      114      With ``keep_playhead`` the playhead is nudged back inside 
+           the new range when
+      115      the offset pushed it outside; otherwise every frame before
+            ``frame_start``
+      116      clamps to cache frame 0 and the car looks frozen/broken.
+      117      """
+      118      global _frame_start
+      119 -    _frame_start = int(round(_start_second * _output_fps))    
+      119 +    _frame_start = int(_start_frame)                          
+      120      scene.frame_start = _frame_start
+      121      scene["_beamng_frame_start"] = _frame_start
+      122 -    scene["_beamng_start_second"] = _start_second             
+      122 +    scene["_beamng_start_frame"] = _frame_start               
+      123  
+      124      if _active is None:
+      125          return
+
+● Update(runtime\frame_handler.py)
+  ⎿  Added 17 lines, removed 7 lines
+      148              area.tag_redraw()
+      149  
+      150  
+      151 -def update_start_second(start_second: float) -> None:         
+      152 -    """Move cache frame 0 to ``start_second`` on the LIVE time
+          -line.                                                         
+      151 +def update_start_frame(start_frame: int) -> None:             
+      152 +    """Move cache frame 0 to Blender frame ``start_frame`` on 
+          +the LIVE timeline.                                            
+      153  
+      154 -    Called from the add-on's "Start at Second" property callba
+          -ck so the offset is                                           
+      154 +    Called from the add-on's "Start at Frame" property callbac
+          +k so the offset is                                            
+      155      retunable without re-importing the cache: the mapping in
+      156      :func:`_cache_frame_for` is pure arithmetic on ``_frame_st
+           art``, so shifting
+      157 -    the whole animation in time is just a matter of re-derivin
+          -g the frame range                                             
+      158 -    and re-running the current frame.                         
+      157 +    the whole animation is just a matter of re-deriving the fr
+          +ame range and                                                 
+      158 +    re-running the current frame.                             
+      159      """
+      160 -    global _start_second                                      
+      161 -    _start_second = max(0.0, float(start_second))             
+      160 +    global _start_frame                                       
+      161 +    _start_frame = max(0, int(round(float(start_frame))))     
+      162  
+      163      if bpy is None:
+      164          return
+     ...
+      169      _refresh_current_frame(scene)
+      170  
+      171  
+      172 +def update_start_second(start_second: float) -> None:         
+      173 +    """Deprecated seconds-based alias for :func:`update_start_
+          +frame`.                                                       
+      174 +                                                              
+      175 +    The panel field is frames now.  This is kept so an older s
+          +aved .blend, or                                               
+      176 +    any caller that still thinks in seconds, converts instead 
+          +of breaking.                                                  
+      177 +    """                                                       
+      178 +    fps = _output_fps if _output_fps > 0 else 1.0             
+      179 +    update_start_frame(int(round(max(0.0, float(start_second))
+          + * fps)))                                                     
+      180 +                                                              
+      181 +                                                              
+      182  def update_fps(playback_fps: Optional[float] = None,
+      183                 output_fps: Optional[float] = None) -> None:
+      184      """Update the playback/output frame rates on the LIVE hand
+           ler.
+
+● Now update_fps — with frames canonical, changing output fps must no longer
+  move the start.
+
+  Read 1 file (ctrl+o to expand)
+
+● That's fine — _apply_timeline now reads _start_frame directly, so the start
+  stays put. Now attach():
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(runtime\frame_handler.py)
+  ⎿  Added 6 lines, removed 6 lines
+      452             start_second: Optional[float] = None) -> None:
+      453      """Register ``playback`` as the active sequence and hook t
+           he timeline.
+      454  
+      455 -    ``frame_start`` is the Blender frame that maps to cache fr
+          -ame 0.  Pass                                                  
+      456 -    ``start_second`` instead to express the same offset in sec
+          -onds — that is the                                            
+      457 -    canonical form (see :data:`_start_second`), and it is what
+      458 -    :func:`update_start_second` retunes live.  When omitted it
+          - is back-derived                                              
+      459 -    from ``frame_start``.                                     
+      455 +    ``frame_start`` is the Blender frame that maps to cache fr
+          +ame 0 — the                                                   
+      456 +    canonical form (see :data:`_start_frame`), and what       
+      457 +    :func:`update_start_frame` retunes live.  ``start_second``
+          + is the deprecated                                            
+      458 +    seconds spelling of the same thing; when given it is conve
+          +rted with                                                     
+      459 +    ``output_fps`` and takes precedence, so old callers keep w
+          +orking.                                                       
+      460      ``playback_fps`` is the capture/source rate (animation SPE
+           ED — how many
+      461      captured frames advance per real second).  ``output_fps`` 
+           is the scene's
+      462      render frame rate (smoothness).  The two are independent: 
+           the timeline is
+     ...
+      468      """
+      469      if bpy is None:
+      470          raise RuntimeError("frame handler requires Blender (bp
+           y)")
+      471 -    global _active, _frame_start, _start_second, _playback_fps
+          -, _output_fps                                                 
+      471 +    global _active, _frame_start, _start_frame, _playback_fps,
+          + _output_fps                                                  
+      472      _active = playback
+      473      _playback_fps = max(0.001, float(playback_fps))
+      474      _output_fps = max(0.001, float(output_fps))
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(runtime\frame_handler.py)
+  ⎿  Added 5 lines, removed 3 lines
+      472      _active = playback
+      473      _playback_fps = max(0.001, float(playback_fps))
+      474      _output_fps = max(0.001, float(output_fps))
+      475 -    _start_second = (max(0.0, float(start_second)) if start_se
+          -cond is not None                                              
+      476 -                     else frame_start / _output_fps)          
+      477 -    _frame_start = int(round(_start_second * _output_fps))    
+      475 +    # Frames are canonical; the deprecated seconds spelling co
+          +nverts into them.                                             
+      476 +    _start_frame = (int(round(max(0.0, float(start_second)) * 
+          +_output_fps))                                                 
+      477 +                    if start_second is not None               
+      478 +                    else max(0, int(round(float(frame_start)))
+          +))                                                            
+      479 +    _frame_start = _start_frame                               
+      480  
+      481      detach_handler()  # avoid duplicate registrations
+      482      bpy.app.handlers.frame_change_pre.append(_on_frame_change)
+● Update(runtime\frame_handler.py)
+  ⎿  Added 1 line, removed 1 line
+      511      # Store state for undo/reload recovery
+      512      scene["_beamng_cache_path"] = str(playback.reader.path)
+      513      scene["_beamng_frame_start"] = _frame_start
+      514 -    scene["_beamng_start_second"] = _start_second             
+      514 +    scene["_beamng_start_frame"] = _frame_start               
+      515      scene["_beamng_use_chunked"] = playback._chunk_map is not 
+           None
+      516      scene["_beamng_playback_fps"] = _playback_fps
+      517      scene["_beamng_output_fps"] = _output_fps
+
+● Now the recovery path and detach:
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(runtime\frame_handler.py)
+  ⎿  Added 9 lines, removed 5 lines
+      315          use_chunked = bool(scene.get("_beamng_use_chunked", Fa
+           lse))
+      316          _playback_fps = float(scene.get("_beamng_playback_fps"
+           , _playback_fps))
+      317          _output_fps = float(scene.get("_beamng_output_fps", _o
+           utput_fps))
+      318 -        # Prefer the stored SECONDS; fall back to deriving the
+          -m from the stored                                             
+      319 -        # frame so a .blend saved before this key existed stil
+          -l recovers.                                                   
+      320 -        _start_second = float(scene.get(                      
+      321 -            "_beamng_start_second",                           
+      322 -            frame_start / _output_fps if _output_fps > 0 else 
+          -0.0))                                                         
+      318 +        # Frames are canonical.  A .blend saved by the older s
+          +econds-based build                                            
+      319 +        # only has "_beamng_start_second", so convert it with 
+          +the recovered                                                 
+      320 +        # output_fps — otherwise reopening such a file would r
+          +eset the offset.                                              
+      321 +        stored_frame = scene.get("_beamng_start_frame")       
+      322 +        if stored_frame is None:                              
+      323 +            legacy_second = scene.get("_beamng_start_second") 
+      324 +            stored_frame = (float(legacy_second) * _output_fps
+      325 +                            if legacy_second is not None else 
+          +frame_start)                                                  
+      326 +        _start_frame = max(0, int(round(float(stored_frame))))
+      327  
+      328          reader = CacheReader(cache_path)
+      329          chunk_map = None
+
+● Update(runtime\frame_handler.py)
+  ⎿  Added 1 line, removed 1 line
+      292  
+      293      Returns True if recovery succeeded (or wasn't needed).
+      294      """
+      295 -    global _active, _frame_start, _start_second, _playback_fps
+          -, _output_fps                                                 
+      295 +    global _active, _frame_start, _start_frame, _playback_fps,
+          + _output_fps                                                  
+      296  
+      297      # Already active — nothing to do
+      298      if _active is not None:
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● _apply_timeline at line 119 also needs _start_frame declared global-safe, and
+  detach must clear the new key.
+
+  Read 1 file (ctrl+o to expand)
+
+● Update(runtime\frame_handler.py)
+  ⎿  Added 2 lines, removed 1 line
+      539      _active = None
+      540      # Clear stored state so _try_recover doesn't fire stale da
+           ta
+      541      if bpy is not None and bpy.context.scene is not None:
+      542 -        keys = ["_beamng_cache_path", "_beamng_frame_start", "
+          -_beamng_start_second",                                        
+      542 +        keys = ["_beamng_cache_path", "_beamng_frame_start", "
+          +_beamng_start_frame",                                         
+      543 +                "_beamng_start_second",  # legacy key from the
+          + seconds-based build                                          
+      544                  "_beamng_use_chunked", "_beamng_playback_fps",
+            "_beamng_output_fps"]
+      545          keys += [f"_beamng_tyre_{k}" for k in _TYRE_KEYS]
+      546          for key in keys:
+
+● Now the UI property:
+
+● Update(addon\ui.py)
+  ⎿  Added 12 lines, removed 12 lines
+      128          max=64,
+      129          soft_max=32,
+      130      )
+      131 -    start_second: FloatProperty(                              
+      132 -        name="Start at Second",                               
+      133 -        description="Animation starts at this Blender timeline
+          - second. "                                                    
+      134 -                    "Cache frame 0 maps to this time on the ti
+          -meline. "                                                     
+      135 -                    "LIVE — drag it after importing and the wh
+          -ole animation "                                               
+      136 -                    "slides along the timeline, no re-import n
+          -eeded.",                                                      
+      137 -        default=0.0,                                          
+      138 -        min=0.0,                                              
+      139 -        soft_max=60.0,                                        
+      140 -        step=10,                                              
+      141 -        precision=2,                                          
+      142 -        update=_on_start_second_update,                       
+      131 +    start_frame: IntProperty(                                 
+      132 +        name="Start at Frame",                                
+      133 +        description="Animation starts at this Blender timeline
+          + FRAME — cache "                                              
+      134 +                    "frame 0 lands on this frame number, the s
+          +ame number the "                                              
+      135 +                    "timeline shows. LIVE: drag it after impor
+          +ting and the "                                                
+      136 +                    "whole animation slides, no re-import need
+          +ed. Note this is "                                            
+      137 +                    "a frame, not a second, so it does not fol
+          +low Output FPS — "                                            
+      138 +                    "set Output FPS first, then pick the start
+          + frame.",                                                     
+      139 +        default=0,                                            
+      140 +        min=0,                                                
+      141 +        soft_max=2000,                                        
+      142 +        update=_on_start_frame_update,                        
+      143      )
+      144      playback_fps: IntProperty(
+      145          name="Playback Speed (src fps)",
+
+● Update(addon\ui.py)
+  ⎿  Added 2 lines, removed 2 lines
+      14  print("[BeamNG] add-on loading...")
+      15  
+      16  
+      17 -def _on_start_second_update(self, context):                    
+      17 +def _on_start_frame_update(self, context):                     
+      18      """Slide the whole animation along the timeline on the LIVE
+           handler.
+      19  
+      20      The cache-frame mapping is pure arithmetic on the start off
+          set, so this
+     ...
+      23      """
+      24      try:
+      25          from runtime import frame_handler
+      26 -        frame_handler.update_start_second(float(self.start_seco
+         -nd))                                                           
+      26 +        frame_handler.update_start_frame(int(self.start_frame))
+      27      except Exception:
+      28          pass
+      29  
+
+● Update(addon\ui.py)
+  ⎿  Added 1 line, removed 1 line
+      275          box.prop(props, "use_chunked")
+      276          box.prop(props, "weld_cache")
+      277          box.prop(props, "workers")
+      278 -        box.prop(props, "start_second")                       
+      278 +        box.prop(props, "start_frame")                        
+      279          box.prop(props, "playback_fps")
+      280          box.prop(props, "output_fps")
+      281          # These three retune the imported cache in place (see
+
+● Update(addon\operators.py)
+  ⎿  Added 6 lines, removed 5 lines
+      273              output_fps = max(1, int(getattr(context.scene.beam
+           ng, "output_fps", 60)))
+      274              context.scene.render.fps = output_fps
+      275              context.scene.render.fps_base = 1.0
+      276 -            # Pass the offset in SECONDS — the handler owns th
+          -e seconds→frames                                              
+      277 -            # conversion so the "Start at Second" slider can r
+          -etune it live                                                 
+      278 -            # (frame_handler.update_start_second) without a re
+          --import.                                                      
+      279 -            start_second = float(getattr(context.scene.beamng,
+          - "start_second", 0.0))                                        
+      276 +            # Pass the offset in FRAMES — that is what the "St
+          +art at Frame"                                                 
+      277 +            # field means and what frame_handler stores, so th
+          +e slider can                                                  
+      278 +            # retune it live (frame_handler.update_start_frame
+          +) with no                                                     
+      279 +            # re-import and no seconds↔frames round-trip.     
+      280 +            start_frame = int(getattr(context.scene.beamng, "s
+          +tart_frame", 0))                                              
+      281              frame_handler.attach(
+      282                  playback,
+      283 +                frame_start=start_frame,                      
+      284                  playback_fps=playback_fps,
+      285                  output_fps=output_fps,
+      284 -                start_second=start_second,                    
+      286              )
+      287              playback.close_log()
+      288  
+
+● Now let me find any remaining references to the old name.
+
+  Searched for 1 pattern (ctrl+o to expand)
+
+● Good — remaining hits are the intentional back-compat shims. Let me fix the
+  stale UI comment and update the tests.
+
+● Update(addon\ui.py)
+  ⎿  Added 1 line, removed 1 line
+      279          box.prop(props, "playback_fps")
+      280          box.prop(props, "output_fps")
+      281          # These three retune the imported cache in place (see
+      282 -        # runtime.frame_handler.update_start_second / update_f
+          -ps), so say so —                                              
+      282 +        # runtime.frame_handler.update_start_frame / update_fp
+          +s), so say so —                                               
+      283          # otherwise the natural assumption is that they need a
+            re-import.
+      284          note = box.column(align=True)
+      285          note.scale_y = 0.7
+
+● Write(tests\test_start_second.py)
+  ⎿  Added 64 lines, removed 29 lines
+       1  from __future__ import annotations
+       2  
+       3 -"""Live retuning of the "Start at Second" offset (no re-import)
+         -.                                                              
+       3 +"""Live retuning of the "Start at Frame" offset (no re-import).
+       4  
+       5  ``frame_handler`` is importable without Blender (``bpy is None`
+          `), so these
+       6  tests stub a minimal scene/context and drive the real module-le
+          vel state.  What
+       7  matters is the arithmetic contract:
+       8  
+       9 -  * the offset is stored in SECONDS, so changing ``output_fps``
+         - keeps cache                                                   
+      10 -    frame 0 at the same *time* rather than the same frame numbe
+         -r;                                                             
+      11 -  * ``update_start_second`` re-derives ``frame_start``/``frame_
+         -end`` and re-runs                                              
+      12 -    the current frame, which is what makes the slider live.    
+       9 +  * the offset is stored in FRAMES, so the animation starts on 
+         +exactly the                                                    
+      10 +    frame number the user typed (typing 500 must not mean 500 *
+         +seconds*, which                                                
+      11 +    at 60 output fps used to jump the start to frame 30000);   
+      12 +  * ``update_start_frame`` re-derives ``frame_start``/``frame_e
+         +nd`` and re-runs                                               
+      13 +    the current frame, which is what makes the field live;     
+      14 +  * the deprecated ``update_start_second`` / ``attach(start_sec
+         +ond=...)``                                                     
+      15 +    spellings still convert, so older callers and older .blend 
+         +files keep                                                     
+      16 +    working.                                                   
+      17  """
+      18  
+      19  import sys
+     ...
+      68      monkeypatch.setattr(fh, "_active", playback)
+      69      monkeypatch.setattr(fh, "_playback_fps", 24.0)
+      70      monkeypatch.setattr(fh, "_output_fps", 60.0)
+      67 -    monkeypatch.setattr(fh, "_start_second", 0.0)              
+      71 +    monkeypatch.setattr(fh, "_start_frame", 0)                 
+      72      monkeypatch.setattr(fh, "_frame_start", 0)
+      73      return scene, playback
+      74  
+      75  
+      72 -def test_update_start_second_shifts_frame_range(env):          
+      76 +def test_the_field_is_frames_not_seconds(env):                 
+      77 +    """The reported bug: 500 must mean frame 500, not 500 s (= 
+         +frame 30000)."""                                               
+      78      scene, _ = env
+      74 -    fh.update_start_second(2.0)                                
+      79 +    fh.update_start_frame(500)                                 
+      80 +    assert scene.frame_start == 500                            
+      81 +    assert fh._frame_start == 500                              
+      82 +    assert fh._cache_frame_for(500) == 0                       
+      83  
+      76 -    # 2 s at output_fps=60 -> frame 120 holds cache frame 0.   
+      84 +                                                               
+      85 +def test_update_start_frame_shifts_frame_range(env):           
+      86 +    scene, _ = env                                             
+      87 +    fh.update_start_frame(120)                                 
+      88 +                                                               
+      89      assert scene.frame_start == 120
+      78 -    assert fh._frame_start == 120                              
+      90      assert fh._cache_frame_for(120) == 0
+      91      # 600 source frames at playback_fps=24 = 25 s = 1500 output
+           frames.
+      92      assert scene.frame_end == 120 + 1500
+     ...
+       94  
+       95  def test_offset_does_not_change_animation_duration(env):
+       96      scene, _ = env
+       86 -    fh.update_start_second(0.0)                               
+       97 +    fh.update_start_frame(0)                                  
+       98      span = scene.frame_end - scene.frame_start
+       88 -    fh.update_start_second(7.5)                               
+       99 +    fh.update_start_frame(450)                                
+      100      assert scene.frame_end - scene.frame_start == span
+      101  
+      102  
+      103  def test_mapping_is_a_pure_shift(env):
+      104      _, _ = env
+       94 -    fh.update_start_second(0.0)                               
+      105 +    fh.update_start_frame(0)                                  
+      106      before = [fh._cache_frame_for(f) for f in range(0, 400, 37
+           )]
+       96 -    fh.update_start_second(3.0)  # 3 s * 60 fps = 180 frames  
+      107 +    fh.update_start_frame(180)                                
+      108      after = [fh._cache_frame_for(f + 180) for f in range(0, 40
+           0, 37)]
+      109      assert before == after
+      110  
+     ...
+      113      scene, playback = env
+      114      scene.frame_current = 300
+      115      playback.calls.clear()
+      105 -    fh.update_start_second(1.0)                               
+      116 +    fh.update_start_frame(60)                                 
+      117      # The playhead stayed at 300, so only the re-run makes the
+            change visible.
+      118      assert playback.calls, "expected the live handler to re-ru
+           n the current frame"
+      119      assert playback.calls[-1] == fh._cache_frame_for(300)
+     ...
+      122  def test_playhead_pulled_inside_the_new_range(env):
+      123      scene, _ = env
+      124      scene.frame_current = 10
+      114 -    fh.update_start_second(5.0)  # frame_start becomes 300    
+      125 +    fh.update_start_frame(300)                                
+      126      assert scene.frame_current == scene.frame_start == 300
+      127  
+      128  
+      129  def test_playhead_left_alone_when_already_in_range(env):
+      130      scene, _ = env
+      131      scene.frame_current = 500
+      121 -    fh.update_start_second(1.0)  # frame_start becomes 60     
+      132 +    fh.update_start_frame(60)                                 
+      133      assert scene.frame_current == 500
+      134  
+      135  
+      125 -def test_seconds_survive_an_output_fps_change(env):           
+      136 +def test_frame_number_is_kept_across_an_output_fps_change(env)
+          +:                                                             
+      137 +    """Frames are canonical now, so the START stays on its fra
+          +me number.                                                    
+      138 +                                                              
+      139 +    This is the deliberate tradeoff of frames-over-seconds: th
+          +e start no longer                                             
+      140 +    tracks wall-clock time when the render rate changes.  The 
+          +DURATION still                                                
+      141 +    follows playback_fps/output_fps, so only the offset is pin
+          +ned.                                                          
+      142 +    """                                                       
+      143      scene, _ = env
+      127 -    fh.update_start_second(2.0)                               
+      128 -    assert scene.frame_start == 120  # 2 s at 60 fps          
+      144 +    fh.update_start_frame(120)                                
+      145 +    assert scene.frame_start == 120                           
+      146  
+      147      fh.update_fps(output_fps=30)
+      131 -    # Same TIME (2 s), different frame number — this is why th
+          -e offset is                                                   
+      132 -    # stored in seconds rather than frames.                   
+      133 -    assert scene.frame_start == 60                            
+      134 -    assert fh._start_second == pytest.approx(2.0)             
+      148 +    assert scene.frame_start == 120                           
+      149 +    assert fh._start_frame == 120                             
+      150  
+      151  
+      152  def test_negative_offset_clamped(env):
+      153      scene, _ = env
+      139 -    fh.update_start_second(-4.0)                              
+      140 -    assert fh._start_second == 0.0                            
+      154 +    fh.update_start_frame(-4)                                 
+      155 +    assert fh._start_frame == 0                               
+      156      assert scene.frame_start == 0
+      157  
+      158  
+      159  def test_state_persisted_for_undo_recovery(env):
+      160      scene, _ = env
+      146 -    fh.update_start_second(2.5)                               
+      147 -    assert scene["_beamng_start_second"] == pytest.approx(2.5)
+      161 +    fh.update_start_frame(150)                                
+      162 +    assert scene["_beamng_start_frame"] == 150                
+      163      assert scene["_beamng_frame_start"] == 150
+      164  
+      165  
+      166  def test_no_active_playback_is_a_noop_not_a_crash(env, monkeyp
+           atch):
+      167      scene, _ = env
+      168      monkeypatch.setattr(fh, "_active", None)
+      154 -    fh.update_start_second(3.0)                               
+      169 +    fh.update_start_frame(180)                                
+      170      # The offset is still recorded so a later attach()/recover
+            picks it up.
+      171      assert fh._frame_start == 180
+      172      assert scene.frame_start == 180
+      173 +                                                              
+      174 +                                                              
+      175 +# --- backward compatibility with the old seconds-based spelli
+          +ng -----------                                                
+      176 +                                                              
+      177 +def test_deprecated_update_start_second_still_converts(env):  
+      178 +    scene, _ = env                                            
+      179 +    fh.update_start_second(2.0)          # 2 s at output_fps=6
+          +0                                                             
+      180 +    assert scene.frame_start == 120                           
+      181 +    assert fh._start_frame == 120                             
+      182 +                                                              
+      183 +                                                              
+      184 +def test_recover_reads_legacy_start_second_key(env, monkeypatc
+          +h):                                                           
+      185 +    """A .blend saved by the seconds-based build must not lose
+          + its offset."""                                               
+      186 +    scene, _ = env                                            
+      187 +    scene["_beamng_start_second"] = 2.0                       
+      188 +    scene["_beamng_output_fps"] = 60.0                        
+      189 +    # Simulate the conversion _try_recover performs for the le
+          +gacy key.                                                     
+      190 +    legacy = scene.get("_beamng_start_second")                
+      191 +    converted = int(round(float(legacy) * float(scene["_beamng
+          +_output_fps"])))                                              
+      192 +    assert converted == 120                                   
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+● 60/60 pass. Now let me update the headless Blender test, which still tests the
+  old semantics.
+
+  Searched for 1 pattern, read 1 file (ctrl+o to expand)
+
+● API Error: 400 You have exceeded your daily token limit. You can 
+  resume at 2026-08-01 00:00 UTC.
+
+✻ Sautéed for 6m 20s
+
+❯ go on                                                                         
+  ⎿  UserPromptSubmit hook error
+  ⎿  Failed with non-blocking status code: Assertion failed: !(handle->flags & 
+     UV_HANDLE_CLOSING), file src\win\async.c, line 94
+
+● I'll update this headless test to the frames semantics.
+
+  Read 1 file (ctrl+o to expand)
+
+● API Error: 400 You have exceeded your daily token limit. You can 
+  resume at 2026-08-01 00:00 UTC.
+
+✻ Churned for 34s

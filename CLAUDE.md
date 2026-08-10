@@ -124,6 +124,8 @@ Patched with `beamng_capture_quiet` flag to suppress GE console spam.
 | `runtime/cache_reader.py` | ✅ | BVC memmap reader |
 | `runtime/mesh_update.py` | ✅ | Per-frame vertex update, sharp edge marking |
 | `runtime/tyre_deform.py` | ✅ | Fake tyre ground-contact flattening (see below) |
+| `runtime/impact_detect.py` | ✅ | Impact detection core + glass damage tiers (pure numpy, tested) |
+| `runtime/glass_shatter.py` | ✅ | Glass pane fragmentation + retained-fringe selection |
 | `runtime/frame_handler.py` | ✅ | Timeline handler, undo/reload recovery, live start/fps/tyre retune |
 | `addon/operators.py` | ✅ | Scan/build/import/export/texture operators |
 | `addon/ui.py` | ✅ | Panel + scene properties + Tyre Contact sub-panel |

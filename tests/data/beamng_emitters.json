@@ -1,0 +1,188 @@
+[
+ {
+  "type": "paint_white",
+  "frame": 2025,
+  "x": 45.175120200205114,
+  "y": 4.849197409038141,
+  "energy": 2.50759101163576,
+  "maxspd": 0.9807477368148494,
+  "parts": [
+   "flanje_e180_body",
+   "flanje_e180_fender_L",
+   "flanje_e180_hood",
+   "flanje_e180_underbody",
+   "flanje_e180_door_FL",
+   "flanje_e180_mirror_L",
+   "flanje_e180_door_FR",
+   "flanje_e180_door_RR",
+   "flanje_e180_fender_R",
+   "flanje_e180_mirror_R"
+  ],
+  "n": 10
+ },
+ {
+  "type": "glass",
+  "frame": 2025,
+  "x": 45.432033842511466,
+  "y": 5.074732455107679,
+  "energy": 1.4493744323867472,
+  "maxspd": 0.8141142309084312,
+  "parts": [
+   "flanje_e180_headlightglass_L",
+   "flanje_e180_headlightglass_L_intense",
+   "flanje_e180_doorglass_FL",
+   "flanje_e180_windshield",
+   "flanje_e180_backlight",
+   "flanje_e180_doorglass_FR",
+   "flanje_e180_doorglass_RR"
+  ],
+  "n": 7
+ },
+ {
+  "type": "plastic",
+  "frame": 2025,
+  "x": 43.56946367356659,
+  "y": 4.359905066667392,
+  "energy": 0.9647333608212161,
+  "maxspd": 0.8074409684767161,
+  "parts": [
+   "flanje_e180_bumper_F",
+   "flanje_e180_headlight_L",
+   "flanje_e180_headlight_L_bake"
+  ],
+  "n": 3
+ },
+ {
+  "type": "steel_dark",
+  "frame": 2025,
+  "x": 44.98029994488294,
+  "y": 4.6544805924385395,
+  "energy": 0.9385205696086407,
+  "maxspd": 0.8143093704190664,
+  "parts": [
+   "flanje_e180_engbaycrap",
+   "flanje_e180_dash",
+   "flanje_e180_strut_F",
+   "flanje_e180_seats_FR"
+  ],
+  "n": 4
+ },
+ {
+  "type": "paint_white",
+  "frame": 2032,
+  "x": 48.216615640346234,
+  "y": 6.257573455857187,
+  "energy": 0.2665355095806837,
+  "maxspd": 0.5361206367987478,
+  "parts": [
+   "flanje_e180_taillight_trunk",
+   "flanje_e180_trunk"
+  ],
+  "n": 2
+ },
+ {
+  "type": "glass",
+  "frame": 2032,
+  "x": 48.37600590059226,
+  "y": 5.927002421673169,
+  "energy": 0.29532253831474387,
+  "maxspd": 0.5458562848433877,
+  "parts": [
+   "flanje_e180_taillight_trunkglass",
+   "flanje_e180_taillightglass_R"
+  ],
+  "n": 2
+ },
+ {
+  "type": "plastic",
+  "frame": 2032,
+  "x": 48.49021438856598,
+  "y": 5.617961847248458,
+  "energy": 0.14734171294871937,
+  "maxspd": 0.5428475162487517,
+  "parts": [
+   "flanje_e180_taillight_R"
+  ],
+  "n": 1
+ },
+ {
+  "type": "steel_dark",
+  "frame": 2032,
+  "x": 47.29720675494536,
+  "y": 5.621348965398657,
+  "energy": 0.1214687369019746,
+  "maxspd": 0.492886877289251,
+  "parts": [
+   "flanje_e180_seats_R"
+  ],
+  "n": 1
+ },
+ {
+  "type": "paint_white",
+  "frame": 2112,
+  "x": 59.471320463372045,
+  "y": 4.319871554179768,
+  "energy": 0.319904685603985,
+  "maxspd": 0.48444310484340836,
+  "parts": [
+   "flanje_e180_body",
+   "flanje_e180_mirror_L",
+   "flanje_e180_hood",
+   "flanje_e180_underbody"
+  ],
+  "n": 4
+ },
+ {
+  "type": "glass",
+  "frame": 2112,
+  "x": 60.089888825768604,
+  "y": 4.261127055444494,
+  "energy": 0.18853517278031995,
+  "maxspd": 0.36541883103965633,
+  "parts": [
+   "flanje_e180_windshield",
+   "flanje_e180_headlightglass_L",
+   "flanje_e180_headlightglass_L_intense"
+  ],
+  "n": 3
+ },
+ {
+  "type": "plastic",
+  "frame": 2115,
+  "x": 60.67781634810469,
+  "y": 4.258625759975822,
+  "energy": 0.24608814426912307,
+  "maxspd": 0.4529680005128238,
+  "parts": [
+   "flanje_e180_bumper_F",
+   "flanje_e180_headlight_L",
+   "flanje_e180_headlight_L_bake"
+  ],
+  "n": 3
+ },
+ {
+  "type": "steel_dark",
+  "frame": 2115,
+  "x": 59.91088312779098,
+  "y": 4.477988378303003,
+  "energy": 0.1417764324992885,
+  "maxspd": 0.3817278160704353,
+  "parts": [
+   "flanje_e180_dash",
+   "flanje_e180_engbaycrap"
+  ],
+  "n": 2
+ },
+ {
+  "type": "paint_white",
+  "frame": 2175,
+  "x": 62.91824478275628,
+  "y": 7.472415090102371,
+  "energy": 0.07505043531056473,
+  "maxspd": 0.38742853614715766,
+  "parts": [
+   "flanje_e180_door_RR"
+  ],
+  "n": 1
+ }
+]
