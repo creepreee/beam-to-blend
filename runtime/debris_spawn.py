@@ -152,6 +152,23 @@ def _bounce_params(bounciness: float) -> Tuple[float, float, float]:
     return restitution, lin_damp, ang_damp
 
 
+def _find_transform_root() -> Optional["bpy.types.Object"]:
+    """Locate the imported cache's ``<collection>__root`` transform empty.
+
+    The playback handler drives this empty's ``matrix_basis`` from the cached
+    rigid transform every frame, so parenting debris to it rides the wreck's
+    own motion.  Found by name suffix rather than a stored reference — the
+    build operator does not know the collection's name, and after a reload the
+    reference is gone while the object itself survives in the .blend.
+    """
+    if bpy is None:
+        return None
+    for obj in bpy.data.objects:
+        if obj.type == "EMPTY" and obj.name.endswith("__root"):
+            return obj
+    return None
+
+
 def _key_visibility(obj: "bpy.types.Object", launch_frame: int) -> None:
     """Hide a hero piece until the frame it is thrown.
 
@@ -1020,13 +1037,13 @@ def _spawn_glass_pane(part: str, tier: str, event: ImpactEvent,
                       ) -> Tuple[List["bpy.types.Object"], int]:
     """Break one pane into fragments and place them in the scene.
 
-    Returns ``(dynamic_fragments, retained_count)``.  EVERY fragment is an
-    independent rigid body — nothing is parented to the car, so no glass can
-    ride the wreck or bury itself below the ground.  Fragments flagged
-    ``retained`` (the pane's edge fringe) are thrown at a fraction of the
-    normal velocity, so they fall and settle in place around the aperture
-    instead of scattering downrange; the rest of the pane breaks outward from
-    the impact.
+    Returns ``(dynamic_fragments, retained_count)``.  Retained fragments (the
+    pane's edge fringe) are PARENTED to the ``<collection>__root`` transform
+    empty with ``matrix_parent_inverse`` resolved at ``spawn_frame`` — they
+    stay stuck in the frame and ride the wreck's own motion, never buried by
+    the launch/RB/bake path (measured before this fix: 65/82 retained fragments
+    following the chassis at z=-1.5).  The non-retained fragments are
+    independent rigid bodies that break outward from the impact.
 
     ``verts`` must be in WORLD space (the same space as ``event.position`` —
     see ``impact_detect.local_to_world``).
@@ -1057,6 +1074,9 @@ def _spawn_glass_pane(part: str, tier: str, event: ImpactEvent,
     # (object, launch_start) placed in phase 1, registered as a rigid body in
     # phase 2 — see the phase note in _spawn_hero_pieces.
     placed: List[Tuple["bpy.types.Object", int]] = []
+    # Retained fringe fragments, collected so they can be parented to the
+    # transform empty at the shatter-frame pose in phase 0b.
+    fringe: List["bpy.types.Object"] = []
 
     for i, frag in enumerate(fragments):
         mesh = bpy.data.meshes.new(f"glassfrag_{part}_{i:03d}")
@@ -1073,18 +1093,17 @@ def _spawn_glass_pane(part: str, tier: str, event: ImpactEvent,
         obj.location = tuple(float(c) for c in frag.centre)
         coll.objects.link(obj)
 
+        if frag.retained:
+            # Edge fringe — NEVER launched or given a rigid body.  It stays in
+            # the aperture: phase 0b parents it to the root empty at the shatter
+            # pose so it is stuck in the frame and rides the wreck's motion.
+            retained += 1
+            fringe.append(obj)
+            continue
+
         # Fragments closest to the impact are thrown hardest — the strike drives
         # them out while the far side of the pane merely falls away.
         blow = float(np.exp(-2.4 * frag.impact_distance))
-        if frag.retained:
-            # Edge fringe.  NEVER parented to the car: parented glass rides the
-            # wreck and buries itself below the ground (measured: 65/82 retained
-            # fragments at z=-1.5 following the chassis).  It gets the SAME
-            # rigid body treatment as every other fragment, but with the throw
-            # almost removed so it drops and settles around the aperture
-            # instead of scattering downrange.
-            retained += 1
-            blow *= float(glass_settings.edge_retain) * 0.5
         away = np.array(frag.centre, dtype=np.float64) - np.array(
             event.position, dtype=np.float64)
         n = np.linalg.norm(away)
@@ -1102,19 +1121,27 @@ def _spawn_glass_pane(part: str, tier: str, event: ImpactEvent,
         # Flatten the outward throw: glass falling out of a window should not be
         # lobbed upward off the car.
         vel[2] = min(vel[2], abs(vel[2]) * 0.2)
-        if frag.retained:
-            # No inherited part velocity either — the edge glass falls where
-            # the pane broke, it is not thrown with the panel.
-            vel = vel * 0.15
-        else:
-            vel = vel + part_vel * settings.inherit_velocity * intensity
+        vel = vel + part_vel * settings.inherit_velocity * intensity
 
         launch_start = spawn_frame - LAUNCH_FRAMES
         base = np.array(frag.centre, dtype=np.float64)
+        # Clamp on the fragment's LOWEST POINT, not its origin — exactly as the
+        # hero pieces do (see _lowest_point_offset).  The launch phase is
+        # KINEMATIC and ignores collisions, so a strong inherited downward
+        # velocity carries the centre down to the ground_z + GROUND_CLEARANCE
+        # floor while the hull, which extends several cm BELOW the centre, is
+        # already buried in the slab.  Bullet resolves that initial penetration
+        # by ejecting the body through the nearest face — for a thin flat shard
+        # that is downward — and the fragment free-falls out of the world
+        # (measured on the real cache: 15 backlight/trunkglass fragments ended
+        # at z=-107 to -118 with the centre-only clamp).  Skimming on the lowest
+        # point keeps the hull clear of the collider at release.
+        low_off = _lowest_point_offset(obj, (0.0, 0.0, 0.0), 1.0)
+        floor = settings.ground_z + GROUND_CLEARANCE - low_off
         for k in range(LAUNCH_FRAMES + 1):
             loc = base + vel * dt * k
-            if loc[2] < settings.ground_z + GROUND_CLEARANCE:
-                loc[2] = settings.ground_z + GROUND_CLEARANCE
+            if loc[2] < floor:
+                loc[2] = floor
             obj.location = tuple(loc)
             obj.keyframe_insert("location", frame=launch_start + k)
         # Constant-velocity keys need LINEAR interpolation — see _linearise.
@@ -1123,6 +1150,36 @@ def _spawn_glass_pane(part: str, tier: str, event: ImpactEvent,
         obj[LAUNCH_PROP] = int(launch_start)
         _key_visibility(obj, launch_start)
         placed.append((obj, launch_start))
+
+    # Phase 0b: glue the retained fringe into the frame.  Resolve the root
+    # empty's pose at the shatter frame and parent each fringe fragment against
+    # THAT inverse, so its local transform pins it to the aperture as it was
+    # when the pane broke.  The parent_inverse MUST be the shatter-frame pose —
+    # resolving it at bake time (after the wreck has moved) is what let glass
+    # ride the chassis and bury itself.
+    if fringe:
+        root = _find_transform_root()
+        if root is not None:
+            scene = bpy.context.scene
+            frame_orig = scene.frame_current
+            scene.frame_set(spawn_frame)
+            bpy.context.view_layer.update()
+            for obj in fringe:
+                world_before = obj.matrix_world.copy()
+                obj.parent = root
+                obj.matrix_parent_inverse = root.matrix_world.inverted()
+                obj.matrix_world = world_before
+                obj[LAUNCH_PROP] = int(spawn_frame)
+                _key_visibility(obj, spawn_frame)
+            scene.frame_set(frame_orig)
+        else:
+            # No transform empty (defensive): keep the fringe from the old
+            # firework path by giving it no velocity at all and letting it fall.
+            for obj in fringe:
+                launch_start = spawn_frame - LAUNCH_FRAMES
+                obj[LAUNCH_PROP] = int(launch_start)
+                _key_visibility(obj, launch_start)
+                placed.append((obj, launch_start))
 
     # Phase 2: evaluate the placed fragments in the scene, then register their
     # rigid bodies against the real world matrices.
