@@ -217,16 +217,34 @@ def _point_in_polygon(p: np.ndarray, poly: np.ndarray) -> bool:
     return True
 
 
-def _dist_to_outline(p: np.ndarray, outline: np.ndarray) -> float:
-    """Shortest distance from a point to the boundary of the outline polygon."""
-    best = float("inf")
+def _closest_outline_point(p: np.ndarray,
+                           outline: np.ndarray) -> Tuple[float, np.ndarray]:
+    """Nearest point on the outline boundary to ``p``.
+
+    Returns ``(distance, point)``.  The point is needed when a shattered
+    pane's interior vertices are collapsed onto the rim — pulling them onto
+    their nearest outline point keeps the remaining faces degenerate along the
+    break edge, where collapsing them all onto the pane centroid would draw
+    long spikes from the rim to the middle of the pane.
+    """
+    best_d = float("inf")
+    best_p = np.asarray(p, dtype=np.float64)
     n = len(outline)
     for i in range(n):
         a, b = outline[i], outline[(i + 1) % n]
         ab = b - a
-        t = float(np.clip(((p - a) @ ab) / max(ab @ ab, 1e-12), 0.0, 1.0))
-        best = min(best, float(np.linalg.norm(p - (a + t * ab))))
-    return best
+        t = float(np.clip(((best_p - a) @ ab) / max(ab @ ab, 1e-12), 0.0, 1.0))
+        q = a + t * ab
+        d = float(np.linalg.norm(best_p - q))
+        if d < best_d:
+            best_d = d
+            best_p = q
+    return best_d, best_p
+
+
+def _dist_to_outline(p: np.ndarray, outline: np.ndarray) -> float:
+    """Shortest distance from a point to the boundary of the outline polygon."""
+    return _closest_outline_point(p, outline)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +394,69 @@ def shatter_pane(verts: np.ndarray,
         for i in retained_idx[keep:]:
             out[i].retained = False
     return out
+
+
+def rim_mask_and_anchors(verts: np.ndarray,
+                         edge_retain: float = 0.05
+                         ) -> Tuple[np.ndarray, np.ndarray]:
+    """Per-vertex rim keep-mask and glue-anchor index for a pane.
+
+    This is what stays welded in the aperture.  Rather than spawning separate
+    ``glassfrag`` objects for the fringe — which can only ride the wreck's
+    RIGID transform and so drift away from a pane that keeps deforming — the
+    pane mesh itself keeps its rim band alive: from the shatter frame on only
+    the vertices OUTSIDE the band collapse, so the rim IS the fringe and
+    follows the pane's per-frame vertex animation exactly.  Drift is
+    impossible by construction.
+
+    Returns ``(keep, anchors)``:
+
+    * ``keep`` — (N,) bool; True where the vertex stays welded to the pane
+      (its distance to the outline is within ``edge_retain`` of the pane's
+      half-extent, the same band :func:`shatter_pane` uses to mark cells
+      retained).
+    * ``anchors`` — (N,) int, one rim vertex each interior vertex is GLUED to.
+      Each interior vertex rides the CURRENT-frame position of its anchor, so
+      the collapsed faces stay degenerate along the break edge even while the
+      pane keeps deforming — a static collapse target would stretch metres off
+      the moving rim.
+    """
+    pts = np.asarray(verts, dtype=np.float64)
+    basis = pane_basis(pts)
+    uv = basis.to_2d(pts)
+    outline = _convex_hull_2d(uv)
+    if len(outline) < 3:  # degenerate pane — collapse everything
+        return np.zeros(len(pts), dtype=bool), np.arange(len(pts))
+
+    centre_uv = outline.mean(axis=0)
+    extent = float(np.abs(outline - centre_uv).max()) or 1.0
+    band = float(edge_retain) * extent
+
+    distances = np.array(
+        [_dist_to_outline(uv[v], outline) for v in range(len(pts))])
+    keep = distances <= band
+    # Mirror the retained-CELL cap in :func:`shatter_pane`
+    # (``MAX_RETAINED_FRACTION``).  On a long thin pane — the backlight is the
+    # real-world case — 5% of the half-extent exceeds the pane's half-width, so
+    # the band alone would mark EVERY vertex as rim: nothing collapses, yet the
+    # build still spawned fragments for the released cells, and the shot gets
+    # double glass.  Cap the rim at the shallowest fraction of vertices, exactly
+    # as the cell test does.
+    n_keep = int(len(pts) * MAX_RETAINED_FRACTION)
+    if keep.sum() > n_keep:
+        order = np.argsort(distances)
+        keep[:] = False
+        keep[order[:n_keep]] = True
+
+    anchors = np.arange(len(pts))
+    kept_idx = np.flatnonzero(keep)
+    if len(kept_idx):
+        for v in range(len(pts)):
+            if keep[v]:
+                continue
+            d2 = ((uv[kept_idx] - uv[v]) ** 2).sum(axis=1)
+            anchors[v] = kept_idx[int(np.argmin(d2))]
+    return keep, anchors
 
 
 def _polygon_area(poly: np.ndarray) -> float:

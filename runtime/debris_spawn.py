@@ -44,6 +44,7 @@ from .glass_shatter import (
     shatter_pane,
 )
 from .impact_detect import (
+    GLASS_CRACKED,
     GLASS_SHATTERED,
     MATERIAL_DEBRIS_BIAS,
     GlassSettings,
@@ -163,23 +164,6 @@ def _bounce_params(bounciness: float) -> Tuple[float, float, float]:
     lin_damp = 0.85 - 0.79 * b
     ang_damp = 0.92 - 0.80 * b
     return restitution, lin_damp, ang_damp
-
-
-def _find_transform_root() -> Optional["bpy.types.Object"]:
-    """Locate the imported cache's ``<collection>__root`` transform empty.
-
-    The playback handler drives this empty's ``matrix_basis`` from the cached
-    rigid transform every frame, so parenting debris to it rides the wreck's
-    own motion.  Found by name suffix rather than a stored reference — the
-    build operator does not know the collection's name, and after a reload the
-    reference is gone while the object itself survives in the .blend.
-    """
-    if bpy is None:
-        return None
-    for obj in bpy.data.objects:
-        if obj.type == "EMPTY" and obj.name.endswith("__root"):
-            return obj
-    return None
 
 
 def _key_visibility(obj: "bpy.types.Object", launch_frame: int) -> None:
@@ -408,6 +392,43 @@ def _get_collection(name: str, parent=None) -> "bpy.types.Collection":
     return coll
 
 
+#: Prefix of every material :func:`_apply_glass_crack` builds.  Used to find
+#: them again at clear time — they sit in the CAR's material slots, so they
+#: cannot be found by walking the debris collections.
+CRACK_MATERIAL_PREFIX = "BeamNG Crack "
+
+
+def _clear_crack_materials() -> int:
+    """Strip crack materials off the car and delete them.
+
+    Returns how many materials were removed.  Faces carrying a crack slot are
+    reset to slot 0 (the pane's original glass), then the now-unused slot is
+    left in place — removing a slot re-indexes every face above it, which would
+    silently repaint unrelated panes in the same merged chunk.
+    """
+    if bpy is None:
+        return 0
+    cracks = [m for m in bpy.data.materials
+              if m.name.startswith(CRACK_MATERIAL_PREFIX)]
+    if not cracks:
+        return 0
+    crack_set = set(cracks)
+    for mesh in bpy.data.meshes:
+        slots = list(mesh.materials)
+        if not slots or not crack_set.intersection(
+                m for m in slots if m is not None):
+            continue
+        cracked_slots = {i for i, m in enumerate(slots) if m in crack_set}
+        for poly in mesh.polygons:
+            if poly.material_index in cracked_slots:
+                poly.material_index = 0
+        for i in cracked_slots:
+            mesh.materials[i] = None
+    for mat in cracks:
+        bpy.data.materials.remove(mat)
+    return len(cracks)
+
+
 def clear_debris() -> int:
     """Remove every object this module created.  Returns how many were removed."""
     if bpy is None:
@@ -438,6 +459,24 @@ def clear_debris() -> int:
     for mesh in list(bpy.data.meshes):
         if mesh.users == 0 and mesh.name.startswith("shard_"):
             bpy.data.meshes.remove(mesh)
+
+    # Un-paint cracked panes.  The crack lives on the CAR's own mesh (a slot on
+    # the merged glass chunk), not on a debris object, so removing the debris
+    # collections cannot reach it — without this a cracked pane stays cracked
+    # after Clear Debris, and a rebuild with different thresholds paints a
+    # second crack over the first.  Restores each affected face to slot 0, the
+    # pane's original glass shader.
+    removed += _clear_crack_materials()
+
+    # Un-collapse the car's glass panes.  A shattered pane is collapsed out of
+    # the car during playback (and that state is persisted on the scene), so
+    # clearing the fragments must also clear the collapse map — otherwise the
+    # car's glass stays gone even after Clear Debris.
+    try:
+        from runtime import frame_handler
+        frame_handler.set_shattered_panes({})
+    except Exception:
+        pass
     return removed
 
 
@@ -1032,6 +1071,29 @@ def _spawn_fine_particles(event: ImpactEvent, count: int,
 GLASS_COLLECTION = "BeamNG Debris Glass"
 
 
+@dataclass
+class GlassCrackSettings:
+    """How a CRACKED pane is decorated.
+
+    Separate from :class:`GlassSettings` (which owns the tier thresholds)
+    because this is purely a look, with no effect on classification.
+    """
+
+    #: Master switch for the crack decoration.
+    enabled: bool = True
+    #: Paint the damage from a user-supplied image instead of the procedural
+    #: web.  The Image Texture node is left empty when no path is set, so the
+    #: user can drop their own crack PNG into it and place it by hand.
+    use_image: bool = True
+    #: Absolute path to the crack texture.  Empty = leave the node unassigned.
+    image_path: str = ""
+    #: How wide (m) the crack image spans across the pane.
+    image_span: float = 1.2
+    #: Hole size scale, fed to ``glass_crack.hole_radius_for`` with severity.
+    #: Only used by the procedural path.
+    scale: float = 0.05
+
+
 def _glass_material_for(part: str, material: str,
                         source_objects: Optional[Dict[str, "bpy.types.Object"]]
                         ) -> Optional["bpy.types.Material"]:
@@ -1069,13 +1131,13 @@ def _spawn_glass_pane(part: str, tier: str, event: ImpactEvent,
                       ) -> Tuple[List["bpy.types.Object"], int]:
     """Break one pane into fragments and place them in the scene.
 
-    Returns ``(dynamic_fragments, retained_count)``.  Retained fragments (the
-    pane's edge fringe) are PARENTED to the ``<collection>__root`` transform
-    empty with ``matrix_parent_inverse`` resolved at ``spawn_frame`` — they
-    stay stuck in the frame and ride the wreck's own motion, never buried by
-    the launch/RB/bake path (measured before this fix: 65/82 retained fragments
-    following the chassis at z=-1.5).  The non-retained fragments are
-    independent rigid bodies that break outward from the impact.
+    Returns ``(dynamic_fragments, retained_count)``.  Retained cells (the
+    pane's edge fringe) are NOT spawned as objects: the pane mesh's rim band
+    is kept alive by ``mesh_update`` (via ``set_shattered_panes``) and IS the
+    fringe, so it stays welded in the aperture and follows the pane's per-frame
+    vertex deformation exactly — where a parented fragment could only ride the
+    wreck's rigid transform and drift off a deforming pane.  The non-retained
+    fragments are independent rigid bodies that break outward from the impact.
 
     ``verts`` must be in WORLD space (the same space as ``event.position`` —
     see ``impact_detect.local_to_world``).
@@ -1106,11 +1168,18 @@ def _spawn_glass_pane(part: str, tier: str, event: ImpactEvent,
     # (object, launch_start) placed in phase 1, registered as a rigid body in
     # phase 2 — see the phase note in _spawn_hero_pieces.
     placed: List[Tuple["bpy.types.Object", int]] = []
-    # Retained fringe fragments, collected so they can be parented to the
-    # transform empty at the shatter-frame pose in phase 0b.
-    fringe: List["bpy.types.Object"] = []
 
     for i, frag in enumerate(fragments):
+        if frag.retained:
+            # Edge fringe — never spawned as an object.  The pane mesh's rim
+            # band is kept alive by mesh_update and IS the fringe: it stays
+            # welded in the aperture and follows the pane's own per-frame
+            # vertex animation, where a separate parented fragment could only
+            # ride the wreck's rigid transform and drift off the deforming
+            # pane.  Counted so the build report still shows the rim.
+            retained += 1
+            continue
+
         mesh = bpy.data.meshes.new(f"glassfrag_{part}_{i:03d}")
         mesh.from_pydata([tuple(float(c) for c in v) for v in frag.verts], [],
                          [list(f) for f in frag.faces])
@@ -1124,14 +1193,6 @@ def _spawn_glass_pane(part: str, tier: str, event: ImpactEvent,
         obj = bpy.data.objects.new(f"glassfrag_{part}_{i:03d}", mesh)
         obj.location = tuple(float(c) for c in frag.centre)
         coll.objects.link(obj)
-
-        if frag.retained:
-            # Edge fringe — NEVER launched or given a rigid body.  It stays in
-            # the aperture: phase 0b parents it to the root empty at the shatter
-            # pose so it is stuck in the frame and rides the wreck's motion.
-            retained += 1
-            fringe.append(obj)
-            continue
 
         # Fragments closest to the impact are thrown hardest — the strike drives
         # them out while the far side of the pane merely falls away.
@@ -1183,36 +1244,6 @@ def _spawn_glass_pane(part: str, tier: str, event: ImpactEvent,
         _key_visibility(obj, launch_start)
         placed.append((obj, launch_start))
 
-    # Phase 0b: glue the retained fringe into the frame.  Resolve the root
-    # empty's pose at the shatter frame and parent each fringe fragment against
-    # THAT inverse, so its local transform pins it to the aperture as it was
-    # when the pane broke.  The parent_inverse MUST be the shatter-frame pose —
-    # resolving it at bake time (after the wreck has moved) is what let glass
-    # ride the chassis and bury itself.
-    if fringe:
-        root = _find_transform_root()
-        if root is not None:
-            scene = bpy.context.scene
-            frame_orig = scene.frame_current
-            scene.frame_set(spawn_frame)
-            bpy.context.view_layer.update()
-            for obj in fringe:
-                world_before = obj.matrix_world.copy()
-                obj.parent = root
-                obj.matrix_parent_inverse = root.matrix_world.inverted()
-                obj.matrix_world = world_before
-                obj[LAUNCH_PROP] = int(spawn_frame)
-                _key_visibility(obj, spawn_frame)
-            scene.frame_set(frame_orig)
-        else:
-            # No transform empty (defensive): keep the fringe from the old
-            # firework path by giving it no velocity at all and letting it fall.
-            for obj in fringe:
-                launch_start = spawn_frame - LAUNCH_FRAMES
-                obj[LAUNCH_PROP] = int(launch_start)
-                _key_visibility(obj, launch_start)
-                placed.append((obj, launch_start))
-
     # Phase 2: evaluate the placed fragments in the scene, then register their
     # rigid bodies against the real world matrices.
     bpy.context.view_layer.update()
@@ -1249,6 +1280,151 @@ def _spawn_glass_pane(part: str, tier: str, event: ImpactEvent,
     return dynamic, retained
 
 
+def _find_pane_target(part: str) -> Tuple[Optional["bpy.types.Object"],
+                                          Optional[Tuple[int, int]]]:
+    """Locate the object that actually DRAWS ``part``, and its face slice.
+
+    Returns ``(object, face_range)``.  ``face_range`` is None when the pane owns
+    a whole mesh; otherwise it is the ``[start, end)`` polygon slice of the pane
+    inside a merged chunk mesh.
+
+    This lookup exists because the real capture imports CHUNKED: the windshield
+    is not an object, it is 59 vertices and their faces inside a merged
+    ``glass`` mesh shared by all 13 panes.  A standalone
+    ``flanje_e180_windshield`` object does still exist (in the hidden Source
+    collection), and it is a trap — playback never writes to it, so anything
+    applied there is invisible.  Ask the live playback which object it actually
+    updates, and fall back to the scene object only when there is no chunking.
+    """
+    if bpy is None:
+        return None, None
+    try:
+        from . import frame_handler
+        pb = frame_handler._active
+    except Exception:  # pragma: no cover - defensive
+        pb = None
+
+    if pb is not None:
+        faces = getattr(pb, "_chunk_member_faces", None) or {}
+        chunks = getattr(pb, "_chunks", None) or {}
+        for chunk_name, members in faces.items():
+            if part in members and chunk_name in chunks:
+                return chunks[chunk_name], members[part]
+        # Non-chunked playback drives the per-part objects directly.
+        objs = getattr(pb, "_objects", None) or {}
+        if part in objs and not chunks:
+            return objs[part], None
+
+    return bpy.data.objects.get(part), None
+
+
+def _assign_material_to_faces(obj: "bpy.types.Object",
+                              mat: "bpy.types.Material",
+                              face_range: Optional[Tuple[int, int]]) -> int:
+    """Put ``mat`` on ``obj``, restricted to ``face_range`` when given.
+
+    Returns the number of polygons switched to the new material.  Appending a
+    slot (rather than replacing slot 0) is what keeps the other twelve panes in
+    a merged glass chunk on their original shader — replacing the slot would
+    crack every window in the car at once.
+    """
+    mesh = getattr(obj, "data", None)
+    if mesh is None or mat is None:
+        return 0
+    slot = -1
+    for i, existing in enumerate(mesh.materials):
+        if existing is mat:
+            slot = i
+            break
+    if slot < 0:
+        mesh.materials.append(mat)
+        slot = len(mesh.materials) - 1
+
+    polys = mesh.polygons
+    if face_range is None:
+        start, end = 0, len(polys)
+    else:
+        start, end = face_range
+        start = max(0, int(start))
+        end = min(len(polys), int(end))
+    for i in range(start, end):
+        polys[i].material_index = slot
+    return max(0, end - start)
+
+
+def _apply_glass_crack(part: str, event: ImpactEvent, cache_frame: int,
+                       reader, crack_frame: int,
+                       settings: "GlassCrackSettings",
+                       ground_shift: float = 0.0,
+                       ) -> Optional[dict]:
+    """Paint a cracked pane: it keeps its glass and keeps animating.
+
+    A cracked pane is NOT fragmented and NOT collapsed — the decoration is a
+    material, because the pane is still part of the vertex-cache animation and
+    that animation writes mesh vertices BY INDEX.  Re-topologising the pane to
+    give a hole real edges would misalign every frame of the car (see the
+    ``glass_crack`` module docstring).
+
+    Returns a summary dict, or None when the pane could not be decorated.
+    """
+    if bpy is None:
+        return None
+    from .glass_crack import (
+        build_crack_image_material, build_crack_material, crack_placement,
+        hole_radius_for, keyframe_crack, load_crack_image,
+        world_to_cache_local,
+    )
+
+    obj, face_range = _find_pane_target(part)
+    if obj is None or getattr(obj, "data", None) is None:
+        return None
+
+    # The shader works in OBJECT space — the same cache-local space playback
+    # writes into the mesh — so both the pane and the impact must be mapped out
+    # of world space, including the ground shift playback applies OUTSIDE the
+    # mesh (on obj.location).
+    try:
+        local = np.asarray(reader.frame_positions(part, cache_frame),
+                           dtype=np.float64)
+    except Exception:
+        return None
+    if len(local) < 3:
+        return None
+    transform = reader.frame_transform(cache_frame)
+    impact_local = world_to_cache_local(
+        np.asarray(event.position, dtype=np.float64), transform,
+        ground_shift=ground_shift)
+
+    try:
+        placement = crack_placement(
+            local, impact_local,
+            hole_radius_for(settings.scale, event.severity))
+    except ValueError:
+        return None
+
+    name = f"BeamNG Crack {part}"
+    if settings.use_image:
+        image = load_crack_image(settings.image_path)
+        mat = build_crack_image_material(
+            name, placement, obj, image=image, span=settings.image_span)
+    else:
+        mat = build_crack_material(
+            name, placement, web_intensity=float(np.clip(event.severity, 0.0, 1.0)),
+            seed=_stable_hash(str(part)) % 100000, obj=obj)
+    if mat is None:
+        return None
+
+    n_faces = _assign_material_to_faces(obj, mat, face_range)
+    # The driver reads this off the OBJECT that carries the material, which in
+    # chunked mode is the shared chunk — so several panes cracking would fight
+    # over one property.  Ramp it once; a second pane on the same chunk simply
+    # re-keys the same fade, which is correct because they crack together.
+    keyframe_crack(obj, int(crack_frame))
+    return {"part": part, "object": obj.name, "material": mat.name,
+            "faces": n_faces, "frame": int(crack_frame),
+            "chunked": face_range is not None}
+
+
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
@@ -1261,6 +1437,7 @@ def _template_key(event: ImpactEvent) -> str:
 def build_debris(reader, events: Sequence[ImpactEvent],
                  settings: Optional[DebrisSettings] = None,
                  glass_settings: Optional[GlassSettings] = None,
+                 crack_settings: Optional[GlassCrackSettings] = None,
                  frame_start: int = 0,
                  playback_fps: float = 24.0,
                  output_fps: float = 24.0,
@@ -1276,6 +1453,7 @@ def build_debris(reader, events: Sequence[ImpactEvent],
 
     settings = settings or DebrisSettings()
     glass_settings = glass_settings or GlassSettings()
+    crack_settings = crack_settings or GlassCrackSettings()
     scene = bpy.context.scene
     rng = np.random.default_rng(settings.seed)
 
@@ -1366,11 +1544,26 @@ def build_debris(reader, events: Sequence[ImpactEvent],
     # tier.  Only shattered panes spawn; cracked panes keep their glass.
     glass_objects: List["bpy.types.Object"] = []
     shattered_panes: Dict[str, int] = {}
+    cracked_panes: List[dict] = []
     retained_total = 0
     if settings.shatter_glass:
         glass_coll = _get_collection(GLASS_COLLECTION)
         for part, (tier, cache_frame, event) in resolve_glass_damage(
                 events, glass_settings).items():
+            # A CRACKED pane keeps its glass: no fragments, and deliberately no
+            # entry in shattered_panes, so mesh_update never collapses it and
+            # the pane's vertices keep animating with the car.
+            if tier == GLASS_CRACKED:
+                if crack_settings.enabled:
+                    crack_frame = _blender_frame_for(
+                        cache_frame, frame_start, playback_fps, output_fps)
+                    crack_frame = max(scene.frame_start + 1, crack_frame)
+                    info = _apply_glass_crack(
+                        part, event, cache_frame, reader, crack_frame,
+                        crack_settings, ground_shift=ground_shift)
+                    if info is not None:
+                        cracked_panes.append(info)
+                continue
             if tier != GLASS_SHATTERED:
                 continue
             try:
@@ -1477,6 +1670,7 @@ def build_debris(reader, events: Sequence[ImpactEvent],
         "glass": len(glass_objects),
         "retained": retained_total,
         "shattered_panes": shattered_panes,
+        "cracked_panes": cracked_panes,
         "bake_start": bake_start,
         "bake_end": bake_end,
         "hero_objects": hero_objects + glass_objects,

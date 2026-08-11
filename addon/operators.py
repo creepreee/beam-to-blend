@@ -71,6 +71,25 @@ def _glass_settings(context):
     )
 
 
+def _crack_settings(context):
+    """Build a GlassCrackSettings from the scene's crack UI properties."""
+    from runtime.debris_spawn import GlassCrackSettings
+
+    props = context.scene.beamng_debris
+    path = str(getattr(props, "glass_crack_image", "") or "")
+    if path:
+        # The field is a FILE_PATH, so it can hold Blender's "//relative" form;
+        # the material loader works with real filesystem paths.
+        path = bpy.path.abspath(path)
+    return GlassCrackSettings(
+        enabled=bool(getattr(props, "glass_crack_enabled", True)),
+        use_image=bool(getattr(props, "glass_crack_use_image", True)),
+        image_path=path,
+        image_span=float(getattr(props, "glass_crack_span", 1.2)),
+        scale=float(getattr(props, "glass_crack_scale", 0.05)),
+    )
+
+
 def _live_timing(context):
     """Live frame mapping from the running handler, else the scene props.
 
@@ -654,9 +673,11 @@ class BEAMNG_OT_build_debris(Operator):
                 return {"FINISHED"}
 
             settings = _debris_settings(context)
+            gs = _glass_settings(context)
             summary = build_debris(
                 reader, events, settings,
-                glass_settings=_glass_settings(context),
+                glass_settings=gs,
+                crack_settings=_crack_settings(context),
                 frame_start=int(frame_start),
                 playback_fps=float(playback_fps),
                 output_fps=float(output_fps),
@@ -671,10 +692,13 @@ class BEAMNG_OT_build_debris(Operator):
             )
 
             # Register which panes shattered so the intact glass collapses out
-            # of the car from its break frame onward during playback.
+            # of the car from its break frame onward during playback.  Always
+            # push the map, even when empty: an empty map UN-registers panes
+            # from an earlier build, so rebuilding with "shatter glass" off
+            # brings the intact glass back (the old `if shattered:` gate
+            # silently left the panes collapsed).
             shattered = summary.get("shattered_panes") or {}
-            if shattered:
-                frame_handler.set_shattered_panes(shattered)
+            frame_handler.set_shattered_panes(shattered, edge_retain=gs.edge_retain)
 
             sys.stderr.write(f"[BeamNG] {summarise(events)}\n")
             sys.stderr.flush()
@@ -684,8 +708,9 @@ class BEAMNG_OT_build_debris(Operator):
                 f"{summary.get('emitters', 0)} emitters, "
                 f"{summary.get('shards', 0)} shards; "
                 f"{summary.get('glass', 0)} glass fragments "
-                f"({summary.get('retained', 0)} edge, all fall) from "
-                f"{len(summary.get('shattered_panes', {}))} panes; "
+                f"({summary.get('retained', 0)} rim cells stay in frame) from "
+                f"{len(summary.get('shattered_panes', {}))} panes, "
+                f"{len(summary.get('cracked_panes', []))} cracked; "
                 f"{bake.get('baked', 0)} baked over "
                 f"{bake.get('frames', 0)} frames"
             )

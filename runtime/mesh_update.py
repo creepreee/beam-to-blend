@@ -19,6 +19,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from .cache_reader import CacheReader
+from .glass_shatter import rim_mask_and_anchors
 from .tyre_deform import TyreSettings, flatten_tyre, height_basis_from_transform
 
 try:
@@ -339,6 +340,11 @@ class CachePlayback:
         self._chunk_map: Optional[Dict[str, List[str]]] = chunk_map
         self._chunks: Dict[str, "bpy.types.Object"] = {}
         self._chunk_member_ranges: Dict[str, Dict[str, Tuple[int, int]]] = {}
+        #: Per-member FACE slices of each chunk mesh, ``{chunk: {member:
+        #: (start, end)}}``.  Vertex ranges alone cannot address a member's
+        #: polygons, and assigning a material to one pane inside a merged mesh
+        #: is a per-FACE operation — see :func:`debris_spawn._apply_glass_crack`.
+        self._chunk_member_faces: Dict[str, Dict[str, Tuple[int, int]]] = {}
         self._current_frame: Optional[int] = None
         self._log_fh = None
         self._transform_empty: Optional["bpy.types.Object"] = None
@@ -349,6 +355,18 @@ class CachePlayback:
         self._shattered: Dict[str, int] = {}
         #: Cache-local collapse target (pane centroid at its shatter frame).
         self._shattered_centres: Dict[str, np.ndarray] = {}
+        #: Per-vertex rim keep-mask for each shattered member, ``{name: (N,)
+        #: bool}`` — True where the vertex stays welded to the pane.  The rim
+        #: band IS the fringe: it keeps animating with the pane's vertex cache,
+        #: so it follows the deforming aperture where a parented fragment could
+        #: only ride the wreck's rigid transform.
+        self._shattered_keeps: Dict[str, np.ndarray] = {}
+        #: Glue-anchor index per vertex for each shattered member's INTERIOR
+        #: (``keep`` False) rows.  Each interior vertex is pulled to its anchor
+        #: RIM vertex's CURRENT-frame position, so the collapsed faces stay
+        #: degenerate along the break edge even while the pane keeps deforming —
+        #: a static collapse target would stretch metres off the moving rim.
+        self._shattered_anchors: Dict[str, np.ndarray] = {}
         if log_path:
             self._log_fh = open(Path(log_path), "w", encoding="utf-8")
             self._log("=== CachePlayback debug log ===")
@@ -541,6 +559,7 @@ class CachePlayback:
         chunk_mat_names: List[str] = []
         chunk_mat_index_of: Dict[str, int] = {}
         ranges: Dict[str, Tuple[int, int]] = {}
+        face_ranges: Dict[str, Tuple[int, int]] = {}
         vert_offset = 0
         face_offset = 0
 
@@ -553,6 +572,7 @@ class CachePlayback:
             all_verts.append(pos)
             all_faces.append(idx + vert_offset)
             ranges[mname] = (vert_offset, vert_offset + n_verts)
+            face_ranges[mname] = (face_offset, face_offset + n_faces)
             vert_offset += n_verts
 
             # Merge UVs: v5 loop UVs (F,3,2) when available, else expand
@@ -619,6 +639,7 @@ class CachePlayback:
         collection.objects.link(obj)
         self._chunks[chunk_name] = obj
         self._chunk_member_ranges[chunk_name] = ranges
+        self._chunk_member_faces[chunk_name] = face_ranges
         if self._transform_empty:
             obj.parent = self._transform_empty
 
@@ -713,19 +734,32 @@ class CachePlayback:
         self._transform_empty.rotation_mode = "QUATERNION"
 
     # --- glass shatter ---------------------------------------------------
-    def set_shattered_panes(self, panes: Dict[str, int]) -> None:
+    def set_shattered_panes(self, panes: Dict[str, int],
+                            edge_retain: Optional[float] = 0.05) -> None:
         """Register which glass panes shattered and when (cache frames).
 
-        From ``panes[name]`` onward the member's vertices are collapsed to its
-        centroid at the shatter frame, so the intact glass disappears from the
-        car and the spawned fragments take over.  The collapse target is
-        computed here from the cache, so callers only need the name→frame map
-        (see :func:`runtime.impact_detect.resolve_glass_damage`).
+        From ``panes[name]`` onward the member's INTERIOR vertices are
+        collapsed out of the car, so the intact glass disappears and the
+        spawned fragments take over — while the rim band stays welded to the
+        pane and keeps animating, acting as the fringe.  ``edge_retain`` is the
+        band width (fraction of the pane's half-extent) and must match the
+        value the debris build used for :func:`glass_shatter.shatter_pane`, so
+        the surviving rim lines up with the cells the build kept.  The
+        collapse targets are computed here from the cache, so callers only
+        need the name→frame map (see :func:`runtime.impact_detect.
+        resolve_glass_damage`).
 
-        Called from the debris builder while the playback is live; the pane
-        vanishes the moment the playhead passes the recorded shatter frame.
+        The map is REPLACED, not merged: an empty ``panes`` un-collapses every
+        pane, so turning "shatter glass" off (or clearing debris) brings the
+        intact glass back.  Before this, an empty map was a silent no-op and a
+        pane collapsed by one build stayed collapsed in every later one.
         """
-        registered: Dict[str, int] = {}
+        if edge_retain is None:
+            edge_retain = 0.05
+        self._shattered = {}
+        self._shattered_centres = {}
+        self._shattered_keeps = {}
+        self._shattered_anchors = {}
         for name, frame in panes.items():
             frame = int(frame)
             if not (0 <= frame < self.reader.frame_count):
@@ -736,16 +770,34 @@ class CachePlayback:
                 continue
             pos = self._gltf_to_blender(raw)
             if len(pos):
-                registered[name] = frame
+                self._shattered[name] = frame
                 self._shattered_centres[name] = pos.mean(axis=0)
-        if registered:
-            self._shattered.update(registered)
-            # Defeat the "same frame, return early" guard so a pane already
-            # past its shatter frame disappears on the next refresh.
-            self._current_frame = None
+                keep, anchors = rim_mask_and_anchors(pos, float(edge_retain))
+                self._shattered_keeps[name] = keep
+                self._shattered_anchors[name] = anchors
+        # Defeat the "same frame, return early" guard so the change (collapse
+        # OR un-collapse) takes effect on the next refresh.
+        self._current_frame = None
 
     def _collapse_shattered(self, name: str, pos: np.ndarray) -> np.ndarray:
-        """Collapse a shattered member's vertices onto its stored centroid."""
+        """Collapse a shattered member's INTERIOR vertices onto the rim.
+
+        Rows the rim band keeps (``_shattered_keeps[name]`` True) stay at
+        their live per-frame positions, so they follow the pane's vertex
+        animation exactly.  Each interior row is replaced by the CURRENT-frame
+        position of its anchor RIM vertex, so the collapsed faces ride the
+        deforming break edge and never stretch away from it.  Falls back to the
+        old whole-member centroid collapse when the mask is missing (e.g. a
+        build older than this change) or nothing was retained (the pane
+        vanishes wholesale).
+        """
+        keep = self._shattered_keeps.get(name)
+        anchors = self._shattered_anchors.get(name)
+        if keep is not None and anchors is not None and len(keep) == len(pos):
+            if keep.sum() > 0:
+                out = pos.copy()
+                out[~keep] = pos[anchors[~keep]]
+                return out
         centre = self._shattered_centres.get(name)
         if centre is None:
             return pos

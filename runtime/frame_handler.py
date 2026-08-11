@@ -277,25 +277,34 @@ def _load_tyre(scene) -> TyreSettings:
 
 
 _SHATTER_KEY = "_beamng_shattered_panes"
+_SHATTER_RETAIN_KEY = "_beamng_shatter_edge_retain"
 
 
-def set_shattered_panes(panes: Dict[str, int]) -> None:
+def set_shattered_panes(panes: Dict[str, int],
+                        edge_retain: Optional[float] = None) -> None:
     """Register shattered glass panes on the LIVE playback (and persist them).
 
     ``panes`` maps a pane member name to the cache frame it broke.  From that
-    frame on the intact glass collapses to a point so the spawned fragments
-    take over.  Called by the debris builder; also stored on the scene so undo
-    /reload recovery re-applies the shatter (the .blend keeps the fragments,
-    so the panes must keep collapsing to match).
+    frame on the intact glass collapses so the spawned fragments take over —
+    the pane's RIM band stays welded to the aperture and acts as the fringe.
+    Called by the debris builder; also stored on the scene so undo /reload
+    recovery re-applies the shatter (the .blend keeps the fragments, so the
+    panes must keep collapsing to match).  ``edge_retain`` is the rim-band
+    width the build used; it is persisted alongside the map so a recovered
+    playback can rebuild the same rim.
     """
     if _active is not None:
-        _active.set_shattered_panes(panes)
+        _active.set_shattered_panes(panes, edge_retain=edge_retain)
     if bpy is not None and bpy.context.scene is not None:
         if panes:
             bpy.context.scene[_SHATTER_KEY] = ",".join(
                 f"{k}:{int(v)}" for k, v in sorted(panes.items()))
-        elif _SHATTER_KEY in bpy.context.scene:
-            del bpy.context.scene[_SHATTER_KEY]
+            if edge_retain is not None:
+                bpy.context.scene[_SHATTER_RETAIN_KEY] = float(edge_retain)
+        else:
+            for key in (_SHATTER_KEY, _SHATTER_RETAIN_KEY):
+                if key in bpy.context.scene:
+                    del bpy.context.scene[key]
 
 
 def _load_shattered_panes(scene) -> Dict[str, int]:
@@ -313,6 +322,14 @@ def _load_shattered_panes(scene) -> Dict[str, int]:
         except ValueError:
             continue
     return out
+
+
+def _load_shatter_edge_retain(scene) -> float:
+    """Restore the rim-band width the debris build used, for recovery."""
+    try:
+        return float(scene.get(_SHATTER_RETAIN_KEY, 0.05))
+    except (TypeError, ValueError):
+        return 0.05
 
 
 def set_force_depsgraph(enabled: bool) -> None:
@@ -441,15 +458,27 @@ def _try_recover(scene) -> bool:
                 if chunk_obj is None:
                     continue
                 playback._chunks[chunk_name] = chunk_obj
-                # Rebuild vertex offset ranges for this chunk
+                # Rebuild vertex AND face offset ranges for this chunk.  The
+                # offsets must be accumulated over exactly the members
+                # _build_chunk merged — it skips dynamic members, so walking the
+                # raw chunk_map here would shift every subsequent member's slice
+                # and address the wrong geometry.
                 ranges = {}
+                face_ranges = {}
                 vert_offset = 0
+                face_offset = 0
                 for mname in member_names:
+                    if mname in dynamic_names:
+                        continue
                     co = reader.get_object(mname)
                     vc = co.vertex_count
+                    fc = int(reader.base_indices(mname).shape[0])
                     ranges[mname] = (vert_offset, vert_offset + vc)
+                    face_ranges[mname] = (face_offset, face_offset + fc)
                     vert_offset += vc
+                    face_offset += fc
                 playback._chunk_member_ranges[chunk_name] = ranges
+                playback._chunk_member_faces[chunk_name] = face_ranges
         else:
             # Non-chunked: all collection mesh objects are individual targets
             for obj in playback_coll.objects:
@@ -467,7 +496,8 @@ def _try_recover(scene) -> bool:
         # Re-apply shattered panes so recovered playback collapses them too.
         panes = _load_shattered_panes(scene)
         if panes:
-            playback.set_shattered_panes(panes)
+            playback.set_shattered_panes(
+                panes, edge_retain=_load_shatter_edge_retain(scene))
 
         # Re-register handler if missing
         _ensure_handler_registered()
@@ -603,7 +633,7 @@ def detach() -> None:
         keys = ["_beamng_cache_path", "_beamng_frame_start", "_beamng_start_frame",
                 "_beamng_start_second",  # legacy key from the seconds-based build
                 "_beamng_use_chunked", "_beamng_playback_fps", "_beamng_output_fps",
-                _SHATTER_KEY]
+                _SHATTER_KEY, _SHATTER_RETAIN_KEY]
         keys += [f"_beamng_tyre_{k}" for k in _TYRE_KEYS]
         for key in keys:
             if key in bpy.context.scene:

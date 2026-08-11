@@ -3,13 +3,15 @@
     blender --background --python tests/blender_debris_analyze.py
 
 Opens the blend saved by blender_debris_retention.py (SAVE_BLEND env) and
-prints the root empty's translation+rotation and a probe fragment's world and
-local (matrix_basis) translation at its shatter frame and at the last frame, so
-we can see whether the parented fringe rides the root.
+prints the root empty's translation+rotation, the glass fragment counts, the
+persisted shattered-pane map, and — when live playback recovered — the rim-band
+keep/interior counts per pane, so we can see the rim-band collapse held.
 """
 
 import os
 import sys
+
+import numpy as np
 
 import bpy
 
@@ -36,36 +38,32 @@ def main():
             root = o
     log(f"[ANA] root: {root.name if root else None}")
 
-    parented = [o for o in bpy.data.objects
-                if o.name.startswith("glassfrag_") and o.parent is not None]
-    log(f"[ANA] parented fringe: {len(parented)}")
+    frags = [o for o in bpy.data.objects if o.name.startswith("glassfrag_")]
+    parented = [o for o in frags if o.parent is not None]
+    log(f"[ANA] glass fragments: {len(frags)} total, "
+        f"{len(parented)} parented (fringe objects removed by design)")
 
     scene = bpy.context.scene
-    last = scene.frame_end
-    probe = parented[0]
-    spawn = int(probe.get("_beamng_debris_launch", scene.frame_start))
+    log(f"[ANA] scene shattered panes: "
+        f"{scene.get('_beamng_shattered_panes')}")
+    log(f"[ANA] scene rim-band width: "
+        f"{scene.get('_beamng_shatter_edge_retain')}")
 
-    def snap(label):
-        scene.frame_set(scene.frame_current)
-        bpy.context.view_layer.update()
-        log(f"[ANA] {label}: root t {tuple(round(float(x), 3) for x in root.matrix_world.translation)} "
-            f"e {tuple(round(float(x), 3) for x in root.matrix_world.to_euler())}")
-        log(f"[ANA] {label}: {probe.name} t {tuple(round(float(x), 3) for x in probe.matrix_world.translation)} "
-            f"basis {tuple(round(float(x), 3) for x in probe.matrix_basis.to_translation())} "
-            f"parent_inv t {tuple(round(float(x), 3) for x in probe.matrix_parent_inverse.translation)}")
+    try:
+        from runtime import frame_handler
+        pb = frame_handler._active
+    except Exception:
+        pb = None
+    if pb is not None:
+        panes = getattr(pb, "_shattered", {}) or {}
+        log(f"[ANA] live _shattered: {panes}")
+        for name in sorted(panes):
+            keep = (pb._shattered_keeps or {}).get(name)
+            n = len(keep) if keep is not None else 0
+            rim = int(keep.sum()) if keep is not None else 0
+            log(f"[ANA]   {name:40s} verts={n:5d} rim={rim:5d} "
+                f"interior={n - rim:5d}")
 
-    scene.frame_set(spawn)
-    snap("spawn")
-    scene.frame_set(last)
-    snap("end")
-
-    # Does the fragment's world position match root.M(end) @ parent_inv @ basis?
-    expected = (root.matrix_world @ probe.matrix_parent_inverse @ probe.matrix_basis)
-    log(f"[ANA] expected(world recompute) {tuple(round(float(x), 3) for x in expected.translation)}")
-    log(f"[ANA] actual(world)            {tuple(round(float(x), 3) for x in probe.matrix_world.translation)}")
-
-    if os.path.exists(_BLEND):
-        pass
     log("[ANA][DONE]")
 
 

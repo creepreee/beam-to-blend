@@ -89,3 +89,45 @@ VERIFIED (`DEBRIS_SETTLE=20`, real cache, 315 fragments):
 The slab thickness (0.2 m, 12 substeps) was never the issue for these fragments
 — a 15 m/s body crosses only ~2 cm/substep, nowhere near 0.2 m. The measured
 tunnel was purely the spawn-penetration ejection.
+
+### E. Rim-band collapse — REPLACES approach C (2026-08-11)
+
+The 58 parented fringe objects from C had a ceiling: parenting follows only the
+root empty's RIGID transform, and the pane keeps DEFORMING during the crash
+(the aperture crumples as the car rolls/crushes), so the fringe drifted off the
+deforming frame. The code's own comment in `_spawn_glass_pane` called the right
+design "don't parent the fringe at all — the fringe is one or more fixed verts
+on the pane, so at frame f its world position SHOULD BE the pane verts at frame
+f". Following the pane's verts was blocked, though, because `mesh_update`
+collapsed EVERY vertex of a shattered member to the pane centroid from the
+shatter frame on — no live rim existed to follow.
+
+FIX: the pane mesh itself keeps its rim band alive and acts as the fringe.
+- `glass_shatter.rim_mask_and_anchors()`: per-vertex keep-mask (vertices within
+  `edge_retain` of the outline, capped at `MAX_RETAINED_FRACTION` like the cell
+  test) + per-vertex glue-anchor index: every interior vertex rides its nearest
+  rim vertex's CURRENT-frame position, so the collapsed faces stay degenerate
+  along the break edge even while the pane keeps deforming (a static collapse
+  target would stretch metres off the moving rim — measured rim rows move up to
+  3.8 m of pure deformation over the crash).
+- `mesh_update.set_shattered_panes(panes, edge_retain)`: stores keep/anchor
+  arrays per pane; `_collapse_shattered` replaces only the interior rows with
+  their anchor's live position. Rim rows keep their per-frame positions → rim
+  follows the pane's vertex animation EXACTLY.
+- `_spawn_glass_pane`: no fringe objects, no phase 0b, no `_find_transform_root`
+  (deleted). Retained cells are counted but not spawned.
+- `frame_handler` persists `_beamng_shatter_edge_retain` so reload recovery
+  rebuilds the same rim; operator passes `glass_settings.edge_retain`.
+
+VERIFIED (`tests/blender_debris_retention.py`, real cache, 208 dynamic
+fragments):
+- **0 parented fragments** (the 58 fringe objects are gone; outliner is clean)
+- 6 panes shattered, map + rim-band width persisted, reload recovery rebuilds
+  the masks
+- rim rows welded to the pane **0.0000 m** deviation at the end frame; interior
+  rows ride their rim anchors **0.0000 m** deviation and sit up to 3.8 m off
+  their own live positions (proving real collapse)
+- below-ground dynamic fragments: **0**
+- `python -m pytest -q` 81/81 green; addon repacked.
+- NOTE: a previously saved SAVE_BLEND predates this change and must be
+  regenerated (it still holds the old parented fringe).

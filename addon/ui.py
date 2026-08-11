@@ -469,6 +469,53 @@ class BeamNGDebrisProperties(PropertyGroup):
         max=1.0,
         precision=4,
     )
+    glass_crack_enabled: BoolProperty(
+        name="Crack Panes",
+        description="Decorate panes hit hard enough to craze but not hard "
+                    "enough to shatter. The pane KEEPS its glass and keeps "
+                    "animating — only a material is applied, fading in at the "
+                    "frame the pane was struck",
+        default=True,
+    )
+    glass_crack_use_image: BoolProperty(
+        name="Use Crack Texture",
+        description="Paint the damage from your own crack image instead of the "
+                    "procedural crack web. The Image Texture node is added to "
+                    "the pane's material even when no file is set, so you can "
+                    "drop a PNG into it and position it by hand with the "
+                    "Mapping node wired next to it",
+        default=True,
+    )
+    glass_crack_image: StringProperty(
+        name="Crack Texture",
+        description="Crack image painted onto cracked panes. Its ALPHA is the "
+                    "mask: opaque pixels show damage, clear pixels leave the "
+                    "glass untouched. Leave empty to wire up the node and "
+                    "assign the image yourself in the shader editor",
+        default="",
+        subtype="FILE_PATH",
+    )
+    glass_crack_span: FloatProperty(
+        name="Crack Size",
+        description="How wide (m) the crack texture spans across the pane, "
+                    "centred on the impact point. Larger values spread the same "
+                    "image over more glass",
+        default=1.2,
+        min=0.01,
+        max=10.0,
+        precision=2,
+    )
+    glass_crack_scale: FloatProperty(
+        name="Hole Size",
+        description="Size of the hole punched at the impact, scaled by how hard "
+                    "the pane was hit. Only used by the PROCEDURAL crack (when "
+                    "Use Crack Texture is off); the hole is clamped so it can "
+                    "never exceed 60% of the pane",
+        default=0.05,
+        min=0.0,
+        max=1.0,
+        precision=3,
+    )
     glass_edge_retain: FloatProperty(
         name="Edge Retain",
         description="Width of the glass fringe that stays glued in the window "
@@ -609,12 +656,12 @@ class BEAMNG_PT_debris(Panel):
         phys.prop(props, "debris_spread")
 
         det = layout.box()
-        det.label(text="When to Spawn", icon="EVENT")
+        det.label(text="When to Spawn", icon="TIME")
         det.prop(props, "debris_min_severity")
         det.prop(props, "debris_min_blast_severity")
 
         gen = layout.box()
-        gen.label(text="Generation", icon="SHUFFLE")
+        gen.label(text="Generation", icon="MOD_BUILD")
         gen.prop(props, "debris_variants")
         gen.prop(props, "debris_settle_frames")
         gen.prop(props, "debris_seed")
@@ -628,6 +675,18 @@ class BEAMNG_PT_debris(Panel):
         sub.prop(props, "glass_shatter_deform")
         sub.prop(props, "glass_shatter_ground_depth")
         sub.prop(props, "glass_edge_retain")
+
+        crack = glass.box()
+        crack.active = props.debris_shatter_glass
+        crack.prop(props, "glass_crack_enabled")
+        ccol = crack.column(align=True)
+        ccol.active = props.debris_shatter_glass and props.glass_crack_enabled
+        ccol.prop(props, "glass_crack_use_image")
+        if props.glass_crack_use_image:
+            ccol.prop(props, "glass_crack_image")
+            ccol.prop(props, "glass_crack_span")
+        else:
+            ccol.prop(props, "glass_crack_scale")
 
         col = layout.column(align=True)
         col.scale_y = 1.2
