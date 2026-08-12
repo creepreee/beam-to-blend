@@ -699,6 +699,13 @@ class BEAMNG_OT_build_debris(Operator):
                 summary.get("bake_end", scene.frame_end),
             )
 
+            # Remember the frame mapping this build baked against, so the live
+            # fps/start sliders can rescale the debris keys later (the car
+            # re-times procedurally; the debris does not).
+            from runtime.debris_retime import record_build_timing
+            record_build_timing(scene, int(frame_start),
+                                float(playback_fps), float(output_fps))
+
             # Register which panes shattered so the intact glass collapses out
             # of the car from its break frame onward during playback.  Always
             # push the map, even when empty: an empty map UN-registers panes
@@ -749,6 +756,8 @@ class BEAMNG_OT_clear_debris(Operator):
     def execute(self, context):
         from runtime.debris_spawn import clear_debris
         removed = clear_debris()
+        from runtime.debris_retime import clear_build_timing
+        clear_build_timing(context.scene)
         self.report({"INFO"}, f"Removed {removed} debris objects")
         return {"FINISHED"}
 

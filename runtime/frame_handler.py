@@ -165,6 +165,30 @@ def _refresh_current_frame(scene) -> None:
             area.tag_redraw()
 
 
+def _retime_debris(scene) -> None:
+    """Rescale baked debris/particle timing to the CURRENT live mapping.
+
+    The debris build bakes every keyframe to an absolute timeline frame at its
+    build-time ``(frame_start, playback_fps, output_fps)``.  The car re-times
+    procedurally, so after :func:`update_fps` / :func:`update_start_frame` the
+    two would live on different clocks — the shards fire before/after the panel
+    they came off.  This hands the current live values to
+    :func:`runtime.debris_retime.retime_debris`, which affinely rescales the
+    baked keys so each one keeps the cache frame (the moment in the crash) it
+    was baked for.
+
+    Imported lazily so a missing/wrong debris module can never take down the
+    fps sliders; a failure is logged and ignored.
+    """
+    if bpy is None or scene is None:
+        return
+    try:
+        from .debris_retime import retime_debris
+        retime_debris(scene, _frame_start, _playback_fps, _output_fps)
+    except Exception as exc:  # pragma: no cover - Blender-only path
+        print(f"[BeamNG] debris retime skipped: {exc}")
+
+
 def update_start_frame(start_frame: int) -> None:
     """Move cache frame 0 to Blender frame ``start_frame`` on the LIVE timeline.
 
@@ -183,6 +207,7 @@ def update_start_frame(start_frame: int) -> None:
     if scene is None:
         return
     _apply_timeline(scene)
+    _retime_debris(scene)
     _refresh_current_frame(scene)
 
 
@@ -240,6 +265,10 @@ def update_fps(playback_fps: Optional[float] = None,
     # output_fps keeps frame_start fixed and only re-derives frame_end (the
     # duration still tracks the fps ratio).
     _apply_timeline(scene)
+
+    # Rescale the baked debris/particle keys to the new mapping so they keep
+    # hitting their cache frames (see _retime_debris).
+    _retime_debris(scene)
 
     # Re-run the frame the playhead sits on — see the docstring: the new fps
     # remaps the parked playhead to a different cache frame, and nothing else
