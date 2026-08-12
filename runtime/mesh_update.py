@@ -329,10 +329,41 @@ _TAIL_PERIOD_GRID = np.linspace(4.0, 30.0, 40)
 # Per-frame amplitude below which a degree of freedom counts as "already at
 # rest" (metres for translation, radians for rotation).
 _TAIL_AMPLITUDE_EPS = 1e-4
-# Dimensionless decay exponent of the tail envelope: e^{-LAMBDA·u}(1-u), so the
-# swing is down to ~25% of its amplitude halfway through and exactly zero rest
-# at the end (gradual, not a brake).
-_TAIL_LAMBDA = 1.5
+# How many members to sample when measuring the swing frequency from vertex data
+# (only used for caches with no rigid transform block).  A handful is plenty —
+# every part of the car rocks at the same frequency.
+_TAIL_VFIT_OMEGA_MEMBERS = 4
+
+
+def _tail_envelope(u: float) -> float:
+    """Amplitude taper across the tail: raised cosine ``cos²(πu/2)``.
+
+    This scales the amplitude of the CONTINUED oscillation, so the car keeps
+    rocking through its rest centre the whole way down and each successive swing
+    is a little smaller than the last::
+
+        <-------->, <------->, <----->, <--->, <->, rest
+
+    Properties that matter, and why this shape rather than the previous
+    ``(1-u)·e^{-λu}``:
+
+    * ``env(0) = 1`` — the tail opens at the car's CURRENT full swing amplitude,
+      so there is no amplitude step at the seam.
+    * ``env'(0) = 0`` — the taper starts flat, so the decay eases in instead of
+      the amplitude falling off a cliff on the first tail frame (the old
+      envelope's slope at ``u=0`` was ``-(1+λ) = -2.5``, which read as a sudden
+      stop even when the swing itself was continued correctly).
+    * ``env(1) = 0`` and ``env'(1) = 0`` — it reaches exact rest with zero
+      velocity, so the settle lands softly rather than being clipped.
+    * Evenly spaced swings shrink by similar-looking steps (1.00, 0.96, 0.85,
+      0.69, 0.50, 0.31, 0.15, 0.04, 0.00 over eight half-periods), which is the
+      "true smooth" taper — not most of the decay crammed into the first swing.
+    """
+    if u <= 0.0:
+        return 1.0
+    if u >= 1.0:
+        return 0.0
+    return math.cos(0.5 * math.pi * u) ** 2
 
 
 def _fit_sine_at(values: np.ndarray, omega: float,
@@ -406,14 +437,17 @@ class CachePlayback:
         self._transform_empty: Optional["bpy.types.Object"] = None
         #: Smooth-stop tail, in CACHE-frame units.  0 disables the settle: the
         #: timeline ends exactly on the last captured frame and the car freezes
-        #: there.  When > 0, cache positions past ``frame_count - 1`` glide the
-        #: whole car (rigid pose AND vertex deformation) along its residual
-        #: motion with linearly-decaying velocity, converging to a full rest
+        #: there.  When > 0, cache positions past ``frame_count - 1`` continue
+        #: the whole car's fitted oscillation (rigid pose AND vertex
+        #: deformation) with a shrinking amplitude, reaching a full rest
         #: ``tail`` cache-frames after the capture ends — no more instant stop.
         self._smooth_stop_tail: float = 0.0
-        #: Fitted damped-sine continuation for the tail (see
+        #: Fitted sine continuation of the ROOT motion for the tail (see
         #: :meth:`_compute_tail_fit`), or ``None`` when disabled/unfittable.
         self._tail_fit: Optional[Dict] = None
+        #: Fitted per-VERTEX sine continuation for the tail (see
+        #: :meth:`_compute_tail_vfit`), or ``None`` when disabled/unfittable.
+        self._tail_vfit: Optional[Dict] = None
         # Panes that have shattered: {member_name: cache_frame_it_broke}.  From
         # that frame on the member's vertices are collapsed to a point so the
         # intact glass disappears from the car and the spawned fragments take
@@ -815,10 +849,191 @@ class CachePlayback:
         whatever the car is actually doing.  A car that is genuinely at rest at
         capture end (no measurable residual motion) gets a still tail — there is
         nothing to settle.
+
+        The VERTEX deformation is fitted the same way, per vertex per axis
+        (:meth:`_compute_tail_vfit`), rather than extrapolated from the last
+        inter-frame step.  See that method for why the step is not usable.
         """
         self._smooth_stop_tail = max(0.0, float(tail_cache))
-        self._tail_fit = self._compute_tail_fit() if self._smooth_stop_tail > 0.0 else None
+        if self._smooth_stop_tail > 0.0:
+            self._tail_fit = self._compute_tail_fit()
+            self._tail_vfit = self._compute_tail_vfit(self._tail_omega())
+        else:
+            self._tail_fit = None
+            self._tail_vfit = None
         self._current_frame = None  # defeat the "same frame, return early" guard
+
+    def _tail_omega(self) -> float:
+        """Angular frequency (rad / cache frame) driving the tail oscillation.
+
+        Prefers the frequency fitted from the rigid root motion; falls back to a
+        fit on the vertex data itself when the cache carries no transform block,
+        so a vertex-only cache still swings at its own real frequency instead of
+        an arbitrary default.
+        """
+        fit = self._tail_fit
+        if fit is not None:
+            return float(fit["omega"])
+        omega = self._fit_omega_from_vertices()
+        if omega is not None:
+            return omega
+        tail = max(2.0, min(10.0, self._smooth_stop_tail or 10.0))
+        return 2.0 * math.pi / tail
+
+    def _tail_sample_frames(self) -> List[int]:
+        """Trailing cache frames used for every tail fit (root and vertex)."""
+        n_src = self.reader.frame_count
+        start = max(0, n_src - _TAIL_FIT_WINDOW)
+        return list(range(start, n_src))
+
+    def _tail_member_names(self) -> List[str]:
+        """Every stable member whose vertices the tail has to animate."""
+        if self._chunk_map:
+            names: List[str] = []
+            for chunk_name in self._chunks:
+                names.extend(self._chunk_member_ranges[chunk_name].keys())
+            return names
+        return list(self._objects.keys())
+
+    def _fit_omega_from_vertices(self) -> Optional[float]:
+        """Dominant swing frequency measured from the vertex data.
+
+        Used only when the cache has no rigid transform block.  Fits the mean
+        per-frame vertex displacement magnitude (a scalar that oscillates at the
+        swing frequency) over the period grid and takes the best joint SSE.
+        """
+        frames = self._tail_sample_frames()
+        if len(frames) < 8:
+            return None
+        names = self._tail_member_names()[:_TAIL_VFIT_OMEGA_MEMBERS]
+        series: List[np.ndarray] = []
+        for name in names:
+            try:
+                stack = np.array(
+                    [self.reader.frame_positions(name, f).astype(np.float64)
+                     for f in frames])
+            except ValueError:
+                continue
+            if stack.ndim != 3 or stack.shape[1] == 0:
+                continue
+            centre = stack.mean(axis=0)
+            # Signed projection onto the dominant deviation direction, averaged
+            # over vertices: oscillates at the swing frequency (a magnitude
+            # would rectify it and double the apparent frequency).
+            dev = stack - centre
+            flat = dev.reshape(len(frames), -1)
+            u, s, vt = np.linalg.svd(flat, full_matrices=False)
+            if len(s) == 0 or s[0] <= 0:
+                continue
+            series.append(flat @ vt[0])
+        if not series:
+            return None
+        best_sse, best_w = None, None
+        n = np.arange(len(frames), dtype=np.float64)
+        for period in _TAIL_PERIOD_GRID:
+            w = 2.0 * math.pi / period
+            sse = 0.0
+            for col in series:
+                c = _fit_sine_at(col, w)
+                if c is None:
+                    continue
+                resid = col - (c[0] + c[1] * np.cos(w * n) + c[2] * np.sin(w * n))
+                sse += float(resid @ resid)
+            if best_sse is None or sse < best_sse:
+                best_sse, best_w = sse, w
+        return best_w
+
+    def _compute_tail_vfit(self, omega: float) -> Optional[Dict]:
+        """Fit each vertex's residual oscillation: ``c + Ac·cos(ωn) + As·sin(ωn)``.
+
+        Returns ``{member_name: (centre, Ac, As, seam_residual)}`` with each
+        value an ``(V, 3)`` float32 array, or ``None`` when nothing usable was
+        fitted.
+
+        **Why not extrapolate the last inter-frame step.**  The previous tail
+        drove vertices with ``v_last + (v_last - v_prev)·k``, i.e. it inferred
+        the swing's amplitude from the instantaneous velocity at capture end.
+        A capture ends at an arbitrary phase, and typically near a TURNING POINT
+        of the rock (measured on real data: the root is at 0.98 / -1.00 / -0.995
+        of its per-axis amplitude on the final frame).  At a turning point the
+        velocity is ~zero, so that estimate collapses: the true vertex swing was
+        2.91 mm but ``|v_last - v_prev|/ω`` gave 0.86 mm — a 29% amplitude.  The
+        result was a visible instant drop in swing size at the seam, then a
+        smooth decay of the wrong, much smaller motion.  Fitting amplitude and
+        phase over a whole window recovers the actual swing, so the tail opens
+        at exactly the amplitude the car was already rocking at.
+
+        The fit is a full-window least squares at the shared ``omega``, done
+        vectorised over all vertices at once (3 dot products per member), so it
+        costs one pass over ``_TAIL_FIT_WINDOW`` frames per member and is
+        computed ONCE per ``set_smooth_stop`` rather than per frame.
+
+        **Seam residual.**  A least-squares sine does not pass exactly through
+        the final captured sample (measured: 0.14 mm mean, 0.57 mm worst — under
+        the per-frame motion already present, but non-zero).  Left alone, the
+        first tail frame would step by that much.  So the per-vertex residual
+        ``v_last - fit(t_last)`` is stored and added back scaled by ``env``: at
+        the seam it cancels exactly, and it fades out along with the swing, so
+        the tail starts from precisely the pose the capture ended on.
+        """
+        frames = self._tail_sample_frames()
+        if len(frames) < 8:
+            return None
+        n = np.arange(len(frames), dtype=np.float64)
+        # Shared design matrix: the fit grid is identical for every member.
+        basis = np.column_stack(
+            [np.ones_like(n), np.cos(omega * n), np.sin(omega * n)])
+        pinv = np.linalg.pinv(basis)  # (3, T)
+        t_last = float(len(frames) - 1)   # fit-grid index of the final sample
+        ct_l, st_l = math.cos(omega * t_last), math.sin(omega * t_last)
+        out: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = {}
+        for name in self._tail_member_names():
+            try:
+                stack = np.array(
+                    [self.reader.frame_positions(name, f).astype(np.float64)
+                     for f in frames])
+            except ValueError:
+                continue
+            if stack.ndim != 3 or stack.shape[1] == 0:
+                continue
+            t = len(frames)
+            coef = pinv @ stack.reshape(t, -1)      # (3, V*3)
+            coef = coef.reshape(3, stack.shape[1], 3)
+            centre, ac, as_ = coef[0], coef[1], coef[2]
+            seam = stack[-1] - (centre + ac * ct_l + as_ * st_l)
+            out[name] = (centre.astype(np.float32),
+                         ac.astype(np.float32),
+                         as_.astype(np.float32),
+                         seam.astype(np.float32))
+        if not out:
+            return None
+        return {"omega": float(omega), "start": frames[0], "members": out}
+
+    def _glide_positions(self, name: str, last: int, t: float, env: float
+                         ) -> Optional[np.ndarray]:
+        """Vertex positions for tail time *t* (absolute fit units), or ``None``.
+
+        Continues the fitted per-vertex oscillation with its amplitude scaled by
+        *env*, plus the ``env``-scaled seam residual::
+
+            c + (Ac·cos(ωt) + As·sin(ωt) + seam)·env
+
+        At ``env = 1`` and ``t = t_last`` this is EXACTLY the final captured pose
+        (the residual cancels the fit error), so the tail starts where the
+        capture stopped; at ``env = 0`` every vertex sits exactly on its
+        oscillation CENTRE ``c`` — the pose the car settles into.
+        """
+        vfit = self._tail_vfit
+        if vfit is None:
+            return None
+        entry = vfit["members"].get(name)
+        if entry is None:
+            return None
+        centre, ac, as_, seam = entry
+        ct = math.cos(vfit["omega"] * t)
+        st = math.sin(vfit["omega"] * t)
+        swing = ac * np.float32(ct) + as_ * np.float32(st) + seam
+        return centre + swing * np.float32(env)
 
     def _compute_tail_fit(self) -> Optional[Dict]:
         """Fit the car's residual oscillation from the recent captured frames.
@@ -892,15 +1107,16 @@ class CachePlayback:
 
     def _glide_transform(self, s: float, env: float, last: int
                          ) -> Optional[np.ndarray]:
-        """Synthetic 12-float transform block for the eased swing pose.
+        """Synthetic 12-float transform block for the shrinking swing pose.
 
-        Continues the per-axis damped sine fitted from the recent frames:
+        Continues the per-axis sine fitted from the recent frames:
         ``p = c + (Ac·cos(ω(t)) + As·sin(ω(t)))·env`` with ``t = last + s`` in
         ABSOLUTE frame index (the fit's sample grid was ``frame - start``).
         The rotation follows the mean orientation plus the same fitted swing on
-        its small vector part.  At ``env = 0`` (the end of the tail) this is the
-        oscillation CENTER: the pose the car rocks through and settles at, which
-        is exactly where the fitted swing is heading.
+        its small vector part.  Only ``env`` decays, so the car keeps rocking to
+        BOTH sides of its rest centre all the way down.  At ``env = 0`` (the end
+        of the tail) this is the oscillation CENTRE: the pose the car rocks
+        through and settles at, which is exactly where the swing is heading.
         """
         fit = self._tail_fit
         if fit is None:
@@ -1096,16 +1312,20 @@ class CachePlayback:
         """Continue the car's residual SWING past the final captured frame.
 
         With ``_smooth_stop_tail`` configured, cache position ``s`` past the end
-        keeps the damped oscillation the car was still rocking through when the
-        capture ended (fitted from the last ``_TAIL_FIT_WINDOW`` frames) and
-        eases it to rest: the amplitude envelope ``(1-u)·e^{-λu}`` starts at the
-        full fitted amplitude and reaches exactly zero at ``s == tail``, so the
-        swing gradually decays and stops — it does NOT brake in a straight line.
+        keeps the oscillation the car was still rocking through when the capture
+        ended — fitted in amplitude AND phase from the last ``_TAIL_FIT_WINDOW``
+        frames — and shrinks it to rest.  Both the rigid root and every vertex
+        continue their own fitted sine; only the AMPLITUDE is scaled down, by
+        :func:`_tail_envelope`.  So the car keeps rocking both ways the whole
+        time, each swing smaller than the last::
 
-        The rigid root transform continues its fitted per-axis sine; the vertex
-        deformation swings in phase with the same frequency (driven by each
-        vertex's own residual velocity, so nothing tears).  A car that is truly
-        at rest at capture end gets a still tail (nothing to settle).
+            <-------->, <------->, <----->, <--->, <->, rest
+
+        It does not brake in a straight line, and it does not drop to a small
+        swing at the seam and then decay that: ``env(0) = 1`` means the first
+        tail frame continues the swing at exactly the size it already had.
+        A car that is truly at rest at capture end gets a still tail (nothing to
+        settle).
         """
         tail = self._smooth_stop_tail
         if tail <= 0:
@@ -1115,10 +1335,9 @@ class CachePlayback:
             else:
                 self._set_frame_individual(last)
             return
-        prev = last - 1
         s = max(0.0, pos - last)
         u = 1.0 if s >= tail else s / tail
-        env = (1.0 - u) * math.exp(-_TAIL_LAMBDA * u)
+        env = _tail_envelope(u)
 
         tf = self._glide_transform(s, env, last)
         if self._transform_empty is not None and tf is not None:
@@ -1126,26 +1345,24 @@ class CachePlayback:
             self._transform_empty.rotation_mode = "QUATERNION"
         self._set_tyre_basis(tf)
 
-        # Scalar swing profile for the vertex deformation, in cache-frame
-        # units: starts with the residual velocity (k'(0)=1) and swings back
-        # and forth at the fitted frequency, decaying with the envelope.
-        fit = self._tail_fit
-        omega = fit["omega"] if fit else 2.0 * math.pi / max(2.0, min(10.0, tail))
-        k = (1.0 / omega) * math.sin(omega * s) * env
+        # Absolute phase for the vertex fit: its sample grid was `frame - start`,
+        # so continuing past the end means t = (last - start) + s.  Using the
+        # same phase convention as the root keeps vertices and root in step.
+        vfit = self._tail_vfit
+        t = ((last - vfit["start"]) + s) if vfit is not None else s
 
         if self._chunk_map:
-            self._glide_chunked(last, prev, k)
+            self._glide_chunked(last, t, env)
         else:
-            self._glide_individual(last, prev, k)
+            self._glide_individual(last, t, env)
 
-    def _glide_individual(self, last: int, prev: int, k: float) -> None:
+    def _glide_individual(self, last: int, t: float, env: float) -> None:
         for name, obj in self._objects.items():
-            v_last = self.reader.frame_positions(name, last)
-            if prev >= 0:
-                v_prev = self.reader.frame_positions(name, prev)
-                raw = v_last + (v_last - v_prev) * k
-            else:
-                raw = v_last
+            raw = self._glide_positions(name, last, t, env)
+            if raw is None:
+                # Nothing fitted for this member (too few frames, or a cache
+                # that cannot serve it) — hold its final captured pose.
+                raw = self.reader.frame_positions(name, last)
             positions = self._gltf_to_blender(raw)
             positions = self._deform_tyre(name, obj, positions, last)
             # The rim band rides the glided geometry, so the collapsed glass
@@ -1157,17 +1374,14 @@ class CachePlayback:
         for name, obj in self._dynamic_objects.items():
             self._write_dynamic_frame(name, obj, last)
 
-    def _glide_chunked(self, last: int, prev: int, k: float) -> None:
+    def _glide_chunked(self, last: int, t: float, env: float) -> None:
         for chunk_name, obj in self._chunks.items():
             member_ranges = self._chunk_member_ranges[chunk_name]
             parts = []
             for mname, (start, end) in member_ranges.items():
-                v_last = self.reader.frame_positions(mname, last)
-                if prev >= 0:
-                    v_prev = self.reader.frame_positions(mname, prev)
-                    raw = v_last + (v_last - v_prev) * k
-                else:
-                    raw = v_last
+                raw = self._glide_positions(mname, last, t, env)
+                if raw is None:
+                    raw = self.reader.frame_positions(mname, last)
                 pos = self._gltf_to_blender(raw)
                 pos = self._deform_tyre(mname, obj, pos, last)
                 if self._shattered and last >= self._shattered.get(mname, 1 << 30):
