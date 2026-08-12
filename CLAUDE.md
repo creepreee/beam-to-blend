@@ -123,6 +123,7 @@ Patched with `beamng_capture_quiet` flag to suppress GE console spam.
 | `importer/materials.py` | ⚠️ | Blender 4.0+ Specular socket issue |
 | `runtime/cache_reader.py` | ✅ | BVC memmap reader |
 | `runtime/mesh_update.py` | ✅ | Per-frame vertex update, sharp edge marking, smooth-stop swing tail |
+| `runtime/debris_retime.py` | ✅ | Rescales baked debris/particle keys on live fps/start changes |
 | `runtime/frame_handler.py` | ✅ | Timeline handler, undo/reload recovery, live start/fps/tyre/smooth-stop retune |
 | `addon/operators.py` | ✅ | Scan/build/import/export/texture operators |
 | `addon/ui.py` | ✅ | Panel + scene properties + Tyre Contact sub-panel |
@@ -233,6 +234,43 @@ the car's residual oscillation — NOT a rigid decelerate-and-halt.
   no oscillation to continue and the tail is a static hold (correct physics, not
   a bug). The test cache is still swinging at the end, so the continuation is
   measurable there.
+
+## Debris retime (`runtime/debris_retime.py`)
+
+The car is animated *procedurally* — `frame_handler._cache_frame_for` maps the
+playhead to a cache frame every frame, so changing Playback Speed / Output FPS
+/ Start at Frame re-times it for free.  Debris is the opposite: `build_debris`
+*bakes* each impact to an absolute TIMELINE frame (`_blender_frame_for` at
+build time), freezes the rigid-body sim into F-curves, and stamps particle
+emitters with absolute `frame_start` / `frame_end` / `lifetime`.  Change fps
+after a build and the car re-times while every debris keyframe stays put — the
+shards fire at the wrong moment.  `retime_debris` fixes that:
+
+- **The record.** `record_build_timing(scene, ...)` stores the build-time
+  `(frame_start, playback_fps, output_fps)` as `_beamng_debris_build_*` scene
+  props (survives save/undo).  Called at the end of a successful debris build.
+- **The retime.** On live fps/start changes `frame_handler._retime_debris`
+  calls `retime_debris(scene, live...)`, which affinely rescales every debris
+  key about the start frame so each key keeps the CACHE frame it was baked
+  for: `f_new = start_new + (f_old - start_old) * scale` with
+  `scale = (pb_old/out_old) / (pb_new/out_new)`.  Bezier handles move with
+  their key (otherwise rescaling shears the curves).  Covers F-curves, particle
+  windows, `_beamng_debris_launch` props, and the rigid-body world cache range.
+  Incremental: the record is re-written after each call, so slider drags
+  compose instead of squaring the scale; `_EPS` no-ops an unchanged mapping.
+- **Old builds (no record).** Debris built before this module existed has no
+  `_beamng_debris_build_*` props → `retime_debris` skips (nothing to retime
+  *from*).  The debris object names carry the build-time timeline spawn frame
+  (`debris_<material>_<spawn_frame>_NNN`, same suffix repeated by the
+  emitters), and the impacts' cache frames are in the BVC; fitting
+  `spawn = start + cache * (out/pb)` over hero suffixes recovers the build
+  mapping.  Verified exact on real data (spawn = 400 + cache·3).  Manual
+  recovery: `blender --background --python tests/fix_debris_resync.py -- <file.blend>`
+  (records the derived mapping, retimes to the live values, asserts alignment,
+  saves).
+- **Particles limitation.** Emission timing re-syncs, but particle trajectories
+  are solver-integrated at `scene.render.fps` — their fall speed does not slow
+  with the car.  Baked rigid-body shards are the only full slow-motion.
 
 ## Tyre ground contact (`runtime/tyre_deform.py`)
 
