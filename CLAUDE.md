@@ -122,11 +122,8 @@ Patched with `beamng_capture_quiet` flag to suppress GE console spam.
 | `importer/topology.py` | ✅ | SHA-256 topology hashing |
 | `importer/materials.py` | ⚠️ | Blender 4.0+ Specular socket issue |
 | `runtime/cache_reader.py` | ✅ | BVC memmap reader |
-| `runtime/mesh_update.py` | ✅ | Per-frame vertex update, sharp edge marking |
-| `runtime/tyre_deform.py` | ✅ | Fake tyre ground-contact flattening (see below) |
-| `runtime/impact_detect.py` | ✅ | Impact detection core + glass damage tiers (pure numpy, tested) |
-| `runtime/glass_shatter.py` | ✅ | Glass pane fragmentation + retained-fringe selection |
-| `runtime/frame_handler.py` | ✅ | Timeline handler, undo/reload recovery, live start/fps/tyre retune |
+| `runtime/mesh_update.py` | ✅ | Per-frame vertex update, sharp edge marking, smooth-stop swing tail |
+| `runtime/frame_handler.py` | ✅ | Timeline handler, undo/reload recovery, live start/fps/tyre/smooth-stop retune |
 | `addon/operators.py` | ✅ | Scan/build/import/export/texture operators |
 | `addon/ui.py` | ✅ | Panel + scene properties + Tyre Contact sub-panel |
 | `tools/capture_gltf_sequence.py` | ✅ | beamngpy driver, slowmo + deterministic |
@@ -144,6 +141,7 @@ These panel fields have `update=` callbacks that push straight into the running
 | Start at Frame | `frame_handler.update_start_frame()` |
 | Playback Speed / Output FPS | `frame_handler.update_fps()` |
 | all Tyre Contact fields | `frame_handler.update_tyre()` |
+| Smooth Car Stop / Stop Frames | `frame_handler.update_smooth_stop()` |
 
 **The start offset is stored in FRAMES** (`_start_frame`), and `_frame_start` is
 just a copy of it. It used to be seconds, so that cache frame 0 held its *time*
@@ -194,6 +192,47 @@ asserts both, in per-object and chunked mode (measured 8.828 m of root travel;
 
 The recovery link is **soft**: the .blend stores only the BVC *path* (46 MB, not
 4.27 GB). Move or rename the cache and `_try_recover` returns False silently.
+
+## Smooth car stop (`runtime/mesh_update.py` tail path)
+
+Without it, the crash ends with the car frozen mid-pose the instant the last
+captured frame plays. With "Smooth Car Stop" on, the timeline is extended by
+`Stop Frames` past the last captured frame and the car **keeps the little swing
+it was still rocking through when the capture ended, and that swing gradually
+decreases and then stops**. The tail is a *fitted damped-sine continuation* of
+the car's residual oscillation — NOT a rigid decelerate-and-halt.
+
+- **Frames vs cache units.** The UI field is in *timeline* frames; the playback
+  needs *cache* frames (`tail_cache = tail_frames * playback_fps / output_fps`).
+  `frame_handler._smooth_stop_tail_cache()` does the conversion; both `attach()`
+  and the live `update_smooth_stop()` pass the result to
+  `CachePlayback.set_smooth_stop()`, and the scene prop
+  `_beamng_smooth_stop_frames` (TIMELINE frames) persists it for undo/reload
+  recovery.
+- **The fit.** `_compute_tail_fit()` (called by `set_smooth_stop`) fits a damped
+  sine to the last `_TAIL_FIT_WINDOW = 24` cache frames of the ROOT translation
+  (real captures end mid-swing: the test cache rocks at period ~10 frames,
+  amplitude ~3 mm at capture end). A frequency grid
+  (`_TAIL_PERIOD_GRID = np.linspace(4.0, 30.0, 40)`) minimises joint SSE; if the
+  series is too short or the variance is below `_TAIL_AMPLITUDE_EPS = 1e-4`
+  (`_fit_sine_at` returns None) there is no swing to continue and the tail just
+  holds the final rigid pose. Each axis is fitted as
+  `c + Ac·cos(ωt) + As·sin(ωt)` with an absolute phase `t = (frame - start)`;
+  rotation is the vector part of `q_n · q_mean⁻¹` per component, plus the sign-
+  aligned mean quaternion `_average_quaternion(qs)`.
+- **The continuation.** For cache position `s` past the end: `u = s / tail`,
+  `env = (1-u) · exp(-_TAIL_LAMBDA · u)` with `_TAIL_LAMBDA = 1.5`. The root
+  pose is `c + (Ac·cos(ωt) + As·sin(ωt)) · env` (position) and
+  `q_mean · Quaternion((1, vx, vy, vz)) · normalized()` (rotation); vertices get
+  a scalar profile `k = (1/ω)·sin(ω·s)·env` → `k(0)=0`, `k'(0)=1` (velocity
+  continuity), so the swing continues the residual vertex motion, sweeps through
+  the oscillation centre (motion REVERSES), and returns to the last-frame pose
+  at rest. `env` is exactly 0 at `s >= tail`, so the pose converges to the
+  fitted centre and velocity → 0 — a natural settle, not a brake.
+- **A stopped car stops**: if the fitted amplitude is below the epsilon there is
+  no oscillation to continue and the tail is a static hold (correct physics, not
+  a bug). The test cache is still swinging at the end, so the continuation is
+  measurable there.
 
 ## Tyre ground contact (`runtime/tyre_deform.py`)
 
@@ -263,6 +302,21 @@ export bakes the same deformation into the .mdd, so renders match the viewport.
   Negative control: deleting the `_refresh_current_frame` call fails exactly the
   3 staleness assertions and nothing else — the other 17 pass without it, so only
   those 3 actually cover the bug.
+- Live "Smooth Car Stop" verified headless (23 checks, 97 objects, 1200-frame
+  capture): the timeline extends by exactly the requested frames and the value is
+  persisted for recovery; the tail FITS the car's residual oscillation (period
+  ~10 frames, amplitude 3.13 mm) and SWINGS through its rest centre and back
+  (motion reverses — not a rigid glide); both the vertex deformation and the root
+  pose lose velocity as the envelope decays and settle ON the fitted centre
+  (~0.001 mm off) once past the tail; retuning the tail length while parked
+  mid-tail refreshes the parked playhead's swing pose; toggling OFF clamps the
+  playhead back and returns the mesh to the exact final captured pose;
+  undo/reload recovery restores the LIVE tail and reproduces the swung pose
+  bit-identically. Run:
+  `blender --background --python tests/blender_smooth_stop.py -- <cache.bvc>`
+  Negative control: disabling `_refresh_current_frame` in `update_smooth_stop`
+  fails exactly the 2 parked-refresh/toggle-off assertions and nothing else —
+  the other 21 pass without it.
 - Deform cost ~2.2 ms/frame for 4 tyres / 1024 verts (bulge dominates; the
   `axle_axis` eigensolve is 0.36 ms of it)
 - GLB pipeline: 2000-frame capture at 10x slowmo, 97 objects, 7.4 GB BVC — verified

@@ -52,9 +52,14 @@ _output_fps: float = 24.0     # scene.render.fps (render smoothness)
 _force_depsgraph: bool = False
 _skip_n: int = 0       # 0 = disabled; > 0 = update only every Nth frame
 _frame_counter: int = 0
+# Smooth-stop tail, in TIMELINE frames: 0 = disabled.  When enabled the
+# timeline is extended by this many frames past the last captured frame and the
+# car glides to a full rest along its residual motion (linear-deceleration
+# ease) instead of freezing instantly at the final captured pose.
+_smooth_stop_frames: int = 0
 
 
-def _cache_frame_for(blender_frame: int) -> int:
+def _cache_frame_for(blender_frame: int) -> float:
     """Map a Blender timeline frame to a source (cache) frame by TIME.
 
     cache_frame = (blender_frame - frame_start) * playback_fps / output_fps
@@ -62,11 +67,22 @@ def _cache_frame_for(blender_frame: int) -> int:
     With playback_fps=15, output_fps=60 this advances the cache 15 frames per
     real second regardless of how many Blender frames render in that second, so
     the viewport preview and the final render play at identical speed.
+
+    Returns a FLOAT.  Values at or below the last captured frame are rounded to
+    integer cache frames by the playback; values PAST it (the smooth-stop tail
+    added to ``frame_end``) drive the eased settle to rest.
     """
     if _output_fps <= 0:
-        return blender_frame - _frame_start
+        return float(blender_frame - _frame_start)
     rel = blender_frame - _frame_start
-    return int(round(rel * (_playback_fps / _output_fps)))
+    return rel * (_playback_fps / _output_fps)
+
+
+def _smooth_stop_tail_cache() -> float:
+    """The smooth-stop tail converted to CACHE-frame units for the playback."""
+    if _output_fps <= 0:
+        return float(_smooth_stop_frames)
+    return _smooth_stop_frames * (_playback_fps / _output_fps)
 
 
 def _set_realtime_sync() -> None:
@@ -125,7 +141,8 @@ def _apply_timeline(scene, keep_playhead: bool = True) -> None:
         return
     n_src = _active.reader.frame_count
     duration_s = (n_src - 1) / _playback_fps if n_src > 1 else 0.0
-    scene.frame_end = _frame_start + int(round(duration_s * _output_fps))
+    scene.frame_end = _frame_start + int(round(duration_s * _output_fps)) \
+        + _smooth_stop_frames
 
     if keep_playhead:
         clamped = min(max(scene.frame_current, scene.frame_start), scene.frame_end)
@@ -231,6 +248,39 @@ def update_fps(playback_fps: Optional[float] = None,
 
 
 _TYRE_KEYS = ("amount", "extra", "bulge", "release", "ground_z", "names")
+
+
+def update_smooth_stop(enabled: Optional[bool] = None,
+                       frames: Optional[int] = None) -> None:
+    """Retune the smooth-stop settle tail on the LIVE handler.
+
+    Called from the add-on's "Smooth Stop" checkbox/frames callbacks so the
+    car's rest motion is tunable without re-importing.  ``enabled=False`` (or a
+    zero ``frames``) removes the tail — the timeline shrinks back to the last
+    captured frame and the car freezes there.  The tail is persisted as a scene
+    prop so undo/reload recovery restores it.
+
+    Like every other live-retune entry point this MUST end in
+    :func:`_refresh_current_frame` — the playhead usually does not move, so
+    without it the viewport keeps showing the previous length/settle.
+    """
+    global _smooth_stop_frames
+    if frames is not None:
+        _smooth_stop_frames = max(0, int(round(float(frames))))
+    if enabled is not None and not enabled:
+        _smooth_stop_frames = 0
+
+    if _active is not None:
+        _active.set_smooth_stop(_smooth_stop_tail_cache())
+
+    if bpy is None:
+        return
+    scene = bpy.context.scene
+    if scene is None:
+        return
+    scene["_beamng_smooth_stop_frames"] = _smooth_stop_frames
+    _apply_timeline(scene)
+    _refresh_current_frame(scene)
 
 
 def update_tyre(**kwargs) -> None:
@@ -366,6 +416,7 @@ def _try_recover(scene) -> bool:
     Returns True if recovery succeeded (or wasn't needed).
     """
     global _active, _frame_start, _start_frame, _playback_fps, _output_fps
+    global _smooth_stop_frames
 
     # Already active — nothing to do
     if _active is not None:
@@ -388,6 +439,8 @@ def _try_recover(scene) -> bool:
         use_chunked = bool(scene.get("_beamng_use_chunked", False))
         _playback_fps = float(scene.get("_beamng_playback_fps", _playback_fps))
         _output_fps = float(scene.get("_beamng_output_fps", _output_fps))
+        _smooth_stop_frames = max(
+            0, int(round(float(scene.get("_beamng_smooth_stop_frames", 0)))))
         # Frames are canonical.  A .blend saved by the older seconds-based build
         # only has "_beamng_start_second", so convert it with the recovered
         # output_fps — otherwise reopening such a file would reset the offset.
@@ -493,6 +546,9 @@ def _try_recover(scene) -> bool:
         _active = playback
         _frame_start = frame_start
 
+        # Restore the smooth-stop tail so the settled rest keeps playing.
+        playback.set_smooth_stop(_smooth_stop_tail_cache())
+
         # Re-apply shattered panes so recovered playback collapses them too.
         panes = _load_shattered_panes(scene)
         if panes:
@@ -544,7 +600,8 @@ def _on_frame_change(scene, _depsgraph=None) -> None:  # pragma: no cover - Blen
 
 def attach(playback: CachePlayback, frame_start: int = 0,
            playback_fps: float = 24.0, output_fps: float = 24.0,
-           start_second: Optional[float] = None) -> None:
+           start_second: Optional[float] = None,
+           smooth_stop_frames: int = 0) -> None:
     """Register ``playback`` as the active sequence and hook the timeline.
 
     ``frame_start`` is the Blender frame that maps to cache frame 0 — the
@@ -564,9 +621,11 @@ def attach(playback: CachePlayback, frame_start: int = 0,
     if bpy is None:
         raise RuntimeError("frame handler requires Blender (bpy)")
     global _active, _frame_start, _start_frame, _playback_fps, _output_fps
+    global _smooth_stop_frames
     _active = playback
     _playback_fps = max(0.001, float(playback_fps))
     _output_fps = max(0.001, float(output_fps))
+    _smooth_stop_frames = max(0, int(round(float(smooth_stop_frames))))
     # Frames are canonical; the deprecated seconds spelling converts into them.
     _start_frame = (int(round(max(0.0, float(start_second)) * _output_fps))
                     if start_second is not None
@@ -593,10 +652,13 @@ def attach(playback: CachePlayback, frame_start: int = 0,
     scene.render.fps_base = 1.0
 
     # Timeline length in OUTPUT frames = duration_seconds * output_fps, where
-    # duration_seconds = (frame_count - 1) / playback_fps.
+    # duration_seconds = (frame_count - 1) / playback_fps.  The smooth-stop
+    # tail extends past the last captured frame.
     n_src = playback.reader.frame_count
     duration_s = (n_src - 1) / _playback_fps if n_src > 1 else 0.0
-    scene.frame_end = _frame_start + int(round(duration_s * _output_fps))
+    scene.frame_end = _frame_start + int(round(duration_s * _output_fps)) \
+        + _smooth_stop_frames
+    playback.set_smooth_stop(_smooth_stop_tail_cache())
 
     # Viewport-only nicety: play at real wall-clock speed (drop frames instead
     # of crawling) so the PREVIEW matches the render.  Has NO effect on the
@@ -610,6 +672,7 @@ def attach(playback: CachePlayback, frame_start: int = 0,
     scene["_beamng_use_chunked"] = playback._chunk_map is not None
     scene["_beamng_playback_fps"] = _playback_fps
     scene["_beamng_output_fps"] = _output_fps
+    scene["_beamng_smooth_stop_frames"] = _smooth_stop_frames
     _store_tyre(scene, playback.tyre)
 
 
@@ -625,14 +688,16 @@ def detach_handler() -> None:
 
 def detach() -> None:
     """Fully detach: remove handler and clear the active playback."""
-    global _active
+    global _active, _smooth_stop_frames
     detach_handler()
     _active = None
+    _smooth_stop_frames = 0
     # Clear stored state so _try_recover doesn't fire stale data
     if bpy is not None and bpy.context.scene is not None:
         keys = ["_beamng_cache_path", "_beamng_frame_start", "_beamng_start_frame",
                 "_beamng_start_second",  # legacy key from the seconds-based build
                 "_beamng_use_chunked", "_beamng_playback_fps", "_beamng_output_fps",
+                "_beamng_smooth_stop_frames",
                 _SHATTER_KEY, _SHATTER_RETAIN_KEY]
         keys += [f"_beamng_tyre_{k}" for k in _TYRE_KEYS]
         for key in keys:

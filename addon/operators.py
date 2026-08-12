@@ -93,9 +93,9 @@ def _crack_settings(context):
 def _live_timing(context):
     """Live frame mapping from the running handler, else the scene props.
 
-    Returns ``(frame_start, playback_fps, output_fps)``.  The frame handler
-    stores the values the user tuned live (including after a reload); before an
-    import the scene properties hold the intended values.
+    Returns ``(frame_start, playback_fps, output_fps, smooth_stop_frames)``.
+    The frame handler stores the values the user tuned live (including after a
+    reload); before an import the scene properties hold the intended values.
     """
     from runtime import frame_handler
 
@@ -105,11 +105,15 @@ def _live_timing(context):
             int(frame_handler._frame_start),
             float(frame_handler._playback_fps),
             float(frame_handler._output_fps),
+            int(frame_handler._smooth_stop_frames),
         )
     return (
         int(getattr(scene.beamng, "start_frame", 0)),
         float(getattr(scene.beamng, "playback_fps", 24)),
         float(getattr(scene.beamng, "output_fps", 60)),
+        int(getattr(scene.beamng, "car_smooth_stop_frames", 0))
+        if getattr(scene.beamng, "car_smooth_stop", False)
+        else 0,
     )
 
 
@@ -359,11 +363,15 @@ class BEAMNG_OT_import_cache(Operator):
             # retune it live (frame_handler.update_start_frame) with no
             # re-import and no seconds↔frames round-trip.
             start_frame = int(getattr(context.scene.beamng, "start_frame", 0))
+            smooth_stop_frames = int(getattr(
+                context.scene.beamng, "car_smooth_stop_frames", 0)) \
+                if getattr(context.scene.beamng, "car_smooth_stop", False) else 0
             frame_handler.attach(
                 playback,
                 frame_start=start_frame,
                 playback_fps=playback_fps,
                 output_fps=output_fps,
+                smooth_stop_frames=smooth_stop_frames,
             )
             playback.close_log()
 
@@ -642,7 +650,7 @@ class BEAMNG_OT_build_debris(Operator):
 
         scene = context.scene
         ground_shift = float(scene.get("_beamng_ground_shift", 0.0))
-        frame_start, playback_fps, output_fps = _live_timing(context)
+        frame_start, playback_fps, output_fps, _ = _live_timing(context)
 
         from runtime.cache_reader import CacheReader
         from runtime.impact_detect import detect_impacts, summarise

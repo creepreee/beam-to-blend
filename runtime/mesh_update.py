@@ -14,6 +14,8 @@ meshes live in a visible playback collection.
 """
 from pathlib import Path
 
+import math
+
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -319,6 +321,60 @@ def validate_chunk_map(chunk_map: Dict[str, List[str]],
 #  CachePlayback
 # ---------------------------------------------------------------------------
 
+# Number of trailing cache frames used to fit the car's residual oscillation for
+# the smooth-stop tail.  ~2.5 periods of the ~10-frame settle rock.
+_TAIL_FIT_WINDOW = 24
+# Period grid (cache frames) searched for the dominant oscillation.
+_TAIL_PERIOD_GRID = np.linspace(4.0, 30.0, 40)
+# Per-frame amplitude below which a degree of freedom counts as "already at
+# rest" (metres for translation, radians for rotation).
+_TAIL_AMPLITUDE_EPS = 1e-4
+# Dimensionless decay exponent of the tail envelope: e^{-LAMBDA·u}(1-u), so the
+# swing is down to ~25% of its amplitude halfway through and exactly zero rest
+# at the end (gradual, not a brake).
+_TAIL_LAMBDA = 1.5
+
+
+def _fit_sine_at(values: np.ndarray, omega: float,
+                 eps: Optional[float] = None) -> Optional[np.ndarray]:
+    """Least-squares ``c + Ac·cos(ωn) + As·sin(ωn)`` on the sample index grid.
+
+    Returns the 3-vector ``(c, Ac, As)``, or ``None`` when the series is too
+    short or (with ``eps``) has no variance above the noise threshold.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    if values.ndim != 1 or len(values) < 8:
+        return None
+    if eps is not None and np.ptp(values) < eps:
+        return None
+    n = np.arange(len(values), dtype=np.float64)
+    x = np.column_stack([np.ones_like(n), np.cos(omega * n), np.sin(omega * n)])
+    coef, *_ = np.linalg.lstsq(x, values, rcond=None)
+    return coef  # (c, Ac, As)
+
+
+def _average_quaternion(qs):
+    """Mean orientation of a sequence of quaternions (sign-aligned average).
+
+    Returns ``mathutils.Quaternion`` or ``None`` when the input is empty.
+    """
+    if not qs:
+        return None
+    base = qs[0]
+    w = x = y = z = 0.0
+    for q in qs:
+        # Align signs so antipodal quaternions (same rotation) don't cancel.
+        if q.w * base.w + q.x * base.x + q.y * base.y + q.z * base.z < 0:
+            q = mathutils.Quaternion((-q.w, -q.x, -q.y, -q.z))
+        w += q.w
+        x += q.x
+        y += q.y
+        z += q.z
+    out = mathutils.Quaternion((w, x, y, z))
+    out.normalize()
+    return out
+
+
 class CachePlayback:
     def __init__(self, reader: CacheReader,
                  collection_name: str = "BeamNG Cache",
@@ -345,9 +401,19 @@ class CachePlayback:
         #: polygons, and assigning a material to one pane inside a merged mesh
         #: is a per-FACE operation — see :func:`debris_spawn._apply_glass_crack`.
         self._chunk_member_faces: Dict[str, Dict[str, Tuple[int, int]]] = {}
-        self._current_frame: Optional[int] = None
+        self._current_frame: Optional[float] = None
         self._log_fh = None
         self._transform_empty: Optional["bpy.types.Object"] = None
+        #: Smooth-stop tail, in CACHE-frame units.  0 disables the settle: the
+        #: timeline ends exactly on the last captured frame and the car freezes
+        #: there.  When > 0, cache positions past ``frame_count - 1`` glide the
+        #: whole car (rigid pose AND vertex deformation) along its residual
+        #: motion with linearly-decaying velocity, converging to a full rest
+        #: ``tail`` cache-frames after the capture ends — no more instant stop.
+        self._smooth_stop_tail: float = 0.0
+        #: Fitted damped-sine continuation for the tail (see
+        #: :meth:`_compute_tail_fit`), or ``None`` when disabled/unfittable.
+        self._tail_fit: Optional[Dict] = None
         # Panes that have shattered: {member_name: cache_frame_it_broke}.  From
         # that frame on the member's vertices are collapsed to a point so the
         # intact glass disappears from the car and the spawned fragments take
@@ -706,6 +772,19 @@ class CachePlayback:
             obj.hide_render = True
         self._log_mesh_stats("DYNCREATE", name, mesh)
 
+    def _matrix_from_transform(self, tf: np.ndarray) -> "mathutils.Matrix":
+        """Build the Blender matrix_basis from a 12-float BVC transform block."""
+        px, py, pz = float(tf[0]), float(tf[1]), float(tf[2])
+        # The 12-float block is [px,py,pz, m00,m01,m02, m10,m11,m12, m20,m21,m22]
+        # row-major -> directly the Blender Matrix.
+        m = tf[3:12].reshape(3, 3).astype(np.float64)
+        return mathutils.Matrix((
+            (m[0, 0], m[0, 1], m[0, 2], px),
+            (m[1, 0], m[1, 1], m[1, 2], py),
+            (m[2, 0], m[2, 1], m[2, 2], pz),
+            (0.0, 0.0, 0.0, 1.0),
+        ))
+
     def _apply_transform(self, frame: int) -> None:
         """Animate the parent empty from per-frame transform data.
 
@@ -719,19 +798,142 @@ class CachePlayback:
         tf = self.reader.frame_transform(frame)
         if tf is None:
             return
-        px, py, pz = float(tf[0]), float(tf[1]), float(tf[2])
-        # The 12-float block is [px,py,pz, m00,m01,m02, m10,m11,m12, m20,m21,m22]
-        # row-major -> directly the Blender Matrix.
-        m = tf[3:12].reshape(3, 3).astype(np.float64)
-
-        mat = mathutils.Matrix((
-            (m[0, 0], m[0, 1], m[0, 2], px),
-            (m[1, 0], m[1, 1], m[1, 2], py),
-            (m[2, 0], m[2, 1], m[2, 2], pz),
-            (0.0, 0.0, 0.0, 1.0),
-        ))
-        self._transform_empty.matrix_basis = mat
+        self._transform_empty.matrix_basis = self._matrix_from_transform(tf)
         self._transform_empty.rotation_mode = "QUATERNION"
+
+    def set_smooth_stop(self, tail_cache: float) -> None:
+        """Configure the smooth-stop tail (in cache frames; 0 disables).
+
+        A non-zero tail lets timeline positions past the last captured frame
+        continue the car's residual SWING (the damped oscillation it is still
+        rocking through when the capture ends) and ease it to rest — instead of
+        freezing it mid-pose or sliding it rigidly to a stop.  Called live from
+        the panel checkbox/field (no re-import).
+
+        The oscillation (frequency, amplitude, phase) is fitted from the last
+        ``_TAIL_FIT_WINDOW`` captured transform frames, so the tail continues
+        whatever the car is actually doing.  A car that is genuinely at rest at
+        capture end (no measurable residual motion) gets a still tail — there is
+        nothing to settle.
+        """
+        self._smooth_stop_tail = max(0.0, float(tail_cache))
+        self._tail_fit = self._compute_tail_fit() if self._smooth_stop_tail > 0.0 else None
+        self._current_frame = None  # defeat the "same frame, return early" guard
+
+    def _compute_tail_fit(self) -> Optional[Dict]:
+        """Fit the car's residual oscillation from the recent captured frames.
+
+        Returns a dict of fitted curves (or ``None`` when there is no usable
+        rigid transform / not enough frames — then the tail eases vertices with
+        a default swing but no rigid continuation):
+
+        ``omega``       shared angular frequency (cache frames, radians/frame)
+        ``pos``         per-axis ``(c, Ac, As)`` for the root translation
+        ``rot_mean``    mean orientation quaternion
+        ``rot``         per-axis ``(c, Ac, As)`` for the rotation vector part
+                        (components of ``q_n · rot_mean⁻¹``, ≈ half-angles)
+        """
+        n_src = self.reader.frame_count
+        last = n_src - 1
+        if last < 2:
+            return None
+        start = max(0, n_src - _TAIL_FIT_WINDOW)
+        frames = list(range(start, n_src))
+        tfs = [self.reader.frame_transform(f) for f in frames]
+        if any(t is None for t in tfs):
+            return None  # cache has no rigid transform block
+
+        # --- shared omega from the root translation (best joint fit) ------
+        p = np.array([t[0:3] for t in tfs], dtype=np.float64)
+        best_sse, best_w = None, None
+        for period in _TAIL_PERIOD_GRID:
+            w = 2.0 * math.pi / period
+            sse = 0.0
+            for k in range(3):
+                c = _fit_sine_at(p[:, k], w)
+                n = np.arange(len(frames), dtype=np.float64)
+                resid = p[:, k] - (c[0] + c[1] * np.cos(w * n) + c[2] * np.sin(w * n))
+                sse += float(resid @ resid)
+            if best_sse is None or sse < best_sse:
+                best_sse, best_w = sse, w
+        if best_w is None:
+            return None
+
+        pos_fit = {k: _fit_sine_at(p[:, k], best_w) for k in range(3)}
+        amp = max((float(np.hypot(c[1], c[2])) for c in pos_fit.values()), default=0.0)
+
+        # --- rotation continuation about the mean orientation -------------
+        # The rotation offset of each frame from the mean, `q_n · rot_mean⁻¹`,
+        # has a small vector part (≈ axis·angle/2) that rocks with the swing;
+        # fit each component and continue it about the mean orientation.
+        qs = [self._matrix_from_transform(t).to_quaternion() for t in tfs]
+        q_mean = _average_quaternion(qs)
+        if q_mean is None:
+            return None
+        offs = np.array([(lambda o: (o.x, o.y, o.z))(q * q_mean.inverted())
+                         for q in qs], dtype=np.float64)
+        rot_comps = [_fit_sine_at(offs[:, k], best_w, eps=1e-6)
+                     for k in range(3)]
+        if any(c is None for c in rot_comps) or all(
+                float(np.hypot(c[1], c[2])) < _TAIL_AMPLITUDE_EPS
+                for c in rot_comps):
+            rot_fit = None
+        else:
+            rot_fit = {k: rot_comps[k] for k in range(3)}
+
+        return {
+            "omega": float(best_w),
+            "start": start,
+            "pos": pos_fit,
+            "rot_mean": q_mean,
+            "rot": rot_fit,
+            "amplitude": amp,
+        }
+
+    def _glide_transform(self, s: float, env: float, last: int
+                         ) -> Optional[np.ndarray]:
+        """Synthetic 12-float transform block for the eased swing pose.
+
+        Continues the per-axis damped sine fitted from the recent frames:
+        ``p = c + (Ac·cos(ω(t)) + As·sin(ω(t)))·env`` with ``t = last + s`` in
+        ABSOLUTE frame index (the fit's sample grid was ``frame - start``).
+        The rotation follows the mean orientation plus the same fitted swing on
+        its small vector part.  At ``env = 0`` (the end of the tail) this is the
+        oscillation CENTER: the pose the car rocks through and settles at, which
+        is exactly where the fitted swing is heading.
+        """
+        fit = self._tail_fit
+        if fit is None:
+            # No usable continuation (cache without transform data, or the car
+            # is genuinely at rest) — hold the final captured rigid pose.
+            return self.reader.frame_transform(last)
+        omega = fit["omega"]
+        start = fit["start"]
+        t = (last - start) + s          # absolute frame index in fit units
+        ct, st = math.cos(omega * t), math.sin(omega * t)
+        pos = np.empty(3, dtype=np.float64)
+        for k in range(3):
+            c, ac, as_ = fit["pos"][k]
+            pos[k] = c + (ac * ct + as_ * st) * env
+
+        q_mean = fit["rot_mean"]
+        if fit["rot"] is None or q_mean is None:
+            q = q_mean if q_mean is not None else mathutils.Quaternion()
+        else:
+            vx = vy = vz = 0.0
+            for k, comp in enumerate((fit["rot"][0], fit["rot"][1], fit["rot"][2])):
+                c, ac, as_ = comp
+                val = c + (ac * ct + as_ * st) * env
+                if k == 0:
+                    vx = val
+                elif k == 1:
+                    vy = val
+                else:
+                    vz = val
+            q = (q_mean * mathutils.Quaternion((1.0, vx, vy, vz))).normalized()
+
+        m = np.asarray(q.to_matrix(), dtype=np.float64).reshape(9)
+        return np.concatenate([pos, m]).astype(np.float64)
 
     # --- glass shatter ---------------------------------------------------
     def set_shattered_panes(self, panes: Dict[str, int],
@@ -822,6 +1024,14 @@ class CachePlayback:
             self._is_tyre[name] = hit
         return hit
 
+    def _set_tyre_basis(self, tf: Optional[np.ndarray]) -> None:
+        """(Re)compute the local→world-height basis from a transform block."""
+        if not self.tyre.enabled:
+            self._tyre_basis = None
+            return
+        up, offset = height_basis_from_transform(tf, ground_z=self.tyre.ground_z)
+        self._tyre_basis = (up, offset)
+
     def _update_tyre_basis(self, frame: int) -> None:
         """Recompute the local→world-height basis for *frame* (once per frame).
 
@@ -830,12 +1040,7 @@ class CachePlayback:
         a Z shift on each object.  Both have to be folded in before we can ask
         "how far is this vertex above the ground".
         """
-        if not self.tyre.enabled:
-            self._tyre_basis = None
-            return
-        tf = self.reader.frame_transform(frame)
-        up, offset = height_basis_from_transform(tf, ground_z=self.tyre.ground_z)
-        self._tyre_basis = (up, offset)
+        self._set_tyre_basis(self.reader.frame_transform(frame))
 
     def _deform_tyre(self, name: str, obj: "bpy.types.Object",
                      pos: np.ndarray, frame: int) -> np.ndarray:
@@ -853,19 +1058,156 @@ class CachePlayback:
         return out
 
     # --- per-frame update ---------------------------------------------
-    def set_frame(self, frame: int) -> None:
-        frame = max(0, min(frame, self.reader.frame_count - 1))
-        self._log(f"--- set_frame({frame})  current={self._current_frame} ---")
-        if frame == self._current_frame:
-            self._log("  (no change, returning early)")
+    def set_frame(self, pos: float) -> None:
+        """Advance playback to *pos* (cache-frame units; may overshoot the end).
+
+        Positions at or below ``frame_count - 1`` use the existing integer
+        cache frames (rounded).  Positions PAST the last frame enter the
+        smooth-stop tail when :meth:`set_smooth_stop` configured one: the car
+        keeps gliding along its residual motion (rigid pose AND vertex
+        deformation) with linearly-decaying velocity and comes to a full rest
+        exactly at ``last + tail``.  With no tail configured, overshooting just
+        holds the final cached pose (the old clamp behaviour).
+        """
+        pos = float(pos)
+        last = self.reader.frame_count - 1
+        if pos <= last:
+            frame = max(0, min(int(round(pos)), last))
+            if frame == self._current_frame:
+                self._log(f"--- set_frame({pos} -> cache {frame})  "
+                          f"current={self._current_frame}  (no change) ---")
+                return
+            self._log(f"--- set_frame({pos} -> cache {frame})  "
+                      f"current={self._current_frame} ---")
+            if self._chunk_map:
+                self._set_frame_chunked(frame)
+            else:
+                self._set_frame_individual(frame)
+            self._current_frame = frame
+        else:
+            if pos == self._current_frame:
+                self._log(f"--- set_frame({pos})  (no change, returning early) ---")
+                return
+            self._log(f"--- set_frame({pos}) glide past last={last} ---")
+            self._set_frame_glide(pos, last)
+            self._current_frame = pos
+
+    def _set_frame_glide(self, pos: float, last: int) -> None:
+        """Continue the car's residual SWING past the final captured frame.
+
+        With ``_smooth_stop_tail`` configured, cache position ``s`` past the end
+        keeps the damped oscillation the car was still rocking through when the
+        capture ended (fitted from the last ``_TAIL_FIT_WINDOW`` frames) and
+        eases it to rest: the amplitude envelope ``(1-u)·e^{-λu}`` starts at the
+        full fitted amplitude and reaches exactly zero at ``s == tail``, so the
+        swing gradually decays and stops — it does NOT brake in a straight line.
+
+        The rigid root transform continues its fitted per-axis sine; the vertex
+        deformation swings in phase with the same frequency (driven by each
+        vertex's own residual velocity, so nothing tears).  A car that is truly
+        at rest at capture end gets a still tail (nothing to settle).
+        """
+        tail = self._smooth_stop_tail
+        if tail <= 0:
+            # No settle configured — clamp to the final cached pose.
+            if self._chunk_map:
+                self._set_frame_chunked(last)
+            else:
+                self._set_frame_individual(last)
             return
+        prev = last - 1
+        s = max(0.0, pos - last)
+        u = 1.0 if s >= tail else s / tail
+        env = (1.0 - u) * math.exp(-_TAIL_LAMBDA * u)
+
+        tf = self._glide_transform(s, env, last)
+        if self._transform_empty is not None and tf is not None:
+            self._transform_empty.matrix_basis = self._matrix_from_transform(tf)
+            self._transform_empty.rotation_mode = "QUATERNION"
+        self._set_tyre_basis(tf)
+
+        # Scalar swing profile for the vertex deformation, in cache-frame
+        # units: starts with the residual velocity (k'(0)=1) and swings back
+        # and forth at the fitted frequency, decaying with the envelope.
+        fit = self._tail_fit
+        omega = fit["omega"] if fit else 2.0 * math.pi / max(2.0, min(10.0, tail))
+        k = (1.0 / omega) * math.sin(omega * s) * env
 
         if self._chunk_map:
-            self._set_frame_chunked(frame)
+            self._glide_chunked(last, prev, k)
         else:
-            self._set_frame_individual(frame)
+            self._glide_individual(last, prev, k)
 
-        self._current_frame = frame
+    def _glide_individual(self, last: int, prev: int, k: float) -> None:
+        for name, obj in self._objects.items():
+            v_last = self.reader.frame_positions(name, last)
+            if prev >= 0:
+                v_prev = self.reader.frame_positions(name, prev)
+                raw = v_last + (v_last - v_prev) * k
+            else:
+                raw = v_last
+            positions = self._gltf_to_blender(raw)
+            positions = self._deform_tyre(name, obj, positions, last)
+            # The rim band rides the glided geometry, so the collapsed glass
+            # keeps moving with the settling car instead of snapping away.
+            if self._shattered and last >= self._shattered.get(name, 1 << 30):
+                positions = self._collapse_shattered(name, positions)
+            flat = np.ascontiguousarray(positions, dtype=np.float32).reshape(-1)
+            _write_positions(obj.data, flat, obj)
+        for name, obj in self._dynamic_objects.items():
+            self._write_dynamic_frame(name, obj, last)
+
+    def _glide_chunked(self, last: int, prev: int, k: float) -> None:
+        for chunk_name, obj in self._chunks.items():
+            member_ranges = self._chunk_member_ranges[chunk_name]
+            parts = []
+            for mname, (start, end) in member_ranges.items():
+                v_last = self.reader.frame_positions(mname, last)
+                if prev >= 0:
+                    v_prev = self.reader.frame_positions(mname, prev)
+                    raw = v_last + (v_last - v_prev) * k
+                else:
+                    raw = v_last
+                pos = self._gltf_to_blender(raw)
+                pos = self._deform_tyre(mname, obj, pos, last)
+                if self._shattered and last >= self._shattered.get(mname, 1 << 30):
+                    pos = self._collapse_shattered(mname, pos)
+                parts.append(pos)
+            combined = np.concatenate(parts, axis=0)
+            flat = np.ascontiguousarray(combined, dtype=np.float32).reshape(-1)
+            _write_positions(obj.data, flat, obj)
+        for name, obj in self._dynamic_objects.items():
+            self._write_dynamic_frame(name, obj, last)
+
+    def _write_dynamic_frame(self, name: str, obj: "bpy.types.Object",
+                             frame: int) -> None:
+        """Render one dynamic (topology-changing) object for *frame*."""
+        positions, indices = self.reader.frame_dynamic_geometry(name, frame)
+        self._log_bounds("RAW_GLTF", name, frame, positions)
+        if len(positions) == 0:
+            obj.hide_viewport = True
+            obj.hide_render = True
+            self._log(f"  {name}: hidden (empty)")
+            return
+        obj.hide_viewport = False
+        obj.hide_render = False
+        mesh = obj.data
+        existing_vc = len(mesh.vertices)
+        new_vc = positions.shape[0]
+        existing_fc = len(mesh.polygons)
+        new_fc = indices.shape[0]
+        pos_blender = self._deform_tyre(
+            name, obj, self._gltf_to_blender(positions.copy()), frame)
+        if existing_vc != new_vc or existing_fc != new_fc:
+            mesh.clear_geometry()
+            _fill_mesh_via_bmesh(mesh, pos_blender, indices)
+            _finalize_mesh(mesh)
+            mesh.update_tag()
+            obj.update_tag()
+        else:
+            self._log_bounds("AFTER_XFORM", name, frame, pos_blender)
+            flat = np.ascontiguousarray(pos_blender, dtype=np.float32).reshape(-1)
+            _write_positions(mesh, flat, obj)
 
     def _set_frame_individual(self, frame: int) -> None:
         """Original per-object position update (96 calls)."""
@@ -895,38 +1237,7 @@ class CachePlayback:
                 self._log_bounds("BLENDER", name, frame, got.reshape(-1, 3))
 
         for name, obj in self._dynamic_objects.items():
-            positions, indices = self.reader.frame_dynamic_geometry(name, frame)
-            if logging:
-                self._log_bounds("RAW_GLTF", name, frame, positions)
-            if len(positions) == 0:
-                obj.hide_viewport = True
-                obj.hide_render = True
-                self._log(f"  {name}: hidden (empty)")
-                continue
-            obj.hide_viewport = False
-            obj.hide_render = False
-            mesh = obj.data
-            existing_vc = len(mesh.vertices)
-            new_vc = positions.shape[0]
-            existing_fc = len(mesh.polygons)
-            new_fc = indices.shape[0]
-            pos_blender = self._gltf_to_blender(positions.copy())
-            pos_blender = self._deform_tyre(name, obj, pos_blender, frame)
-            if existing_vc != new_vc or existing_fc != new_fc:
-                mesh.clear_geometry()
-                _fill_mesh_via_bmesh(mesh, pos_blender, indices)
-                _finalize_mesh(mesh)
-                mesh.update_tag()
-                obj.update_tag()
-            else:
-                flat = np.ascontiguousarray(pos_blender, dtype=np.float32).reshape(-1)
-                _write_positions(mesh, flat, obj)
-
-            if logging:
-                self._log_bounds("AFTER_XFORM", name, frame, pos_blender)
-                got = np.empty(len(mesh.vertices) * 3, dtype=np.float32)
-                mesh.vertices.foreach_get("co", got)
-                self._log_bounds("BLENDER", name, frame, got.reshape(-1, 3))
+            self._write_dynamic_frame(name, obj, frame)
 
     def _set_frame_chunked(self, frame: int) -> None:
         """Update chunk meshes (one foreach_set per chunk)."""
@@ -955,29 +1266,4 @@ class CachePlayback:
             _write_positions(obj.data, flat, obj)
 
         for name, obj in self._dynamic_objects.items():
-            positions, indices = self.reader.frame_dynamic_geometry(name, frame)
-            self._log_bounds("RAW_GLTF", name, frame, positions)
-            if len(positions) == 0:
-                obj.hide_viewport = True
-                obj.hide_render = True
-                self._log(f"  {name}: hidden (empty)")
-                continue
-            obj.hide_viewport = False
-            obj.hide_render = False
-            mesh = obj.data
-            existing_vc = len(mesh.vertices)
-            new_vc = positions.shape[0]
-            existing_fc = len(mesh.polygons)
-            new_fc = indices.shape[0]
-            pos_blender = self._deform_tyre(
-                name, obj, self._gltf_to_blender(positions.copy()), frame)
-            if existing_vc != new_vc or existing_fc != new_fc:
-                mesh.clear_geometry()
-                _fill_mesh_via_bmesh(mesh, pos_blender, indices)
-                _finalize_mesh(mesh)
-                mesh.update_tag()
-                obj.update_tag()
-            else:
-                self._log_bounds("AFTER_XFORM", name, frame, pos_blender)
-                flat = np.ascontiguousarray(pos_blender, dtype=np.float32).reshape(-1)
-                _write_positions(mesh, flat, obj)
+            self._write_dynamic_frame(name, obj, frame)

@@ -66,6 +66,18 @@ def _on_tyre_update(self, context):
         pass
 
 
+def _on_smooth_stop_update(self, context):
+    """Toggle/retune the smooth-stop tail on the LIVE handler (no re-import)."""
+    try:
+        from runtime import frame_handler
+        frame_handler.update_smooth_stop(
+            enabled=bool(self.car_smooth_stop),
+            frames=int(self.car_smooth_stop_frames),
+        )
+    except Exception:
+        pass
+
+
 class BeamNGSceneProperties(PropertyGroup):
     sequence_dir: StringProperty(
         name="Sequence Folder",
@@ -170,6 +182,29 @@ class BeamNGSceneProperties(PropertyGroup):
         max=240,
         soft_max=120,
         update=_on_output_fps_update,
+    )
+    car_smooth_stop: BoolProperty(
+        name="Smooth Car Stop",
+        description="Ease the car to a full rest after the last captured frame "
+                    "instead of freezing it instantly mid-pose. The car keeps "
+                    "gliding along its residual motion — sliding, tilting, "
+                    "settling — with velocity decaying smoothly to zero, so the "
+                    "crash ends with a natural settle rather than a snap. "
+                    "LIVE: toggling it takes effect immediately, no re-import.",
+        default=False,
+        update=_on_smooth_stop_update,
+    )
+    car_smooth_stop_frames: IntProperty(
+        name="Stop Frames",
+        description="Length of the smooth-stop tail (Blender timeline frames) "
+                    "added past the last captured frame. More frames = a longer, "
+                    "softer glide to rest; 0 = instant stop (as if the feature "
+                    "were off). About 30 is a gentle settle at 60 fps.",
+        default=30,
+        min=0,
+        max=600,
+        soft_max=180,
+        update=_on_smooth_stop_update,
     )
 
     # --- tyre ground-contact deformation -------------------------------
@@ -558,6 +593,9 @@ class BEAMNG_PT_main(Panel):
         box.prop(props, "start_frame")
         box.prop(props, "playback_fps")
         box.prop(props, "output_fps")
+        box.prop(props, "car_smooth_stop")
+        if props.car_smooth_stop:
+            box.prop(props, "car_smooth_stop_frames")
         # These three retune the imported cache in place (see
         # runtime.frame_handler.update_start_frame / update_fps), so say so —
         # otherwise the natural assumption is that they need a re-import.
