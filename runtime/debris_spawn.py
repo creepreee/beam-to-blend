@@ -1133,9 +1133,42 @@ def _spawn_hero_pieces(event: ImpactEvent, count: int,
         # rather than being lobbed upward — an upward component on every piece is
         # the single strongest firework cue, because it puts the whole spray on
         # matching rising arcs.
-        sep = dirs[i] * scatter * float(rng.uniform(0.4, 1.3))
+        #
+        # At speed=0 (default) the only separation was scatter ~0.18 m/s,
+        # which leaves pieces clumped.  Add a base separation kick and per-piece
+        # direction jitter so the spray fans naturally even without an explicit
+        # blast.  The cone direction already gives some spread; we rotate each
+        # piece's vector by a random angle around the cone axis (±25°) plus a
+        # small out-of-cone tilt (±12°) to break the radial pattern.
+        axis = np.array(event.direction, dtype=np.float64)
+        axis_norm = np.linalg.norm(axis)
+        axis = axis / axis_norm if axis_norm > 1e-9 else np.array((0.0, 0.0, 1.0))
+        theta = float(rng.uniform(-0.44, 0.44))  # ±25°
+        c, s = np.cos(theta), np.sin(theta)
+        # Rodrigues rotation of dirs[i] around axis by theta
+        dir_rot = (dirs[i] * c +
+                   np.cross(axis, dirs[i]) * s +
+                   axis * (axis @ dirs[i]) * (1 - c))
+        # Small out-of-cone tilt
+        tilt = float(rng.uniform(-0.21, 0.21))  # ±12°
+        # Find an axis perpendicular to dir_rot for the tilt
+        ref = np.array((0.0, 0.0, 1.0)) if abs(dir_rot[2]) < 0.9 else np.array((1.0, 0.0, 0.0))
+        tilt_axis = np.cross(dir_rot, ref)
+        tn = np.linalg.norm(tilt_axis)
+        if tn > 1e-9:
+            tilt_axis = tilt_axis / tn
+            dir_rot = (dir_rot * np.cos(tilt) +
+                       np.cross(tilt_axis, dir_rot) * np.sin(tilt) +
+                       tilt_axis * (tilt_axis @ dir_rot) * (1 - np.cos(tilt)))
+        dir_rot = dir_rot / np.linalg.norm(dir_rot)
+
+        # Base separation speed: even at speed=0, give a random outward kick
+        # so pieces don't fall as a tight cluster.
+        base_sep = scatter * float(rng.uniform(0.7, 1.6))
+        speed_mult = speed * float(rng.uniform(0.6, 1.35)) if speed > 0 else 0.0
+        sep = dir_rot * (base_sep + speed_mult)
         sep[2] = abs(sep[2]) * 0.25
-        vel = sep + dirs[i] * speed * float(rng.uniform(0.6, 1.35)) + inherited
+        vel = sep + inherited
         blast = bool(np.linalg.norm(vel) > 1e-4)
 
         # LAUNCH VELOCITY.  Blender's rigid body API exposes no initial
