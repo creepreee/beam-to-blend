@@ -504,6 +504,13 @@ def clear_debris() -> int:
         except Exception:
             scene.rigidbody_world = None
 
+    # Safety: remove any leftover debris emitters that might not have been
+    # cleaned up (e.g. if bake_particles wasn't called).
+    for obj in list(bpy.data.objects):
+        if obj.name.startswith("debris_emit_"):
+            bpy.data.objects.remove(obj, do_unlink=True)
+            removed += 1
+
     for mesh in list(bpy.data.meshes):
         if mesh.users == 0 and mesh.name.startswith("shard_"):
             bpy.data.meshes.remove(mesh)
@@ -1108,7 +1115,9 @@ def _spawn_hero_pieces(event: ImpactEvent, count: int,
         obj.data = tpl.data  # share mesh data; the transform makes it unique
         obj.name = f"debris_{event.material}_{spawn_frame}_{i:03d}"
 
-        jitter = rng.normal(0.0, 0.045, 3)
+        # Increase spawn jitter significantly: 4.5cm was too small, pieces overlapped
+        # at birth and got stuck together.  15-25cm gives proper initial separation.
+        jitter = rng.normal(0.0, 0.20, 3)
         spawn_at = origin + jitter
         rotation = tuple(rng.uniform(0.0, 2.0 * np.pi, 3))
         obj.rotation_euler = rotation
@@ -1163,8 +1172,9 @@ def _spawn_hero_pieces(event: ImpactEvent, count: int,
         dir_rot = dir_rot / np.linalg.norm(dir_rot)
 
         # Base separation speed: even at speed=0, give a random outward kick
-        # so pieces don't fall as a tight cluster.
-        base_sep = scatter * float(rng.uniform(0.7, 1.6))
+        # so pieces don't fall as a tight cluster.  Increased from 0.7-1.6
+        # to ensure separation at default scatter (0.45).
+        base_sep = scatter * float(rng.uniform(1.0, 2.0))
         speed_mult = speed * float(rng.uniform(0.6, 1.35)) if speed > 0 else 0.0
         sep = dir_rot * (base_sep + speed_mult)
         sep[2] = abs(sep[2]) * 0.25
@@ -1670,10 +1680,12 @@ def _spawn_glass_pane(part: str, tier: str, event: ImpactEvent,
                         * (0.3 + 1.4 * intensity))
         vel = away * (launch_speed + base_sep) * blow * float(rng.uniform(0.55, 1.4))
 
-        # Flatten the outward throw: glass falling out of a window should not be
-        # lobbed upward off the car.
-        vel[2] = min(vel[2], abs(vel[2]) * 0.2)
+        # Add inherited velocity BEFORE Z clamp so it's also flattened.
         vel = vel + part_vel * settings.inherit_velocity * intensity
+
+        # Flatten the outward throw: glass falling out of a window should not be
+        # lobbed upward off the car.  KILL all upward Z velocity entirely.
+        vel[2] = min(vel[2], 0.0)
 
         # Per-fragment position jitter: offset the start position slightly along
         # the pane plane so fragments don't all begin at the exact same point.
