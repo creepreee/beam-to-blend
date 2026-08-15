@@ -1348,12 +1348,12 @@ def _spawn_fine_particles(event: ImpactEvent, count: int,
     # scale, so this field carries ONLY the collision radius.
     st.particle_size = pradius if pcoll is not None else 1.0 * settings.scale
     # SIZE VARIATION scales the collision radius per particle as well as the
-    # render size, and the sunk deflector is calibrated for ONE radius — a 0.7
-    # spread would re-scatter the rest heights over the range the drop exists to
-    # remove (a 0.3x chip resting 70% of a radius low, i.e. back underground).
-    # The templates already differ in size and 8 variants are picked at random,
-    # so the spray keeps its variety without this.
-    st.size_random = 0.0 if pcoll is not None else 0.7
+    # render size. The sunk deflector is calibrated for ONE radius, so a spread
+    # would re-scatter rest heights during the live simulation — but the bake
+    # step (bake_particles) clamps every particle to the ground per-frame,
+    # fixing any penetration/hover from size variation. This gives the visual
+    # variety of a statistical spray without the half-submerged bug.
+    st.size_random = 0.35 if pcoll is not None else 0.7
     # Mass follows size, so big fragments carry momentum and small chips are
     # stopped by drag — without this every piece decelerates identically.
     st.use_multiply_size_mass = True

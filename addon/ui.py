@@ -451,10 +451,11 @@ class BeamNGDebrisProperties(PropertyGroup):
     debris_variants: IntProperty(
         name="Shard Variants",
         description="How many distinct shard meshes are generated per part and "
-                    "material. 8 gives good variety so shards don't all look "
-                    "identical; more = more visual variety but more memory. "
-                    "1 makes every shard share one shape",
-        default=8,
+                    "material. 16 gives good variety so the spray reads as a "
+                    "statistical cloud instead of repeated identical shapes; "
+                    "more = more variety but more memory. 1 makes every shard "
+                    "share one shape",
+        default=16,
         min=1,
         max=32,
     )
