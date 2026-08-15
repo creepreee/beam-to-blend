@@ -437,11 +437,18 @@ class CachePlayback:
         self._transform_empty: Optional["bpy.types.Object"] = None
         #: Smooth-stop tail, in CACHE-frame units.  0 disables the settle: the
         #: timeline ends exactly on the last captured frame and the car freezes
-        #: there.  When > 0, cache positions past ``frame_count - 1`` continue
-        #: the whole car's fitted oscillation (rigid pose AND vertex
-        #: deformation) with a shrinking amplitude, reaching a full rest
-        #: ``tail`` cache-frames after the capture ends — no more instant stop.
+        #: there.  When > 0, cache positions past the seam continue the whole
+        #: car's fitted oscillation (rigid pose AND vertex deformation) with a
+        #: shrinking amplitude, reaching a full rest ``tail`` cache-frames after
+        #: the seam — no more instant stop.
         self._smooth_stop_tail: float = 0.0
+        #: Seam (cache frame) at which the smooth-stop glide ONSET begins.
+        #: ``None`` means the default: the seam is the last captured frame
+        #: (``frame_count - 1``).  When set to an earlier frame the car settles
+        #: from that point instead, cutting the remaining captured motion in
+        #: favour of the damped continuation.  Only meaningful with a non-zero
+        #: ``_smooth_stop_tail``.
+        self._smooth_stop_start: Optional[float] = None
         #: Fitted sine continuation of the ROOT motion for the tail (see
         #: :meth:`_compute_tail_fit`), or ``None`` when disabled/unfittable.
         self._tail_fit: Optional[Dict] = None
@@ -835,26 +842,37 @@ class CachePlayback:
         self._transform_empty.matrix_basis = self._matrix_from_transform(tf)
         self._transform_empty.rotation_mode = "QUATERNION"
 
-    def set_smooth_stop(self, tail_cache: float) -> None:
+    def set_smooth_stop(self, tail_cache: float, start_cache: float = 0.0) -> None:
         """Configure the smooth-stop tail (in cache frames; 0 disables).
 
-        A non-zero tail lets timeline positions past the last captured frame
-        continue the car's residual SWING (the damped oscillation it is still
-        rocking through when the capture ends) and ease it to rest — instead of
-        freezing it mid-pose or sliding it rigidly to a stop.  Called live from
-        the panel checkbox/field (no re-import).
+        A non-zero tail lets timeline positions past the SEAM continue the car's
+        residual SWING (the damped oscillation it is still rocking through when
+        the smooth stop begins) and ease it to rest — instead of freezing it
+        mid-pose or sliding it rigidly to a stop.  Called live from the panel
+        checkbox/field (no re-import).
+
+        ``start_cache`` is the seam in cache-frame units: the smooth stop begins
+        *here* instead of at the end of the captured sequence.  ``0`` (or any
+        value past the last frame) leaves the seam at ``frame_count - 1`` — the
+        default behaviour.  Setting it earlier cuts the captured animation short
+        and starts the settle from that point.
 
         The oscillation (frequency, amplitude, phase) is fitted from the last
-        ``_TAIL_FIT_WINDOW`` captured transform frames, so the tail continues
-        whatever the car is actually doing.  A car that is genuinely at rest at
-        capture end (no measurable residual motion) gets a still tail — there is
-        nothing to settle.
+        ``_TAIL_FIT_WINDOW`` captured frames at-or-before the seam, so the tail
+        continues whatever the car is actually doing.  A car that is genuinely at
+        rest at the seam (no measurable residual motion) gets a still tail — there
+        is nothing to settle.
 
         The VERTEX deformation is fitted the same way, per vertex per axis
         (:meth:`_compute_tail_vfit`), rather than extrapolated from the last
         inter-frame step.  See that method for why the step is not usable.
         """
         self._smooth_stop_tail = max(0.0, float(tail_cache))
+        if self._smooth_stop_tail > 0.0 and start_cache > 0.0:
+            seam = min(start_cache, self.reader.frame_count - 1)
+            self._smooth_stop_start = max(0.0, float(seam))
+        else:
+            self._smooth_stop_start = None
         if self._smooth_stop_tail > 0.0:
             self._tail_fit = self._compute_tail_fit()
             self._tail_vfit = self._compute_tail_vfit(self._tail_omega())
@@ -881,10 +899,20 @@ class CachePlayback:
         return 2.0 * math.pi / tail
 
     def _tail_sample_frames(self) -> List[int]:
-        """Trailing cache frames used for every tail fit (root and vertex)."""
+        """Cache frames used for every tail fit (root and vertex).
+
+        Windowed on ``_TAIL_FIT_WINDOW`` frames ending at the smooth-stop seam
+        — which is ``frame_count - 1`` by default, or the user-specified start
+        frame when one is set.
+        """
         n_src = self.reader.frame_count
-        start = max(0, n_src - _TAIL_FIT_WINDOW)
-        return list(range(start, n_src))
+        seam = self._smooth_stop_start
+        if seam is None or seam >= n_src - 1:
+            start = max(0, n_src - _TAIL_FIT_WINDOW)
+            return list(range(start, n_src))
+        start = max(0, int(seam) - _TAIL_FIT_WINDOW)
+        end = min(n_src, int(seam) + 1)
+        return list(range(start, end))
 
     def _tail_member_names(self) -> List[str]:
         """Every stable member whose vertices the tail has to animate."""
@@ -1009,7 +1037,7 @@ class CachePlayback:
             return None
         return {"omega": float(omega), "start": frames[0], "members": out}
 
-    def _glide_positions(self, name: str, last: int, t: float, env: float
+    def _glide_positions(self, name: str, seam: int, t: float, env: float
                          ) -> Optional[np.ndarray]:
         """Vertex positions for tail time *t* (absolute fit units), or ``None``.
 
@@ -1018,10 +1046,10 @@ class CachePlayback:
 
             c + (Ac·cos(ωt) + As·sin(ωt) + seam)·env
 
-        At ``env = 1`` and ``t = t_last`` this is EXACTLY the final captured pose
+        At ``env = 1`` and ``t = t_last`` this is EXACTLY the seam pose
         (the residual cancels the fit error), so the tail starts where the
-        capture stopped; at ``env = 0`` every vertex sits exactly on its
-        oscillation CENTRE ``c`` — the pose the car settles into.
+        smooth stop onset begins; at ``env = 0`` every vertex sits exactly on
+        its oscillation CENTRE ``c`` — the pose the car settles into.
         """
         vfit = self._tail_vfit
         if vfit is None:
@@ -1047,13 +1075,17 @@ class CachePlayback:
         ``rot_mean``    mean orientation quaternion
         ``rot``         per-axis ``(c, Ac, As)`` for the rotation vector part
                         (components of ``q_n · rot_mean⁻¹``, ≈ half-angles)
+
+        The fit window is taken from :meth:`_tail_sample_frames`, which honours
+        the smooth-stop seam — defaulting to the last captured frames but
+        shrinking to the frames at-or-before an earlier seam when the user
+        starts the settle sooner.
         """
-        n_src = self.reader.frame_count
-        last = n_src - 1
-        if last < 2:
+        frames = self._tail_sample_frames()
+        if len(frames) < 8:
             return None
-        start = max(0, n_src - _TAIL_FIT_WINDOW)
-        frames = list(range(start, n_src))
+        start = frames[0]
+        seam = frames[-1]
         tfs = [self.reader.frame_transform(f) for f in frames]
         if any(t is None for t in tfs):
             return None  # cache has no rigid transform block
@@ -1105,12 +1137,12 @@ class CachePlayback:
             "amplitude": amp,
         }
 
-    def _glide_transform(self, s: float, env: float, last: int
+    def _glide_transform(self, s: float, env: float, seam: float
                          ) -> Optional[np.ndarray]:
         """Synthetic 12-float transform block for the shrinking swing pose.
 
         Continues the per-axis sine fitted from the recent frames:
-        ``p = c + (Ac·cos(ω(t)) + As·sin(ω(t)))·env`` with ``t = last + s`` in
+        ``p = c + (Ac·cos(ω(t)) + As·sin(ω(t)))·env`` with ``t = seam + s`` in
         ABSOLUTE frame index (the fit's sample grid was ``frame - start``).
         The rotation follows the mean orientation plus the same fitted swing on
         its small vector part.  Only ``env`` decays, so the car keeps rocking to
@@ -1121,11 +1153,11 @@ class CachePlayback:
         fit = self._tail_fit
         if fit is None:
             # No usable continuation (cache without transform data, or the car
-            # is genuinely at rest) — hold the final captured rigid pose.
-            return self.reader.frame_transform(last)
+            # is genuinely at rest) — hold the seam rigid pose.
+            return self.reader.frame_transform(int(seam))
         omega = fit["omega"]
         start = fit["start"]
-        t = (last - start) + s          # absolute frame index in fit units
+        t = (seam - start) + s          # absolute frame index in fit units
         ct, st = math.cos(omega * t), math.sin(omega * t)
         pos = np.empty(3, dtype=np.float64)
         for k in range(3):
@@ -1275,19 +1307,26 @@ class CachePlayback:
 
     # --- per-frame update ---------------------------------------------
     def set_frame(self, pos: float) -> None:
-        """Advance playback to *pos* (cache-frame units; may overshoot the end).
+        """Advance playback to *pos* (cache-frame units; may pass the seam).
 
-        Positions at or below ``frame_count - 1`` use the existing integer
-        cache frames (rounded).  Positions PAST the last frame enter the
-        smooth-stop tail when :meth:`set_smooth_stop` configured one: the car
-        keeps gliding along its residual motion (rigid pose AND vertex
-        deformation) with linearly-decaying velocity and comes to a full rest
-        exactly at ``last + tail``.  With no tail configured, overshooting just
-        holds the final cached pose (the old clamp behaviour).
+        Positions at or below the smooth-stop seam use the existing integer
+        cache frames (rounded).  Positions PAST the seam enter the smooth-stop
+        tail when :meth:`set_smooth_stop` configured one: the car keeps gliding
+        along its residual motion (rigid pose AND vertex deformation) with
+        linearly-decaying velocity and comes to a full rest exactly at the seam
+        plus the tail length.  With no tail configured, overshooting just holds
+        the seam pose.
+
+        The seam defaults to the last captured frame, but can be set earlier via
+        :meth:`set_smooth_stop`'s ``start_cache`` — in which case the smooth stop
+        begins at that frame instead, cutting the remaining captured motion in
+        favour of the damped continuation.
         """
         pos = float(pos)
         last = self.reader.frame_count - 1
-        if pos <= last:
+        seam = (self._smooth_stop_start if self._smooth_stop_start is not None
+                else float(last))
+        if pos <= seam:
             frame = max(0, min(int(round(pos)), last))
             if frame == self._current_frame:
                 self._log(f"--- set_frame({pos} -> cache {frame})  "
@@ -1304,17 +1343,17 @@ class CachePlayback:
             if pos == self._current_frame:
                 self._log(f"--- set_frame({pos})  (no change, returning early) ---")
                 return
-            self._log(f"--- set_frame({pos}) glide past last={last} ---")
-            self._set_frame_glide(pos, last)
+            self._log(f"--- set_frame({pos}) glide past seam={seam} ---")
+            self._set_frame_glide(pos, seam)
             self._current_frame = pos
 
-    def _set_frame_glide(self, pos: float, last: int) -> None:
-        """Continue the car's residual SWING past the final captured frame.
+    def _set_frame_glide(self, pos: float, seam: float) -> None:
+        """Continue the car's residual SWING past the smooth-stop seam.
 
-        With ``_smooth_stop_tail`` configured, cache position ``s`` past the end
-        keeps the oscillation the car was still rocking through when the capture
-        ended — fitted in amplitude AND phase from the last ``_TAIL_FIT_WINDOW``
-        frames — and shrinks it to rest.  Both the rigid root and every vertex
+        With ``_smooth_stop_tail`` configured, cache position ``s`` past the seam
+        keeps the oscillation the car was still rocking through when the smooth
+        stop begins — fitted in amplitude AND phase from the frames at-or-before
+        the seam — and shrinks it to rest.  Both the rigid root and every vertex
         continue their own fitted sine; only the AMPLITUDE is scaled down, by
         :func:`_tail_envelope`.  So the car keeps rocking both ways the whole
         time, each swing smaller than the last::
@@ -1324,74 +1363,74 @@ class CachePlayback:
         It does not brake in a straight line, and it does not drop to a small
         swing at the seam and then decay that: ``env(0) = 1`` means the first
         tail frame continues the swing at exactly the size it already had.
-        A car that is truly at rest at capture end gets a still tail (nothing to
+        A car that is truly at rest at the seam gets a still tail (nothing to
         settle).
         """
         tail = self._smooth_stop_tail
         if tail <= 0:
-            # No settle configured — clamp to the final cached pose.
+            # No settle configured — clamp to the seam pose.
             if self._chunk_map:
-                self._set_frame_chunked(last)
+                self._set_frame_chunked(int(seam))
             else:
-                self._set_frame_individual(last)
+                self._set_frame_individual(int(seam))
             return
-        s = max(0.0, pos - last)
+        s = max(0.0, pos - seam)
         u = 1.0 if s >= tail else s / tail
         env = _tail_envelope(u)
 
-        tf = self._glide_transform(s, env, last)
+        tf = self._glide_transform(s, env, seam)
         if self._transform_empty is not None and tf is not None:
             self._transform_empty.matrix_basis = self._matrix_from_transform(tf)
             self._transform_empty.rotation_mode = "QUATERNION"
         self._set_tyre_basis(tf)
 
         # Absolute phase for the vertex fit: its sample grid was `frame - start`,
-        # so continuing past the end means t = (last - start) + s.  Using the
+        # so continuing past the seam means t = (seam - start) + s.  Using the
         # same phase convention as the root keeps vertices and root in step.
         vfit = self._tail_vfit
-        t = ((last - vfit["start"]) + s) if vfit is not None else s
+        t = ((seam - vfit["start"]) + s) if vfit is not None else s
 
         if self._chunk_map:
-            self._glide_chunked(last, t, env)
+            self._glide_chunked(int(seam), t, env)
         else:
-            self._glide_individual(last, t, env)
+            self._glide_individual(int(seam), t, env)
 
-    def _glide_individual(self, last: int, t: float, env: float) -> None:
+    def _glide_individual(self, seam: int, t: float, env: float) -> None:
         for name, obj in self._objects.items():
-            raw = self._glide_positions(name, last, t, env)
+            raw = self._glide_positions(name, seam, t, env)
             if raw is None:
                 # Nothing fitted for this member (too few frames, or a cache
-                # that cannot serve it) — hold its final captured pose.
-                raw = self.reader.frame_positions(name, last)
+                # that cannot serve it) — hold its seam pose.
+                raw = self.reader.frame_positions(name, seam)
             positions = self._gltf_to_blender(raw)
-            positions = self._deform_tyre(name, obj, positions, last)
+            positions = self._deform_tyre(name, obj, positions, seam)
             # The rim band rides the glided geometry, so the collapsed glass
             # keeps moving with the settling car instead of snapping away.
-            if self._shattered and last >= self._shattered.get(name, 1 << 30):
+            if self._shattered and seam >= self._shattered.get(name, 1 << 30):
                 positions = self._collapse_shattered(name, positions)
             flat = np.ascontiguousarray(positions, dtype=np.float32).reshape(-1)
             _write_positions(obj.data, flat, obj)
         for name, obj in self._dynamic_objects.items():
-            self._write_dynamic_frame(name, obj, last)
+            self._write_dynamic_frame(name, obj, seam)
 
-    def _glide_chunked(self, last: int, t: float, env: float) -> None:
+    def _glide_chunked(self, seam: int, t: float, env: float) -> None:
         for chunk_name, obj in self._chunks.items():
             member_ranges = self._chunk_member_ranges[chunk_name]
             parts = []
             for mname, (start, end) in member_ranges.items():
-                raw = self._glide_positions(mname, last, t, env)
+                raw = self._glide_positions(mname, seam, t, env)
                 if raw is None:
-                    raw = self.reader.frame_positions(mname, last)
+                    raw = self.reader.frame_positions(mname, seam)
                 pos = self._gltf_to_blender(raw)
-                pos = self._deform_tyre(mname, obj, pos, last)
-                if self._shattered and last >= self._shattered.get(mname, 1 << 30):
+                pos = self._deform_tyre(mname, obj, pos, seam)
+                if self._shattered and seam >= self._shattered.get(mname, 1 << 30):
                     pos = self._collapse_shattered(mname, pos)
                 parts.append(pos)
             combined = np.concatenate(parts, axis=0)
             flat = np.ascontiguousarray(combined, dtype=np.float32).reshape(-1)
             _write_positions(obj.data, flat, obj)
         for name, obj in self._dynamic_objects.items():
-            self._write_dynamic_frame(name, obj, last)
+            self._write_dynamic_frame(name, obj, seam)
 
     def _write_dynamic_frame(self, name: str, obj: "bpy.types.Object",
                              frame: int) -> None:

@@ -124,6 +124,48 @@ def _lowest_point_offset(template: "bpy.types.Object",
     return float(min(0.0, (co @ basis.T)[:, 2].min()))
 
 
+def _local_verts(obj: "bpy.types.Object",
+                 _cache: Dict[str, np.ndarray] = {}) -> Optional[np.ndarray]:
+    """Object-space vertices of ``obj`` as an ``(N, 3)`` float64 array.
+
+    Cached by mesh name.  The bake calls this once per body per frame across
+    hundreds of bodies and thousands of frames, and ``foreach_get`` on a fresh
+    buffer every time is what turns the ground-snap pass from seconds into
+    minutes.  Hero shards deliberately SHARE mesh data between instances (see
+    :func:`_spawn_hero_pieces`), so the cache hit rate is high.
+    """
+    mesh = getattr(obj, "data", None)
+    count = len(mesh.vertices) if mesh is not None else 0
+    if not count:
+        return None
+    hit = _cache.get(mesh.name)
+    if hit is not None and len(hit) == count:
+        return hit
+    co = np.empty(count * 3, dtype=np.float64)
+    mesh.vertices.foreach_get("co", co)
+    co = co.reshape(-1, 3)
+    _cache[mesh.name] = co
+    return co
+
+
+def _lowest_world_z(obj: "bpy.types.Object", mat) -> Optional[float]:
+    """World Z of the body's LOWEST vertex under world matrix ``mat``.
+
+    The spawn-time :func:`_lowest_point_offset` only understands an euler plus a
+    uniform scale, which is all a freshly-placed shard has.  A BAKED body has an
+    arbitrary rotation from the solver, so its lowest point has to be measured
+    from the full 4x4 — the offset under the spawn rotation says nothing about
+    the offset after the piece has tumbled.
+    """
+    co = _local_verts(obj)
+    if co is None:
+        return None
+    m = np.array(mat, dtype=np.float64)  # 4x4, row-major
+    # Only the Z row is needed: z = m[2,0]x + m[2,1]y + m[2,2]z + m[2,3]
+    z = co @ m[2, :3] + m[2, 3]
+    return float(z.min())
+
+
 def _linearise(obj: "bpy.types.Object", data_path: str) -> None:
     """Force LINEAR interpolation on every key of ``data_path``.
 
@@ -434,7 +476,8 @@ def clear_debris() -> int:
     if bpy is None:
         return 0
     removed = 0
-    for coll_name in (DEBRIS_COLLECTION, SHARD_COLLECTION, GLASS_COLLECTION):
+    for coll_name in (DEBRIS_COLLECTION, SHARD_COLLECTION,
+                      PARTICLE_SHARD_COLLECTION, GLASS_COLLECTION):
         coll = bpy.data.collections.get(coll_name)
         if coll is None:
             continue
@@ -443,10 +486,11 @@ def clear_debris() -> int:
             removed += 1
         bpy.data.collections.remove(coll)
 
-    ground = bpy.data.objects.get(GROUND_NAME)
-    if ground is not None:
-        bpy.data.objects.remove(ground, do_unlink=True)
-        removed += 1
+    for name in (GROUND_NAME, PARTICLE_GROUND_NAME):
+        ground = bpy.data.objects.get(name)
+        if ground is not None:
+            bpy.data.objects.remove(ground, do_unlink=True)
+            removed += 1
 
     # Drop the rigid body world so a re-run starts from a clean solver.
     scene = bpy.context.scene
@@ -540,9 +584,320 @@ def _ensure_ground(settings: DebrisSettings) -> "bpy.types.Object":
         # unlike the rigid-body slab, has no thickness to catch it once past.
         # Thickening the outer zone deflects the particle while it is still
         # above the plane (measured: shards at z=-40 with the default 0.02).
+        #
+        # ``thickness_outer`` is an absolute distance in METRES, and it stacks on
+        # top of the collision radius: a particle rests at ``radius + outer``
+        # above the plane.  With radius collision enabled (see
+        # :func:`_ensure_particle_templates`) 0.12 m of it would park every chip
+        # a hand's width in the air — the exact hovering failure the radius
+        # change exists to remove — so :func:`_disable_ground_particle_collision`
+        # removes this modifier entirely once the sunk particle deflector exists.
+        # The value here is the
+        # point-collision default, which is what a build with no scaled
+        # templates falls back to.
         ground.collision.thickness_outer = 0.12
         ground.collision.thickness_inner = 0.06
     return ground
+
+
+#: Separate deflector for the fine particles, sunk below the visible ground.
+#: See :func:`_ensure_particle_ground`.
+PARTICLE_GROUND_NAME = "BeamNG_DebrisGround_Particles"
+
+
+def _ensure_particle_ground(settings: DebrisSettings, radius: float,
+                            drop: float, suffix: str = "",
+                            ) -> Optional["bpy.types.Object"]:
+    """Deflector for the particles, sunk so their SHARDS land on ``ground_z``.
+
+    Colliding on a radius stops chips sinking, but it introduces the opposite
+    error: the solver rests the particle's SPHERE on the plane, while the flat
+    shard drawn inside that sphere extends less than a radius downward, so the
+    piece floats by the difference (measured ~20 mm — visible, and the contact
+    shadow still detaches).  The radius cannot simply be shrunk to fix it: it is
+    also the anti-tunnelling buffer, and a radius smaller than the shard's own
+    extent puts the piece back under the ground.
+
+    The two jobs come apart by moving the PLANE instead of the radius.  This
+    deflector sits ``drop`` below the visible ground, where ``drop`` is the
+    systematic hover measured from the geometry, so a chip resting on it lands
+    its shard on ``ground_z``.  It cannot be the same object as the rigid-body
+    ground — the hero shards must keep colliding with the true surface, and they
+    are baked and ground-snapped separately.
+
+    ONE PLANE PER MATERIAL.  ``drop`` is derived from the shard size, and the
+    libraries span a 10x range (glass 12-55 mm, paint 30-130 mm), so a single
+    shared plane would be right for one material and wrong for the rest.  Blender
+    deflects a particle against EVERY collider in the scene, so these cannot
+    simply be stacked at different heights — a glass chip would stop on the
+    paint plane if that one happened to be higher.  Each is therefore restricted
+    to its own emitter's particles via the collision collection set on the
+    particle system (see ``_spawn_fine_particles``).
+
+    ``hide_render``/``hide_viewport`` are both left on: a COLLISION modifier
+    keeps deflecting while the object is hidden from the render, and this slab
+    is a physics proxy that must never appear in a shot.
+    """
+    if bpy is None or radius <= 0.0:
+        return None
+    name = f"{PARTICLE_GROUND_NAME}{suffix}"
+    ground = bpy.data.objects.get(name)
+    if ground is None:
+        mesh = bpy.data.meshes.new(name)
+        size = 400.0
+        mesh.from_pydata([(-size, -size, 0.0), (size, -size, 0.0),
+                          (size, size, 0.0), (-size, size, 0.0)],
+                         [], [(0, 1, 2, 3)])
+        mesh.update()
+        ground = bpy.data.objects.new(name, mesh)
+        _get_collection(DEBRIS_COLLECTION).objects.link(ground)
+    ground.location = (0.0, 0.0, settings.ground_z - drop)
+    ground.hide_render = True
+    ground.display_type = "WIRE"
+
+    if not any(m.type == "COLLISION" for m in ground.modifiers):
+        ground.modifiers.new(name="Collision", type="COLLISION")
+    col = getattr(ground, "collision", None)
+    if col is not None:
+        bounciness = float(np.clip(settings.bounciness, 0.0, 1.0))
+        col.damping_factor = 1.0 - 0.85 * bounciness
+        col.damping_random = 0.15 * bounciness
+        col.friction_factor = float(np.clip(
+            settings.friction + 0.6 * (1.0 - bounciness), 0.0, 5.0))
+        col.permeability = 0.0
+        col.damping = 0.6
+        # The radius now supplies the standoff that the thick skin used to, so
+        # the skin drops to a thin safety margin.  See _ensure_particle_ground,
+        # which builds the per-material deflector that replaces this one.
+        col.thickness_outer = max(0.001, min(0.02, radius * 0.25))
+        col.thickness_inner = max(0.001, col.thickness_outer * 0.5)
+    return ground
+
+
+def _disable_ground_particle_collision() -> None:
+    """Stop the MAIN ground deflecting particles, once the sunk one exists.
+
+    The two deflectors are at different heights, and a falling chip stops at
+    whichever it meets first — which is the higher, main one.  Leaving both
+    active silently defeats the sunk plane: the particles rest a radius above
+    ``ground_z`` exactly as they did before, and the offset looks like it had no
+    effect at all.
+
+    Only the COLLISION modifier is removed.  The main ground keeps its PASSIVE
+    rigid body, which is what the hero shards and glass fragments collide with —
+    those are baked and ground-snapped, and must land on the true surface.
+    """
+    ground = bpy.data.objects.get(GROUND_NAME) if bpy is not None else None
+    if ground is None:
+        return
+    for mod in list(ground.modifiers):
+        if mod.type == "COLLISION":
+            ground.modifiers.remove(mod)
+
+
+#: Collection of shard templates pre-scaled for the PARTICLE system.  See
+#: :func:`_ensure_particle_templates` for why this cannot be the same collection
+#: the hero pieces instance from.
+PARTICLE_SHARD_COLLECTION = "BeamNG Debris Shards (Particles)"
+
+
+#: Percentile of the shards' DOWNWARD extent used as the particle collision
+#: radius.  See :func:`_shard_radius` for why it is not the bounding radius and
+#: not the median.
+_SHARD_RADIUS_PCT = 70.0
+
+#: Percentile of the extents used to compute the deflector ``drop`` — the
+#: systematic hover the radius leaves, which the sunk plane cancels.  See the
+#: comment block inside :func:`_ensure_particle_templates`.
+_SHARD_DROP_PCT = 65.0
+
+#: Random orientations sampled per template when measuring that extent.  A
+#: particle lands at an arbitrary angle, so the extent has to be averaged over
+#: orientations rather than read off the template's rest pose.
+_RADIUS_ORIENTATIONS = 24
+
+
+def _shard_extents(objs: Sequence["bpy.types.Object"],
+                   seed: int = 0) -> np.ndarray:
+    """How far each template extends BELOW its own centre, over random landings.
+
+    A particle comes to rest at an arbitrary orientation, so the quantity that
+    decides whether the shard drawn around it looks buried or floating is this
+    per-orientation downward extent — not anything measurable from the
+    template's rest pose.  Returned as a flat array over (template x
+    orientation) so callers can take whatever statistic they need.
+    """
+    rng = np.random.default_rng(seed)
+    out: List[float] = []
+    for obj in objs:
+        co = _local_verts(obj)
+        if co is None:
+            continue
+        # Random rotations via normalised quaternions (uniform on SO(3)).
+        q = rng.normal(size=(_RADIUS_ORIENTATIONS, 4))
+        q /= np.linalg.norm(q, axis=1, keepdims=True)
+        w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+        # Only the matrix's Z row matters — it is what projects onto the ground
+        # normal — so build that directly instead of the full basis.
+        zrow = np.stack([2 * (x * z - y * w),
+                         2 * (y * z + x * w),
+                         1 - 2 * (x * x + y * y)], axis=1)   # (K, 3)
+        out.extend((-(co @ zrow.T).min(axis=0)).tolist())
+    return np.asarray(out, dtype=np.float64)
+
+
+def _shard_radius(objs: Sequence["bpy.types.Object"],
+                  seed: int = 0) -> float:
+    """Collision radius that lands a tumbling shard closest to flat on the plane.
+
+    A NEWTON particle collides as a SPHERE, but a shard is a flat, jagged plate
+    — so no single radius is right for every landing.  What the radius should
+    approximate is how far the piece extends BELOW ITS OWN CENTRE once it comes
+    to rest at whatever angle it happened to land at, which is measured here by
+    sampling random orientations of each template.
+
+    Why not the bounding radius (origin to farthest vertex).  That is the
+    distance to a CORNER, and a flat plate resting on its face extends only a
+    fraction of that downward, so the sphere holds the piece up in the air by
+    the difference: measured 16-21 mm of median hover across the materials, and
+    up to 46 mm at p90.  Trading "half sunk" for "visibly floating" is not a
+    fix — the shadow still detaches.
+
+    Why not the median extent either.  It centres the error on zero, but the
+    distribution is skewed: half the pieces then sink, by up to 23-30 mm at p90.
+    A shard poking through the ground reads as a bug, while the same distance of
+    hover reads merely as a small piece resting on a chip below it, so the
+    percentile is pushed above the median to buy sink-resistance cheaply.  At
+    p70 the worst-case sink drops to 13-21 mm and hover stays under 23 mm —
+    both roughly HALF the current point-collision burial (17-27 mm median,
+    40-57 mm at p90), which is what makes this worth doing at all.
+    """
+    extents = _shard_extents(objs, seed=seed)
+    if not len(extents):
+        return 0.02
+    return float(np.percentile(extents, _SHARD_RADIUS_PCT))
+
+
+def _ensure_particle_templates(
+        settings: DebrisSettings,
+        key: str = "",
+        templates: Optional[Sequence["bpy.types.Object"]] = None,
+        cache: Optional[Dict[str, Tuple]] = None,
+) -> Tuple[Optional["bpy.types.Collection"], float, float]:
+    """Shard templates pre-scaled so particles can collide with a real radius.
+
+    THE HALF-SUBMERGED PARTICLE BUG.  ``ParticleSettings.particle_size`` is
+    ONE number doing TWO jobs: it is the render scale applied to the instanced
+    object AND (with ``use_size_deflect``) the collision radius.  The shard
+    templates are modelled at their true size, so the render job pins it at
+    ~1.0 — and a 1 m collision radius is absurd, which is why the previous fix
+    attempt (just switching ``use_size_deflect`` on) left chips resting at
+    z = 0.35-0.75, hovering half a metre up.  Turning it back OFF collides the
+    particle as a POINT, so the solver rests the shard's CENTRE on the ground
+    and the instance drawn around that centre is exactly half buried — which is
+    precisely the "not a quarter, not too little, exactly half submerged" in the
+    reference screenshot.
+
+    The two jobs are separable by changing the templates instead of the number.
+    A copy of each template scaled UP by ``1/r`` renders at true size when
+    ``particle_size = r``::
+
+        rendered = template_scale x particle_size = (size/r) x r = size
+
+    while the collision radius becomes ``r`` — the shard's actual radius — so a
+    settled chip rests TOUCHING the plane.  The copies must live in their own
+    collection: the hero pieces instance the unscaled originals and would be
+    inflated by ``1/r`` (a 50x blow-up) if this reused SHARD_COLLECTION.
+
+    PER (part, material), not once globally.  The libraries span a 10x size
+    range — glass shards are 12-55 mm, paint flakes 30-130 mm — and one radius
+    across all of them fits none: it buries the glass and floats the paint.  The
+    emitters are already per-material, so each gets templates scaled to its own
+    material's radius.  ``cache`` memoises by ``key`` so the work is done once
+    per library rather than once per impact.
+
+    Returns ``(collection, radius, drop)``.  ``drop`` is the residual hover the
+    radius leaves — the solver rests the SPHERE on the plane while the flatter
+    shard inside reaches less far down — which :func:`_ensure_particle_ground`
+    cancels by sinking the particles' deflector.  The collection is ``None``
+    when there are no templates to scale, in which case the caller keeps point
+    collision.
+    """
+    if cache is not None and key in cache:
+        return cache[key]
+
+    src = list(templates) if templates else None
+    if not src:
+        coll_src = bpy.data.collections.get(SHARD_COLLECTION)
+        src = list(coll_src.objects) if coll_src is not None else []
+    if not src:
+        return None, 0.0, 0.0
+
+    scale = max(1e-6, float(settings.scale))
+    extents = _shard_extents(src, seed=settings.seed) * scale
+    if not len(extents):
+        return None, 0.0, 0.0
+    radius = float(np.percentile(extents, _SHARD_RADIUS_PCT))
+    if radius <= 1e-6:
+        return None, 0.0, 0.0
+    # THE REST HEIGHT IS EXACTLY ``particle_size``.  Measured in Blender 4.5:
+    # a settled particle's CENTRE comes to rest at radius + 0.1 mm, and that is
+    # invariant under both the deflector's ``thickness_outer`` (tried 1-20 mm:
+    # rest height did not move) and the particle's own orientation — the solver
+    # deflects a SPHERE and neither the skin thickness nor the instanced mesh
+    # enters the calculation.
+    #
+    # So the hover is not a statistical effect to be minimised, it is a constant
+    # to be cancelled: the centre sits at ``radius`` while the shard drawn
+    # around it reaches ``median(extents)`` below that centre.  Sinking the
+    # deflector by the difference puts the typical shard's lowest point exactly
+    # on ``ground_z``.  Only the spread of extents remains, which is what
+    # _SHARD_RADIUS_PCT trades off.
+    #
+    # The percentile trades the two directions off.  Measured sink/hover at p90
+    # of the extents (mm, glass / paint / steel):
+    #
+    #     p50   13.7/7.4   18.9/16.5   13.3/11.4
+    #     p65   10.2/11.0  13.0/22.4    9.4/15.4   <- balanced
+    #     p80    5.8/15.4   5.8/29.5    4.7/20.0
+    #
+    # p65 sits where the two are about equal for glass — the material with the
+    # most pieces on screen — and it keeps the worst-case sink well under the
+    # 16-30 mm the piece is buried by today.  Biased slightly ABOVE the median
+    # because a shard poking through the ground reads as a bug while the same
+    # distance of hover reads as the piece resting on a chip underneath it.
+    drop = max(0.0, radius - float(np.percentile(extents, _SHARD_DROP_PCT)))
+
+    # One collection per library, since each is scaled by its own 1/r.
+    coll_name = (f"{PARTICLE_SHARD_COLLECTION} {key}" if key
+                 else PARTICLE_SHARD_COLLECTION)
+    coll = bpy.data.collections.get(coll_name)
+    if coll is None:
+        coll = bpy.data.collections.new(coll_name)
+    else:
+        for obj in list(coll.objects):
+            coll.objects.unlink(obj)
+            if obj.users == 0:
+                bpy.data.objects.remove(obj)
+
+    # The user's Shard Scale is folded in here rather than left to
+    # ``particle_size``, which is already carrying the collision radius.
+    inv = scale / radius
+    for tpl in src:
+        dup = tpl.copy()          # share mesh data; only the scale differs
+        dup.data = tpl.data
+        dup.name = f"{tpl.name}_pcoll"
+        dup.scale = (inv, inv, inv)
+        coll.objects.link(dup)
+
+    # Never linked into the scene: an instance collection only has to exist in
+    # bpy.data, and linking it would drop a pile of 50x shards at the origin.
+    # (Contrast _detach_template_collection, which has to UNLINK the originals —
+    # they are linked so build_shard_library can evaluate them.)
+    out = (coll, radius, drop)
+    if cache is not None:
+        cache[key] = out
+    return out
 
 
 def _detach_template_collection(scene) -> None:
@@ -900,7 +1255,11 @@ def _spawn_fine_particles(event: ImpactEvent, count: int,
                           templates: Sequence["bpy.types.Object"],
                           spawn_frame: int, settings: DebrisSettings,
                           coll: "bpy.types.Collection",
-                          rng: np.random.Generator) -> Optional["bpy.types.Object"]:
+                          rng: np.random.Generator,
+                          particle_templates: Optional[
+                              Tuple[Optional["bpy.types.Collection"],
+                                    float, float]] = None,
+                          ) -> Optional["bpy.types.Object"]:
     """One small emitter whose particles instance the shard templates.
 
     Unlike the earlier attempt, rotation is ON (so shards tumble in flight
@@ -974,13 +1333,47 @@ def _spawn_fine_particles(event: ImpactEvent, count: int,
     # AND the collision radius.  The old 0.5 gave a ~0.18 m collision radius
     # around shards that render at ~0.014 m, so particles rested a hand's width
     # above the ground and bounced off each other like beach balls.  The shard
-    # templates are already modelled at their true size, so the instances want
-    # scale ~1.0 and the collision radius follows the geometry.
-    st.particle_size = 1.0 * settings.scale
-    st.size_random = 0.7
+    # SIZE / COLLISION RADIUS.  These are the same field, so the templates are
+    # pre-scaled to separate them — see _ensure_particle_templates.  With the
+    # scaled collection in play ``particle_size`` becomes the shard's real
+    # radius (~1-3 cm) and the instances still render at true size; without it
+    # this falls back to the old true-size/point-collision pairing.
+    pcoll, pradius, pdrop = (particle_templates if particle_templates is not None
+                             else _ensure_particle_templates(settings))
+    # With the scaled collection the Shard Scale already lives in the template
+    # scale, so this field carries ONLY the collision radius.
+    st.particle_size = pradius if pcoll is not None else 1.0 * settings.scale
+    # SIZE VARIATION scales the collision radius per particle as well as the
+    # render size, and the sunk deflector is calibrated for ONE radius — a 0.7
+    # spread would re-scatter the rest heights over the range the drop exists to
+    # remove (a 0.3x chip resting 70% of a radius low, i.e. back underground).
+    # The templates already differ in size and 8 variants are picked at random,
+    # so the spray keeps its variety without this.
+    st.size_random = 0.0 if pcoll is not None else 0.7
     # Mass follows size, so big fragments carry momentum and small chips are
     # stopped by drag — without this every piece decelerates identically.
     st.use_multiply_size_mass = True
+
+    # THIS EMITTER'S OWN DEFLECTOR, sunk by the drop its shard size implies.
+    # ``collision_collection`` restricts the system to that one plane, which is
+    # what makes per-material drops possible: Blender otherwise deflects a
+    # particle against EVERY collider in the scene, so a glass chip would stop
+    # on whichever material's plane happened to sit highest.
+    # Keyed by LIBRARY — the same (part, material) key the scaled templates and
+    # therefore the radius come from, so the plane a system collides with is
+    # always the one calibrated for the shards it is instancing.  Two parts of
+    # the same material have different shard sizes and so need different planes.
+    # This is per library, not per impact: ~a dozen planes, not one per event.
+    if pcoll is not None:
+        tag = _safe_name(f"{event.part}_{event.material}")
+        pground = _ensure_particle_ground(settings, pradius, pdrop,
+                                          suffix=f"_{tag}")
+        if pground is not None:
+            holder = _get_collection(f"{PARTICLE_GROUND_NAME}_{tag}",
+                                     parent=_get_collection(DEBRIS_COLLECTION))
+            if pground.name not in holder.objects:
+                holder.objects.link(pground)
+            st.collision_collection = holder
 
     # AIR DRAG.  The single biggest cue that debris is light: it sheds speed
     # fast, so the spray loses its shape instead of holding a clean parabola.
@@ -992,15 +1385,17 @@ def _spawn_fine_particles(event: ImpactEvent, count: int,
     # Sub-stepping the solver: at 10-25 m/s a particle covers up to 0.4 m per
     # frame, several times its own size, and would tunnel through the ground.
     st.subframes = int(max(0, settings.particle_subframes))
-    # Point collision, NOT ``use_size_deflect``.  That flag inflates the
-    # collision radius to ``particle_size`` (~0.5 m with size_random to 1.5x),
-    # so shards came to rest at z=0.35-0.75 — hovering half a metre in the air
-    # forever (measured).  ``particle_size`` must stay ~1.0 because the shard
-    # templates are modelled at true size and it doubles as the render scale,
-    # so the only way to keep the collision radius sane is to collide as a
-    # point against the ground's COLLISION surface.  The slab's thickness and
-    # the subframes above stop fast particles from tunnelling.
-    st.use_size_deflect = False
+    # RADIUS collision, now that ``particle_size`` carries the shard's true
+    # radius instead of its render scale.  Point collision (the previous
+    # behaviour, kept as the fallback) rests the shard's CENTRE on the ground,
+    # so the instance drawn around it is exactly half buried — the reported
+    # bug.  Deflecting on the radius rests the shard's SURFACE on the ground.
+    #
+    # The earlier attempt at this flag failed only because ``particle_size`` was
+    # still ~1.0, giving a half-metre collision radius and chips hovering at
+    # z=0.35-0.75; see _ensure_particle_templates for how the render scale and
+    # the collision radius were separated.
+    st.use_size_deflect = pcoll is not None
 
     # NORMAL_FACTOR is emission ALONG THE EMITTER'S NORMAL — i.e. every particle
     # leaving in the same direction at the same speed from the same point.  That
@@ -1035,7 +1430,10 @@ def _spawn_fine_particles(event: ImpactEvent, count: int,
     st.angular_velocity_factor = 2.0 + 22.0 * intensity
 
     st.render_type = "COLLECTION"
-    shard_coll = bpy.data.collections.get(SHARD_COLLECTION)
+    # The PRE-SCALED collection, so the 1/r template scale cancels the radius
+    # in particle_size and the chip renders at its true size.  Falls back to
+    # the unscaled originals when no scaled set could be built.
+    shard_coll = pcoll or bpy.data.collections.get(SHARD_COLLECTION)
     if shard_coll is not None:
         st.instance_collection = shard_coll
         st.use_collection_pick_random = True
@@ -1434,6 +1832,18 @@ def _template_key(event: ImpactEvent) -> str:
     return f"{event.part}|{event.material}"
 
 
+def _safe_name(text: str) -> str:
+    """Datablock-name-safe form of ``text``, short enough to take a suffix.
+
+    Part names come from the capture and can carry separators that make the
+    resulting collection names hard to read; Blender also truncates names past
+    63 characters, which would silently collide two libraries onto one
+    deflector.
+    """
+    out = "".join(c if (c.isalnum() or c in "_-") else "_" for c in text)
+    return out[:40]
+
+
 def build_debris(reader, events: Sequence[ImpactEvent],
                  settings: Optional[DebrisSettings] = None,
                  glass_settings: Optional[GlassSettings] = None,
@@ -1487,6 +1897,17 @@ def build_debris(reader, events: Sequence[ImpactEvent],
         )
         templates[key] = objs
 
+    # Pre-scaled copies for the particle system, built ONCE now that every
+    # library exists — it is derived from the whole template set, and rebuilding
+    # it per emitter would redo the work for all 100+ impacts.
+    # Pre-scaled particle templates + a sunk deflector PER LIBRARY, built lazily
+    # and memoised here (see _ensure_particle_templates for the per-material
+    # rationale).  The main ground must stop deflecting particles or they never
+    # reach the sunk planes at all.
+    particle_cache: Dict[str, Tuple] = {}
+    if templates:
+        _disable_ground_particle_collision()
+
     # --- spawn -------------------------------------------------------------
     _ensure_rigidbody_world(scene, scene.frame_start, scene.frame_end)
     rb_coll = scene.rigidbody_world.collection
@@ -1529,8 +1950,13 @@ def build_debris(reader, events: Sequence[ImpactEvent],
         hero_objects.extend(_spawn_hero_pieces(
             event, hero_n, tpl, spawn_frame, settings, debris_coll, rng, rb_coll,
             output_fps=output_fps))
+        # Scaled templates + sunk deflector for THIS library's shard size.
+        key = _template_key(event)
+        ptpl = _ensure_particle_templates(settings, key=key, templates=tpl,
+                                          cache=particle_cache)
         emitter = _spawn_fine_particles(
-            event, fine_n, tpl, spawn_frame, settings, debris_coll, rng)
+            event, fine_n, tpl, spawn_frame, settings, debris_coll, rng,
+            particle_templates=ptpl)
         if emitter is not None:
             emitters.append(emitter)
 
@@ -1677,8 +2103,121 @@ def build_debris(reader, events: Sequence[ImpactEvent],
     }
 
 
+#: Residual per-frame vertical motion (metres) below which a baked body counts
+#: as having come to REST, so the ground-snap may seat it exactly on the plane.
+#: Above this it is still moving and only the penetration clamp applies — a
+#: piece mid-bounce must be allowed to leave the ground.
+_REST_EPS = 2.5e-4
+
+#: Frames over which the rest seat is ramped in, so seating a settled body does
+#: not produce a single-frame vertical step just before it comes to rest.
+_SEAT_BLEND = 6
+
+
+def _snap_matrices_to_ground(objs: Sequence["bpy.types.Object"],
+                             matrices: List[List], ground_z: float) -> dict:
+    """Lift every baked pose so NO vertex ever sits below ``ground_z``.
+
+    Two distinct corrections, because the two failure modes in the reference
+    screenshot are different bugs wearing the same costume:
+
+    * **Penetration clamp** (every frame).  Bullet resolves contacts against the
+      body's CONVEX HULL plus a collision margin, and it is happy to leave a
+      hull corner a millimetre or two inside the slab — plus the hull is a
+      convex approximation, so a concave notched shard has real geometry
+      *outside* the hull that the solver never tested at all.  Any frame whose
+      lowest vertex is under the plane is lifted by exactly the shortfall.  This
+      is what removes the half-submerged pieces.
+
+    * **Rest seat** (settled tail).  A body that has gone to sleep is left
+      wherever the solver's margin parked it, which is typically a hair ABOVE
+      the plane (``collision_margin`` = 2 mm) — the ``debris_glass_1924_004`` at
+      z = 0.104 in the report.  Once a body stops moving vertically its whole
+      settled tail is translated so its lowest vertex sits exactly ON the plane,
+      so the pile beds down and casts contact shadows instead of floating.
+
+    The correction is a pure Z TRANSLATION of the whole tail, never a
+    re-orientation: rotating a settled piece flat would destroy the natural
+    jumbled lie of the pile.  Because the same offset is applied to every frame
+    from the rest frame onward, a settled body does not drift or pop.
+
+    Mutates ``matrices`` in place.  Returns a summary for the operator report.
+    """
+    if not objs or not matrices:
+        return {"clamped": 0, "seated": 0, "max_lift": 0.0}
+
+    n_frames = len(matrices)
+    clamped = seated = 0
+    max_lift = 0.0
+
+    for j, obj in enumerate(objs):
+        co = _local_verts(obj)
+        if co is None:
+            continue
+
+        # --- per-frame lowest vertex, vectorised over the whole bake --------
+        # Stacking the Z rows lets one matmul do every frame for this body,
+        # instead of a Python loop over (frames x vertices).
+        zrow = np.empty((n_frames, 4), dtype=np.float64)
+        for i in range(n_frames):
+            m = matrices[i][j]
+            zrow[i] = (m[2][0], m[2][1], m[2][2], m[2][3])
+        lows = co @ zrow[:, :3].T + zrow[:, 3]      # (V, F)
+        lows = lows.min(axis=0)                      # (F,)
+
+        # --- rest detection: first frame of the settled tail ----------------
+        # Scanning BACKWARD from the end finds the moment the body last moved,
+        # so a piece that bounces late is not seated on an early lull.
+        rest_from = n_frames
+        for i in range(n_frames - 1, 0, -1):
+            if abs(lows[i] - lows[i - 1]) > _REST_EPS:
+                rest_from = i
+                break
+        else:
+            rest_from = 0
+
+        # --- build the per-frame lift --------------------------------------
+        lift = np.zeros(n_frames, dtype=np.float64)
+        # Penetration: everything below the plane comes up to it.
+        under = lows < ground_z
+        lift[under] = ground_z - lows[under]
+        if under.any():
+            clamped += 1
+        # Rest seat: the settled tail is translated to sit exactly on the plane.
+        if rest_from < n_frames:
+            seat = ground_z - lows[rest_from]
+            lift[rest_from:] = seat
+            if abs(seat) > _REST_EPS:
+                seated += 1
+
+        if not lift.any():
+            continue
+        max_lift = max(max_lift, float(np.abs(lift).max()))
+
+        # Blend the seat in over the approach so a body that settles from a
+        # small residual hover does not step vertically on its rest frame.
+        # Only the frames immediately before the rest frame are touched, and
+        # only up to their own existing lift, so this can never push a moving
+        # piece into the ground.
+        blend = min(_SEAT_BLEND, rest_from)
+        if blend > 0 and rest_from < n_frames:
+            ramp = np.linspace(0.0, 1.0, blend + 1)[:-1]
+            head = slice(rest_from - blend, rest_from)
+            lift[head] = np.maximum(lift[head], lift[rest_from] * ramp)
+
+        for i in range(n_frames):
+            if lift[i]:
+                # Index the translation column explicitly rather than going
+                # through ``.translation``, which returns a COPY on a Matrix —
+                # mutating that copy would silently discard the lift.
+                matrices[i][j][2][3] += lift[i]
+
+    return {"clamped": clamped, "seated": seated, "max_lift": max_lift}
+
+
 def bake_debris(hero_objects: Sequence["bpy.types.Object"],
-                frame_start: int, frame_end: int) -> dict:
+                frame_start: int, frame_end: int,
+                ground_z: float = 0.0, snap_ground: bool = True) -> dict:
     """Simulate the rigid bodies and freeze the result into keyframes.
 
     Runs with all frame handlers detached (see :func:`_frozen_handlers`), then
@@ -1733,6 +2272,14 @@ def bake_debris(hero_objects: Sequence["bpy.types.Object"],
             if f >= frame_start:
                 matrices.append([o.matrix_world.copy() for o in alive])
 
+        # GROUND SNAP.  Applied to the sampled matrices, BEFORE they become
+        # keyframes, so what gets written is already correct — there is no
+        # second pass over the F-curves and nothing can re-introduce the
+        # penetration later.  See _snap_matrices_to_ground for why the solver
+        # leaves pieces both buried and hovering.
+        snap = ({"clamped": 0, "seated": 0, "max_lift": 0.0} if not snap_ground
+                else _snap_matrices_to_ground(alive, matrices, float(ground_z)))
+
         # Drop the rigid body world BEFORE writing keys: while it exists the
         # solver keeps overriding object transforms and the keys do not stick.
         if scene.rigidbody_world is not None:
@@ -1784,4 +2331,6 @@ def bake_debris(hero_objects: Sequence["bpy.types.Object"],
 
         scene.frame_set(frame_orig)
 
-    return {"baked": len(alive), "frames": frame_end - frame_start + 1}
+    return {"baked": len(alive), "frames": frame_end - frame_start + 1,
+            "ground_clamped": snap["clamped"], "ground_seated": snap["seated"],
+            "ground_max_lift": snap["max_lift"]}

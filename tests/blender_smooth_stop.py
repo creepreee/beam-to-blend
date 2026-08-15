@@ -23,7 +23,13 @@ Verifies against a REAL cache, in real Blender, that the smooth-stop settle
     because the playhead does not move;
   * toggling OFF clamps the playhead back inside the shortened range;
   * undo/reload recovery restores the LIVE tail, not the imported one, and the
-    glided geometry matches what it was before the wipe.
+    glided geometry matches what it was before the wipe;
+  * the START-at-FRAME slider moves the smooth-stop onset to an earlier timeline
+    frame: the timeline is cut short at `start + tail`, the fit window is taken
+    from frames at-or-before the seam, frames before the seam play the captured
+    motion unaffected, the tail still swings and converges from the new seam,
+    retuning the start frame refreshes a parked playhead, `start=0` restores the
+    default onset at the capture end, and recovery restores the live start frame.
 
 Exits non-zero on any failure.
 """
@@ -284,6 +290,100 @@ def main():
     goto(scene, mid_rel)
     check(same(snapshot(objs), live_mid),
           "recovered playback reproduces the glided pose bit-identically")
+
+    # --- G. Start-at-Frame: cut the timeline and settle from an earlier seam --
+    # Move the smooth-stop onset from the last captured frame to SEEK, which is
+    # TAIL_FRAMES_FWD timeline frames before the capture end.  The car should
+    # play normally up to SEEK and then enter the damped tail from the seam at
+    # SEEK instead of the absolute end.
+    SEEK = base_end - 50          # ~20 cache frames before the capture end
+    seek_cache = SEEK * PLAYBACK_FPS / OUTPUT_FPS
+    seam_cache = seek_cache        # clamped inside the capture window
+
+    frame_handler.update_smooth_stop(frames=TAIL, start_frame=SEEK)
+    check(scene.frame_end == SEEK + TAIL,
+          f"timeline cut at the start-frame onset "
+          f"({base_end + TAIL} -> {SEEK + TAIL}, seam={SEEK})")
+    check(int(scene["_beamng_smooth_stop_start"]) == SEEK,
+          "start-frame persisted to the scene for recovery")
+    check(playback._smooth_stop_start is not None
+          and abs(playback._smooth_stop_start - seam_cache) < 1e-6,
+          f"seam stored in cache units ({playback._smooth_stop_start} "
+          f"≈ {seam_cache})")
+
+    # Fit window ends at the seam, not at the last captured frame.
+    sample = playback._tail_sample_frames()
+    check(sample[-1] == int(seam_cache),
+          f"fit window ends at the seam "
+          f"(last={sample[-1]} expect {int(seam_cache)})")
+
+    # Frames at or before the seam play the captured frames unaffected.
+    pre_rel = SEEK - 1
+    goto(scene, pre_rel)
+    pre_pose = snapshot(objs)
+    goto(scene, SEEK)
+    seam_pose = snapshot(objs)
+    check(not same(pre_pose, seam_pose),
+          "pose advances normally from SEEK-1 to the seam frame")
+
+    # At the seam the car sits on a captured frame (no tail influence yet).
+    # A frame deep in the tail should show real swing — and at/after the tail
+    # end the pose converges to rest.
+    tail_mid_rel = SEEK + TAIL // 2
+    goto(scene, tail_mid_rel)
+    mid_pose = snapshot(objs)
+    check(not same(seam_pose, mid_pose),
+          f"mid-tail pose differs from the seam (swing is measurable)")
+
+    goto(scene, SEEK + TAIL)
+    rest_pose = snapshot(objs)
+    goto(scene, SEEK + TAIL + 4)
+    rest_pose2 = snapshot(objs)
+    check(same(rest_pose, rest_pose2),
+          "pose converges to full rest past the tail end")
+
+    # Jump back to the seam — the car should be back on a captured frame.
+    goto(scene, SEEK)
+    check(same(snapshot(objs), seam_pose),
+          "replay at the seam matches the initial seam frame")
+
+    # Retuning the start frame while parked mid-tail refreshes the playhead.
+    goto(scene, tail_mid_rel)
+    parked_before = snapshot(objs)
+    frame_handler.update_smooth_stop(frames=TAIL, start_frame=SEEK - 10)
+    check(scene.frame_current == tail_mid_rel,
+          "playhead stayed parked after start-frame retune "
+          f"(got {scene.frame_current})")
+    parked_after = snapshot(objs)
+    check(not same(parked_after, parked_before),
+          "LIVE: retuning the start frame refreshed the parked playhead "
+          "without scrubbing")
+
+    # Reset to a start frame 0 (default onset at capture end) and verify
+    # the timeline returns to the standard extension.
+    frame_handler.update_smooth_stop(frames=TAIL, start_frame=0)
+    check(scene.frame_end == base_end + TAIL,
+          f"start-frame=0 restores the default seam "
+          f"(got {scene.frame_end}, expect {base_end + TAIL})")
+    check(playback._smooth_stop_start is None,
+          "start-frame=0 clears the seam (back to last-captured-frame onset)")
+
+    # Recovery restores the start frame.
+    frame_handler.update_smooth_stop(frames=TAIL, start_frame=SEEK)
+    goto(scene, tail_mid_rel)
+    live_mid = snapshot(objs)
+    frame_handler._active = None
+    frame_handler._smooth_stop_frames = 0
+    frame_handler._smooth_stop_start_frame = 0
+    recovered = frame_handler._try_recover(scene)
+    check(recovered, "recovery rebuilt the playback from scene props")
+    check(frame_handler._smooth_stop_start_frame == SEEK,
+          f"recovery restored the LIVE start-frame "
+          f"(got {frame_handler._smooth_stop_start_frame})")
+    goto(scene, tail_mid_rel)
+    check(same(snapshot(objs), live_mid),
+          "recovered playback reproduces the start-framed glided pose "
+          "bit-identically")
 
     print(f"[SMOOTH] {len(_failures)} failure(s)")
     if _failures:

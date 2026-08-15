@@ -93,7 +93,8 @@ def _crack_settings(context):
 def _live_timing(context):
     """Live frame mapping from the running handler, else the scene props.
 
-    Returns ``(frame_start, playback_fps, output_fps, smooth_stop_frames)``.
+    Returns ``(frame_start, playback_fps, output_fps, smooth_stop_frames,
+    smooth_stop_start_frame)``.
     The frame handler stores the values the user tuned live (including after a
     reload); before an import the scene properties hold the intended values.
     """
@@ -106,6 +107,7 @@ def _live_timing(context):
             float(frame_handler._playback_fps),
             float(frame_handler._output_fps),
             int(frame_handler._smooth_stop_frames),
+            int(frame_handler._smooth_stop_start_frame),
         )
     return (
         int(getattr(scene.beamng, "start_frame", 0)),
@@ -114,6 +116,7 @@ def _live_timing(context):
         int(getattr(scene.beamng, "car_smooth_stop_frames", 0))
         if getattr(scene.beamng, "car_smooth_stop", False)
         else 0,
+        int(getattr(scene.beamng, "car_smooth_stop_start", 0)),
     )
 
 
@@ -366,12 +369,16 @@ class BEAMNG_OT_import_cache(Operator):
             smooth_stop_frames = int(getattr(
                 context.scene.beamng, "car_smooth_stop_frames", 0)) \
                 if getattr(context.scene.beamng, "car_smooth_stop", False) else 0
+            smooth_stop_start_frame = int(getattr(
+                context.scene.beamng, "car_smooth_stop_start", 0)) \
+                if getattr(context.scene.beamng, "car_smooth_stop", False) else 0
             frame_handler.attach(
                 playback,
                 frame_start=start_frame,
                 playback_fps=playback_fps,
                 output_fps=output_fps,
                 smooth_stop_frames=smooth_stop_frames,
+                smooth_stop_start_frame=smooth_stop_start_frame,
             )
             playback.close_log()
 
@@ -650,7 +657,7 @@ class BEAMNG_OT_build_debris(Operator):
 
         scene = context.scene
         ground_shift = float(scene.get("_beamng_ground_shift", 0.0))
-        frame_start, playback_fps, output_fps, _ = _live_timing(context)
+        frame_start, playback_fps, output_fps, _, _ = _live_timing(context)
 
         from runtime.cache_reader import CacheReader
         from runtime.impact_detect import detect_impacts, summarise
@@ -697,6 +704,9 @@ class BEAMNG_OT_build_debris(Operator):
                 summary.get("hero_objects", []),
                 summary.get("bake_start", scene.frame_start),
                 summary.get("bake_end", scene.frame_end),
+                ground_z=settings.ground_z,
+                snap_ground=bool(getattr(scene.beamng_debris,
+                                         "debris_snap_ground", True)),
             )
 
             # Remember the frame mapping this build baked against, so the live
@@ -727,7 +737,10 @@ class BEAMNG_OT_build_debris(Operator):
                 f"{len(summary.get('shattered_panes', {}))} panes, "
                 f"{len(summary.get('cracked_panes', []))} cracked; "
                 f"{bake.get('baked', 0)} baked over "
-                f"{bake.get('frames', 0)} frames"
+                f"{bake.get('frames', 0)} frames; "
+                f"ground snap: {bake.get('ground_clamped', 0)} unburied, "
+                f"{bake.get('ground_seated', 0)} seated "
+                f"(max {bake.get('ground_max_lift', 0.0) * 1000.0:.1f} mm)"
             )
         except Exception as exc:
             sys.stderr.write(

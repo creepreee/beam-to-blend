@@ -198,42 +198,67 @@ The recovery link is **soft**: the .blend stores only the BVC *path* (46 MB, not
 
 Without it, the crash ends with the car frozen mid-pose the instant the last
 captured frame plays. With "Smooth Car Stop" on, the timeline is extended by
-`Stop Frames` past the last captured frame and the car **keeps the little swing
-it was still rocking through when the capture ended, and that swing gradually
-decreases and then stops**. The tail is a *fitted damped-sine continuation* of
-the car's residual oscillation — NOT a rigid decelerate-and-halt.
+`Stop Frames` past the seam and the car keeps the little swing it was still
+rocking through, and that swing gradually decreases and then stops. The tail
+is a *fitted damped-sine continuation* of the car's residual oscillation —
+NOT a rigid decelerate-and-halt.
 
-- **Frames vs cache units.** The UI field is in *timeline* frames; the playback
+The seam (where the smooth stop begins) defaults to the last captured frame,
+but can be set earlier with the **Start at Frame** slider: when enabled, the
+car plays normally up to that frame and the damped settle takes over from
+there, cutting any remaining captured frames in favour of the continuation.
+This is useful when the crash has already settled on screen but the capture
+kept rolling — set "Start at Frame" to where the motion actually ends and the
+car will settle from that point instead of playing on to the absolute end.
+The seam is clamped to the capture end, so a value past it behaves like the
+default.
+
+- **Frames vs cache units.** The UI fields are in *timeline* frames; the playback
   needs *cache* frames (`tail_cache = tail_frames * playback_fps / output_fps`).
-  `frame_handler._smooth_stop_tail_cache()` does the conversion; both `attach()`
-  and the live `update_smooth_stop()` pass the result to
-  `CachePlayback.set_smooth_stop()`, and the scene prop
-  `_beamng_smooth_stop_frames` (TIMELINE frames) persists it for undo/reload
-  recovery.
+  `frame_handler._smooth_stop_tail_cache()` and
+  `frame_handler._smooth_stop_start_cache()` do the conversions; both `attach()`
+  and the live `update_smooth_stop()` pass the results to
+  `CachePlayback.set_smooth_stop()`, and the scene props
+  `_beamng_smooth_stop_frames` / `_beamng_smooth_stop_start` (TIMELINE frames)
+  persist them for undo/reload recovery.
+- **The seam.** `set_smooth_stop(tail_cache, start_cache)` stores the seam in
+  cache-frame units. When it is unset (≤ 0) or past the last captured frame it
+  falls back to `frame_count - 1` — the original behaviour. The seam determines
+  both the glide onset (positions past it enter the tail) and the fit window
+  (the trailing `_TAIL_FIT_WINDOW` frames at-or-before the seam).
 - **The fit.** `_compute_tail_fit()` (called by `set_smooth_stop`) fits a damped
-  sine to the last `_TAIL_FIT_WINDOW = 24` cache frames of the ROOT translation
-  (real captures end mid-swing: the test cache rocks at period ~10 frames,
-  amplitude ~3 mm at capture end). A frequency grid
+  sine to the `_TAIL_FIT_WINDOW = 24` cache frames ending at the seam of the ROOT
+  translation (real captures end mid-swing: the test cache rocks at period ~10
+  frames, amplitude ~3 mm at the seam). A frequency grid
   (`_TAIL_PERIOD_GRID = np.linspace(4.0, 30.0, 40)`) minimises joint SSE; if the
   series is too short or the variance is below `_TAIL_AMPLITUDE_EPS = 1e-4`
   (`_fit_sine_at` returns None) there is no swing to continue and the tail just
-  holds the final rigid pose. Each axis is fitted as
+  holds the seam pose. Each axis is fitted as
   `c + Ac·cos(ωt) + As·sin(ωt)` with an absolute phase `t = (frame - start)`;
   rotation is the vector part of `q_n · q_mean⁻¹` per component, plus the sign-
   aligned mean quaternion `_average_quaternion(qs)`.
-- **The continuation.** For cache position `s` past the end: `u = s / tail`,
-  `env = (1-u) · exp(-_TAIL_LAMBDA · u)` with `_TAIL_LAMBDA = 1.5`. The root
-  pose is `c + (Ac·cos(ωt) + As·sin(ωt)) · env` (position) and
+- **The continuation.** For cache position `s` past the seam: `env = cos²(πu/2)`
+  where `u = s / tail` (raised-cosine taper, `env(0)=1`, `env(1)=0`, zero
+  slope at both ends). The root pose is
+  `c + (Ac·cos(ωt) + As·sin(ωt)) · env` (position) and
   `q_mean · Quaternion((1, vx, vy, vz)) · normalized()` (rotation); vertices get
-  a scalar profile `k = (1/ω)·sin(ω·s)·env` → `k(0)=0`, `k'(0)=1` (velocity
-  continuity), so the swing continues the residual vertex motion, sweeps through
-  the oscillation centre (motion REVERSES), and returns to the last-frame pose
-  at rest. `env` is exactly 0 at `s >= tail`, so the pose converges to the
-  fitted centre and velocity → 0 — a natural settle, not a brake.
+  the same per-axis damped continuation plus an env-scaled seam residual
+  (`c + (Ac·cos(ωt) + As·sin(ωt) + residual) · env`) so the first tail frame
+  matches the seam pose exactly. The oscillation centre — where `env = 0`
+  lands — is the pose the car settles into.
 - **A stopped car stops**: if the fitted amplitude is below the epsilon there is
   no oscillation to continue and the tail is a static hold (correct physics, not
   a bug). The test cache is still swinging at the end, so the continuation is
   measurable there.
+
+**Smooth car stop start frame** (`runtime/frame_handler.py` + `runtime/mesh_update.py`):
+the `_smooth_stop_start_frame` global (timeline frames, 0 = unset) is converted to
+cache units by `_smooth_stop_start_cache()`, passed to `attach()` /
+`update_smooth_stop()` as `smooth_stop_start_frame`, and stored as the seam in
+`CachePlayback.set_smooth_stop(tail_cache, start_cache)`. The `_apply_timeline`
+function sets `scene.frame_end = start_frame + stop_frames` when the start is
+within the capture range, cutting the timeline short. All state persists via
+`_beamng_smooth_stop_start` for undo/reload recovery.
 
 ## Debris retime (`runtime/debris_retime.py`)
 
@@ -355,6 +380,14 @@ export bakes the same deformation into the .mdd, so renders match the viewport.
   Negative control: disabling `_refresh_current_frame` in `update_smooth_stop`
   fails exactly the 2 parked-refresh/toggle-off assertions and nothing else —
   the other 21 pass without it.
+- Live "Smooth Car Stop Start-at-Frame" verified headless (section G of
+  `tests/blender_smooth_stop.py`): setting a start frame inside the capture cuts
+  the timeline at `start + tail` (not `capture_end + tail`), the seam is stored
+  in cache units, the fit window is taken from frames at-or-before the seam,
+  frames before the seam play the captured motion unaffected, the tail still
+  swings and converges from the new seam, retuning the start frame refreshes a
+  parked playhead, `start=0` restores the default onset at the capture end, and
+  undo/reload recovery restores the live start frame.
 - Deform cost ~2.2 ms/frame for 4 tyres / 1024 verts (bulge dominates; the
   `axle_axis` eigensolve is 0.36 ms of it)
 - GLB pipeline: 2000-frame capture at 10x slowmo, 97 objects, 7.4 GB BVC — verified

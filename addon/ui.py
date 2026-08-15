@@ -73,6 +73,7 @@ def _on_smooth_stop_update(self, context):
         frame_handler.update_smooth_stop(
             enabled=bool(self.car_smooth_stop),
             frames=int(self.car_smooth_stop_frames),
+            start_frame=int(self.car_smooth_stop_start),
         )
     except Exception:
         pass
@@ -197,13 +198,27 @@ class BeamNGSceneProperties(PropertyGroup):
     car_smooth_stop_frames: IntProperty(
         name="Stop Frames",
         description="Length of the smooth-stop tail (Blender timeline frames) "
-                    "added past the last captured frame. More frames = a longer, "
-                    "softer glide to rest; 0 = instant stop (as if the feature "
-                    "were off). About 30 is a gentle settle at 60 fps.",
+                    "added past the onset. More frames = a longer, softer glide "
+                    "to rest; 0 = instant stop (as if the feature were off). "
+                    "About 30 is a gentle settle at 60 fps.",
         default=30,
         min=0,
         max=600,
         soft_max=180,
+        update=_on_smooth_stop_update,
+    )
+    car_smooth_stop_start: IntProperty(
+        name="Start at Frame",
+        description="Timeline frame at which the smooth-stop settle begins "
+                    "(0 = start at the end of the captured sequence, the "
+                    "default). Set this to an earlier frame to cut the "
+                    "remaining captured motion and ease the car to rest from "
+                    "that point instead — useful when the crash has already "
+                    "settled on screen but the capture kept rolling. LIVE: "
+                    "no re-import needed.",
+        default=0,
+        min=0,
+        max=50000,
         update=_on_smooth_stop_update,
     )
 
@@ -453,6 +468,20 @@ class BeamNGDebrisProperties(PropertyGroup):
         min=0,
         max=2000,
     )
+    debris_snap_ground: BoolProperty(
+        name="Sit Debris On Ground",
+        description="Guarantee no shard ever ends up buried in or floating "
+                    "above the ground plane. The physics solver resolves "
+                    "collisions against a simplified convex hull plus a safety "
+                    "margin, so settled pieces are left a few millimetres above "
+                    "the ground (no contact shadow) or with a corner poking "
+                    "through it (half-submerged). This lifts every baked pose "
+                    "so the lowest point of the piece never crosses the ground, "
+                    "and beds each piece down to rest exactly ON it. Pieces are "
+                    "only moved straight up/down, never re-rotated, so the pile "
+                    "keeps its natural jumbled lie",
+        default=True,
+    )
     debris_seed: IntProperty(
         name="Random Seed",
         description="Random seed for all shard shapes, positions and "
@@ -596,6 +625,7 @@ class BEAMNG_PT_main(Panel):
         box.prop(props, "car_smooth_stop")
         if props.car_smooth_stop:
             box.prop(props, "car_smooth_stop_frames")
+            box.prop(props, "car_smooth_stop_start")
         # These three retune the imported cache in place (see
         # runtime.frame_handler.update_start_frame / update_fps), so say so —
         # otherwise the natural assumption is that they need a re-import.
@@ -692,6 +722,7 @@ class BEAMNG_PT_debris(Panel):
         phys.prop(props, "debris_scatter")
         phys.prop(props, "debris_speed")
         phys.prop(props, "debris_spread")
+        phys.prop(props, "debris_snap_ground")
 
         det = layout.box()
         det.label(text="When to Spawn", icon="TIME")
