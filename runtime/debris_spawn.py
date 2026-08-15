@@ -1603,23 +1603,54 @@ def _spawn_glass_pane(part: str, tier: str, event: ImpactEvent,
             event.position, dtype=np.float64)
         n = np.linalg.norm(away)
         away = away / n if n > 1e-6 else np.array((0.0, 0.0, 1.0))
-        # ``away`` is the outward direction from the impact, and multiplying the
-        # whole pane's worth of fragments by it is a radial burst — the firework,
-        # per-pane. With ``speed`` 0 by default this term vanishes and the glass
-        # simply falls out of the aperture, which is what shattered glass does:
-        # it drops out of the frame and slides down the bodywork.  Scatter adds
-        # only enough separation that the fragments do not fall as a solid sheet.
+
+        # ``away`` is the outward direction from the impact.  With ``speed`` 0
+        # by default the launch term vanishes and glass should simply fall out
+        # of the aperture.  Scatter alone (0.45 m/s) is too small to break the
+        # clump — we add per-fragment direction jitter and a small base
+        # separation velocity so fragments fan out naturally instead of staying
+        # in a tight ball.
         scatter = max(0.0, float(settings.scatter)) * (0.4 + 0.6 * intensity)
-        vel = (away * (settings.speed * profile_for("glass").speed_bias
-                       * (0.3 + 1.4 * intensity) + scatter) * blow
-               * float(rng.uniform(0.55, 1.4)))
+
+        # Per-fragment direction variation: rotate the radial ``away`` vector by
+        # a random angle around the pane normal (up to ±35°) plus a small
+        # out-of-plane tilt (±15°).  This fans the spray into a proper cloud.
+        pane_normal = np.array(event.normal, dtype=np.float64)
+        nrm = np.linalg.norm(pane_normal)
+        pane_normal = pane_normal / nrm if nrm > 1e-6 else np.array((0.0, 0.0, 1.0))
+        # Random axis in the pane plane
+        theta = float(rng.uniform(-0.61, 0.61))  # ±35°
+        c, s = np.cos(theta), np.sin(theta)
+        # Rotate ``away`` around pane_normal by theta (Rodrigues)
+        away_rot = (away * c +
+                    np.cross(pane_normal, away) * s +
+                    pane_normal * (pane_normal @ away) * (1 - c))
+        # Small out-of-plane tilt
+        tilt = float(rng.uniform(-0.26, 0.26))  # ±15°
+        away_rot = away_rot * np.cos(tilt) + pane_normal * np.sin(tilt)
+        away = away_rot / np.linalg.norm(away_rot)
+
+        # Base separation speed: even at speed=0, give each fragment a small
+        # random outward kick so they don't fall as a solid sheet.
+        base_sep = scatter * float(rng.uniform(0.8, 1.8))
+        launch_speed = (settings.speed * profile_for("glass").speed_bias
+                        * (0.3 + 1.4 * intensity))
+        vel = away * (launch_speed + base_sep) * blow * float(rng.uniform(0.55, 1.4))
+
         # Flatten the outward throw: glass falling out of a window should not be
         # lobbed upward off the car.
         vel[2] = min(vel[2], abs(vel[2]) * 0.2)
         vel = vel + part_vel * settings.inherit_velocity * intensity
 
-        launch_start = spawn_frame - LAUNCH_FRAMES
-        base = np.array(frag.centre, dtype=np.float64)
+        # Per-fragment position jitter: offset the start position slightly along
+        # the pane plane so fragments don't all begin at the exact same point.
+        # Scale by fragment size (~2-5 cm) so the jitter is subtle but breaks
+        # the perfect grid alignment of Voronoi centroids.
+        jitter_scale = 0.03 * float(rng.uniform(0.5, 1.5))
+        jitter_dir = np.array([float(rng.uniform(-1, 1)),
+                               float(rng.uniform(-1, 1)), 0.0])
+        jitter_dir = jitter_dir / (np.linalg.norm(jitter_dir) + 1e-9)
+        base = np.array(frag.centre, dtype=np.float64) + jitter_dir * jitter_scale
         # Clamp on the fragment's LOWEST POINT, not its origin — exactly as the
         # hero pieces do (see _lowest_point_offset).  The launch phase is
         # KINEMATIC and ignores collisions, so a strong inherited downward
