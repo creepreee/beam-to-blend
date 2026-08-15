@@ -661,7 +661,7 @@ class BEAMNG_OT_build_debris(Operator):
 
         from runtime.cache_reader import CacheReader
         from runtime.impact_detect import detect_impacts, summarise
-        from runtime.debris_spawn import build_debris, bake_debris
+        from runtime.debris_spawn import build_debris, bake_debris, bake_particles
         from runtime import frame_handler
 
         def _progress(done, total, name):
@@ -708,6 +708,18 @@ class BEAMNG_OT_build_debris(Operator):
                 snap_ground=bool(getattr(scene.beamng_debris,
                                          "debris_snap_ground", True)),
             )
+            # The fine particles are solver-owned transforms, so the only way
+            # to guarantee no chip ever sits under the ground is to freeze each
+            # one into its own F-curve mesh and clamp it, exactly like the hero
+            # bodies above.  See bake_particles for the measured failure mode.
+            bake_p = bake_particles(
+                summary.get("emitter_objects", []),
+                summary.get("bake_start", scene.frame_start),
+                summary.get("bake_end", scene.frame_end),
+                ground_z=settings.ground_z,
+                snap_ground=bool(getattr(scene.beamng_debris,
+                                         "debris_snap_ground", True)),
+            )
 
             # Remember the frame mapping this build baked against, so the live
             # fps/start sliders can rescale the debris keys later (the car
@@ -740,7 +752,10 @@ class BEAMNG_OT_build_debris(Operator):
                 f"{bake.get('frames', 0)} frames; "
                 f"ground snap: {bake.get('ground_clamped', 0)} unburied, "
                 f"{bake.get('ground_seated', 0)} seated "
-                f"(max {bake.get('ground_max_lift', 0.0) * 1000.0:.1f} mm)"
+                f"(max {bake.get('ground_max_lift', 0.0) * 1000.0:.1f} mm); "
+                f"particles: {bake_p.get('baked', 0)} frozen to meshes, "
+                f"{bake_p.get('ground_clamped', 0)} clamped "
+                f"(max {bake_p.get('ground_max_lift', 0.0) * 1000.0:.1f} mm)"
             )
         except Exception as exc:
             sys.stderr.write(

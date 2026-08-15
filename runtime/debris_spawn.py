@@ -10,7 +10,10 @@ settling behaviour is what sells a crash, and particles cannot fake it.
 
 **Fine debris** — the hundreds of small chips — are a particle system.  At that
 size the eye reads the spray, not the individual piece, so the cheaper solver is
-indistinguishable and keeps the scene tractable.
+indistinguishable and keeps the scene tractable.  The particles are then BAKED
+into per-chip F-curve meshes by :func:`bake_particles` (with every chip
+ground-clamped, since a solver-rested sphere cannot guarantee shards stay off
+the ground), so the finished debris is pure keyframe animation either way.
 
 THE BAKE-CORRUPTION RULE
 ------------------------
@@ -477,7 +480,8 @@ def clear_debris() -> int:
         return 0
     removed = 0
     for coll_name in (DEBRIS_COLLECTION, SHARD_COLLECTION,
-                      PARTICLE_SHARD_COLLECTION, GLASS_COLLECTION):
+                      PARTICLE_SHARD_COLLECTION, GLASS_COLLECTION,
+                      PARTICLE_BAKED_COLLECTION):
         coll = bpy.data.collections.get(coll_name)
         if coll is None:
             continue
@@ -2100,6 +2104,7 @@ def build_debris(reader, events: Sequence[ImpactEvent],
         "bake_start": bake_start,
         "bake_end": bake_end,
         "hero_objects": hero_objects + glass_objects,
+        "emitter_objects": emitters,
     }
 
 
@@ -2334,3 +2339,259 @@ def bake_debris(hero_objects: Sequence["bpy.types.Object"],
     return {"baked": len(alive), "frames": frame_end - frame_start + 1,
             "ground_clamped": snap["clamped"], "ground_seated": snap["seated"],
             "ground_max_lift": snap["max_lift"]}
+
+
+#: Collection the baked particle meshes live in.  A child of the main debris
+#: collection so :func:`clear_debris` and :func:`debris_objects` (retime) cover
+#: them without extra wiring.
+PARTICLE_BAKED_COLLECTION = "BeamNG Debris Particles"
+
+#: Custom property stamped on every baked particle object.  The verify scripts
+#: use it to tell a frozen chip (no particle system) from a hero shard.
+PARTICLE_BAKED_PROP = "_beamng_debris_baked_particle"
+
+
+def _particle_ground_lift(co: np.ndarray, zrows: np.ndarray,
+                          ground_z: float) -> np.ndarray:
+    """Per-frame +Z lift that keeps ONE particle's shard on the ground.
+
+    The per-body half of :func:`_snap_matrices_to_ground`, but for a single
+    particle whose ``(frame, matrix)`` series is not aligned to the bake
+    window: penetration clamp (any frame whose lowest vertex is under the plane
+    comes up to it) plus the rest seat (the settled tail is translated so it
+    sits exactly ON the plane instead of a solver-margin hair above it).
+    ``zrows`` is that particle's stacked Z matrix rows ``(F, 4)``; ``co`` is
+    its local vertices ``(V, 3)``.
+    """
+    n = len(zrows)
+    if not n:
+        return np.zeros(0, dtype=np.float64)
+    lows = co @ zrows[:, :3].T + zrows[:, 3]
+    lows = lows.min(axis=0)
+    lift = np.zeros(n, dtype=np.float64)
+    under = lows < ground_z
+    lift[under] = ground_z - lows[under]
+    rest_from = n
+    for i in range(n - 1, 0, -1):
+        if abs(lows[i] - lows[i - 1]) > _REST_EPS:
+            rest_from = i
+            break
+    else:
+        rest_from = 0
+    if rest_from < n:
+        seat = ground_z - lows[rest_from]
+        lift[rest_from:] = seat
+        blend = min(_SEAT_BLEND, rest_from)
+        if blend > 0 and rest_from < n:
+            ramp = np.linspace(0.0, 1.0, blend + 1)[:-1]
+            head = slice(rest_from - blend, rest_from)
+            lift[head] = np.maximum(lift[head], lift[rest_from] * ramp)
+    # THE GUARANTEE.  The rest seat translates a settled tail so its REST frame
+    # sits exactly on the plane, but a resting body can still wander up to
+    # _REST_EPS off that frame — so the seat can overshoot a neighbouring frame
+    # a fraction of a millimetre into the ground.  Clamp once more against the
+    # FINAL lows so NO frame of ANY particle is ever under the plane.
+    final = lows + lift
+    below = final < ground_z
+    if below.any():
+        lift[below] = ground_z - lows[below]
+    return lift
+
+
+def bake_particles(emitters: Sequence["bpy.types.Object"],
+                   frame_start: int, frame_end: int,
+                   ground_z: float = 0.0, snap_ground: bool = True) -> dict:
+    """Freeze the fine-particle emitters into ground-clamped F-curve meshes.
+
+    WHY THIS IS THE ONLY WAY TO KEEP PARTICLES OFF THE GROUND.  A NEWTON
+    particle collides as a SPHERE and the solver rests the sphere's centre a
+    radius above the deflector.  The flat shard drawn around that centre
+    reaches LESS than a radius downward on a face landing but MORE on an edge
+    landing, so no matter how the collision radius / deflector-drop percentiles
+    are tuned some settled pieces poke through the ground (measured: 36% of
+    instances with a vertex below z=0, worst 98 mm).  The two error directions
+    are tied to the same number: a drop large enough to hide the biggest shard
+    leaves every small chip floating by the same amount.  The only guarantee
+    that NO vertex ever sits under the ground is to stop the solver from owning
+    the transforms: bake each particle into its own mesh and clamp, mirroring
+    :func:`_snap_matrices_to_ground` on the hero bodies.
+
+    Baking also lifts the particle limitation in ``debris_retime``: the frozen
+    chips are ordinary F-curve objects, so the live fps/start sliders slow the
+    spray down with the car like the hero shards.
+
+    HOW.  Each emitter is walked FRAME BY FRAME (jumping the playhead reads
+    garbage from the NEWTON integrator — measured to z=-1e27), and every live
+    particle's world matrix is sampled from the evaluated depsgraph.  A particle
+    keeps the template the solver picked for it, so the baked geometry is
+    bit-identical to what the system would have rendered.  Each particle's
+    series is then penetration-clamped and rest-seated, written as
+    location/rotation keyframes with LINEAR interpolation (auto-clamped Bezier
+    overshoots at every bounce), and the emitters plus their per-material
+    deflectors are deleted.  The result is inert animation data, like the hero
+    bake.
+
+    Returns a summary for the operator report.
+    """
+    if bpy is None or not emitters:
+        return {"baked": 0}
+    scene = bpy.context.scene
+    alive = [o for o in emitters if o.name in bpy.data.objects]
+    alive = [o for o in alive if any(
+        getattr(m, "particle_system", None) is not None for m in o.modifiers)]
+    if not alive:
+        return {"baked": 0}
+    frame_end = int(frame_end)
+    frame_orig = scene.frame_current
+
+    names = {o.name for o in alive}
+    starts: List[int] = []
+    for o in alive:
+        for m in o.modifiers:
+            ps = getattr(m, "particle_system", None)
+            if ps is not None:
+                starts.append(int(ps.settings.frame_start))
+    walk_start = max(scene.frame_start,
+                     (min(starts) if starts else int(frame_start)) - 2)
+
+    # emitter -> particle index -> [(frame, float32 (4,4) matrix)].
+    # The index (depsgraph persistent_id[0]) is stable across frames; the
+    # template is whatever the solver assigned at birth.  Matrices are pulled
+    # off the depsgraph instance immediately and stored by VALUE — keeping the
+    # instance reference across evaluations reads as "StructRNA removed".
+    series: Dict[str, Dict[int, List[Tuple[int, np.ndarray]]]] = {}
+    sources: Dict[str, Dict[int, str]] = {}
+
+    with _frozen_handlers():
+        for f in range(walk_start, frame_end + 1):
+            scene.frame_set(f)
+            bpy.context.view_layer.update()
+            dg = bpy.context.evaluated_depsgraph_get()
+            for inst in dg.object_instances:
+                if not inst.is_instance:
+                    continue
+                parent = inst.parent
+                if parent is None or parent.name not in names:
+                    continue
+                pid = int(inst.persistent_id[0])
+                series.setdefault(parent.name, {}).setdefault(pid, []).append(
+                    (f, np.asarray(inst.matrix_world,
+                                   dtype=np.float32).copy()))
+                sources.setdefault(parent.name, {}).setdefault(
+                    pid, inst.object.name)
+
+    coll = _get_collection(
+        PARTICLE_BAKED_COLLECTION,
+        parent=_get_collection(DEBRIS_COLLECTION))
+    baked_total = 0
+    clamped = seated = 0
+    max_lift = 0.0
+    for ename in sorted(series):
+        for pid in sorted(series[ename]):
+            mats = series[ename][pid]
+            src = bpy.data.objects.get(sources[ename].get(pid, ""))
+            if src is None or src.data is None or not mats:
+                continue
+            co = _local_verts(src)
+            if co is None:
+                continue
+            frames = np.asarray([m[0] for m in mats], dtype=np.int64)
+            mat4 = np.asarray([m[1] for m in mats], dtype=np.float64)
+            lift = (_particle_ground_lift(co, mat4[:, 2], float(ground_z))
+                    if snap_ground
+                    else np.zeros(len(mats), dtype=np.float64))
+            if (lift > 0.0).any():
+                clamped += 1
+            # The rest seat can be negative (seat down) and only moves the
+            # settled tail, so count it from the seat region, not the lift.
+            # max_lift reports the magnitude of the biggest correction.
+            if np.abs(lift).max() > 0.0:
+                max_lift = max(max_lift, float(np.abs(lift).max()))
+            if len(lift) and abs(lift[-1]) > _REST_EPS:
+                seated += 1
+
+            tag = ename.replace("emit_", "", 1) if "emit_" in ename else ename
+            baked = bpy.data.objects.new(f"{tag}_part_{pid}", src.data)
+            baked.scale = (1.0, 1.0, 1.0)
+            baked[PARTICLE_BAKED_PROP] = True
+            baked.rotation_mode = "QUATERNION"
+            baked.animation_data_clear()
+            coll.objects.link(baked)
+
+            birth = int(frames[0])
+            death = int(frames[-1])
+            baked.hide_render = True
+            baked.hide_viewport = True
+
+            # Build the action completely, THEN bind it to the object.  An
+            # action that gains F-curves after it is assigned does not drive
+            # the object: the depsgraph binds the property→fcurve mapping at
+            # assignment time and never sees the later curves.
+            action = bpy.data.actions.new(f"{baked.name}__action")
+
+            # Visibility: hidden until its birth frame, hidden again after its
+            # death (particles are deleted when their lifetime expires, so a
+            # baked chip must blink out the same way).
+            vis_keys = [(birth - 1, 1.0), (birth, 0.0)]
+            if death < frame_end:
+                vis_keys.append((death + 1, 1.0))
+            vis_fcs = []
+            for data_path in ("hide_render", "hide_viewport"):
+                fc = action.fcurves.new(data_path=data_path)
+                fc.keyframe_points.add(len(vis_keys))
+                for k, (fr, val) in enumerate(vis_keys):
+                    kp = fc.keyframe_points[k]
+                    kp.co.x = float(fr)
+                    kp.co.y = float(val)
+                    kp.interpolation = "LINEAR"
+                vis_fcs.append(fc)
+
+            # Transform keyframes written straight into the F-curves rather than
+            # via keyframe_insert: ~3M keys across the scene, and the operator
+            # round-trip would make the bake minutes longer.
+            nf = len(frames)
+            loc_fcs = [action.fcurves.new(data_path="location", index=i)
+                       for i in range(3)]
+            quat_fcs = [action.fcurves.new(data_path="rotation_quaternion",
+                                           index=j) for j in range(4)]
+            for fc in loc_fcs + quat_fcs:
+                fc.keyframe_points.add(nf)
+            prev_q = None
+            for i, f in enumerate(frames):
+                m = mat4[i]
+                m[2][3] += lift[i]
+                mat = mathutils.Matrix(m)
+                loc = mat.to_translation()
+                q = mat.to_quaternion()
+                if prev_q is not None and prev_q.dot(q) < 0.0:
+                    q = -q
+                prev_q = q
+                for idx, fc in enumerate(loc_fcs):
+                    kp = fc.keyframe_points[i]
+                    kp.co.x = float(f)
+                    kp.co.y = float(loc[idx])
+                    kp.interpolation = "LINEAR"
+                for idx, fc in enumerate(quat_fcs):
+                    kp = fc.keyframe_points[i]
+                    kp.co.x = float(f)
+                    kp.co.y = float(q[idx])
+                    kp.interpolation = "LINEAR"
+            for fc in vis_fcs + loc_fcs + quat_fcs:
+                fc.update()
+            baked.animation_data_create().action = action
+            baked_total += 1
+
+    # The emitters are dead once their particles are frozen, and their
+    # per-material deflectors have no systems left to deflect for.
+    for o in alive:
+        if o.name in bpy.data.objects:
+            bpy.data.objects.remove(o, do_unlink=True)
+    prefix = PARTICLE_GROUND_NAME + "_"
+    for o in list(bpy.data.objects):
+        if o.name.startswith(prefix):
+            bpy.data.objects.remove(o, do_unlink=True)
+
+    scene.frame_set(frame_orig)
+    return {"baked": baked_total, "frames": frame_end - walk_start + 1,
+            "ground_clamped": clamped, "ground_seated": seated,
+            "ground_max_lift": max_lift}
