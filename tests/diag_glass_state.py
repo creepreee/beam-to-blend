@@ -71,9 +71,11 @@ def main(argv: List[str]) -> int:
         resolve_glass_damage,
     )
     from runtime.debris_spawn import (
-        DEBRIS_COLLECTION, GLASS_COLLECTION, GROUND_NAME, bake_debris,
-        build_debris, clear_debris, _frozen_handlers,
+        DEBRIS_COLLECTION, GLASS_COLLECTION, GROUND_NAME,
+        build_debris, clear_debris,
     )
+    from runtime.debris_bake import bake_debris
+    from runtime.debris_physics import _frozen_handlers
     from runtime import frame_handler
 
     register_repo_addon()

@@ -104,9 +104,9 @@ def rebuild(scene, cache_path: str, start_frame: int, playback_fps: float,
     from runtime.debris_spawn import (
         clear_debris,
         build_debris,
-        bake_debris,
-        _frozen_handlers,
     )
+    from runtime.debris_bake import bake_debris
+    from runtime.debris_physics import _frozen_handlers
 
     with _frozen_handlers():
         clear_debris()

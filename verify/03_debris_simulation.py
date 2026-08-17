@@ -188,9 +188,9 @@ def main(argv: Sequence[str]) -> int:
         GROUND_NAME,
         clear_debris,
         build_debris,
-        bake_debris,
-        _frozen_handlers,
     )
+    from runtime.debris_bake import bake_debris
+    from runtime.debris_physics import _frozen_handlers
 
     bpy.ops.wm.open_mainfile(filepath=blend)
     scene = bpy.context.scene
@@ -243,7 +243,8 @@ def main(argv: Sequence[str]) -> int:
     meshes = sorted((o for o in targets if not has_particle_system(o)
                      and o.name != GROUND_NAME), key=lambda o: o.name)
     ground = next((o for o in targets if o.name == GROUND_NAME), None)
-    ground_z = float(ground.location.z) if ground is not None else 0.0
+    ground_z = float(ground.location.z + ground.dimensions.z / 2.0) \
+        if ground is not None else 0.0
     log(f"[VERIFY3] {len(emitters)} emitters, {len(meshes)} meshes, "
         f"ground_z={ground_z:.3f}, walking {frame_start}..{frame_end} "
         f"frame-by-frame (sampling every {SAMPLE_EVERY})")

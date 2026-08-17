@@ -469,20 +469,6 @@ class BeamNGDebrisProperties(PropertyGroup):
         min=0,
         max=2000,
     )
-    debris_snap_ground: BoolProperty(
-        name="Sit Debris On Ground",
-        description="Guarantee no shard ever ends up buried in or floating "
-                    "above the ground plane. The physics solver resolves "
-                    "collisions against a simplified convex hull plus a safety "
-                    "margin, so settled pieces are left a few millimetres above "
-                    "the ground (no contact shadow) or with a corner poking "
-                    "through it (half-submerged). This lifts every baked pose "
-                    "so the lowest point of the piece never crosses the ground, "
-                    "and beds each piece down to rest exactly ON it. Pieces are "
-                    "only moved straight up/down, never re-rotated, so the pile "
-                    "keeps its natural jumbled lie",
-        default=True,
-    )
     debris_seed: IntProperty(
         name="Random Seed",
         description="Random seed for all shard shapes, positions and "
@@ -723,7 +709,6 @@ class BEAMNG_PT_debris(Panel):
         phys.prop(props, "debris_scatter")
         phys.prop(props, "debris_speed")
         phys.prop(props, "debris_spread")
-        phys.prop(props, "debris_snap_ground")
 
         det = layout.box()
         det.label(text="When to Spawn", icon="TIME")

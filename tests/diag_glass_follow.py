@@ -64,9 +64,10 @@ def main(argv: List[str]) -> int:
         GlassSettings, detect_impacts, local_to_world, resolve_glass_damage,
     )
     from runtime.debris_spawn import (
-        DebrisSettings, GLASS_COLLECTION, bake_debris, build_debris,
+        DebrisSettings, GLASS_COLLECTION, build_debris,
         clear_debris,
     )
+    from runtime.debris_bake import bake_debris
     from runtime import frame_handler
 
     start = int(scene.get("_beamng_start_frame", 400))

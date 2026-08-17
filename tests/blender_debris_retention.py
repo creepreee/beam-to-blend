@@ -146,7 +146,8 @@ def main():
     # Dynamic (now ALL) fragments are rigid bodies baked against the ground
     # plane, so none may end up below ground.
     ground = bpy.data.objects.get("BeamNG_DebrisGround")
-    ground_z = ground.matrix_world.translation.z if ground is not None else 0.0
+    ground_z = float(ground.location.z + ground.dimensions.z / 2.0) \
+        if ground is not None else 0.0
 
     last = scene.frame_end
     scene.frame_set(last)

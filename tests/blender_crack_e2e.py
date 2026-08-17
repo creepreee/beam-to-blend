@@ -210,7 +210,7 @@ def main():
 
         # Bake + collapse registration, exactly like the operator.
         from runtime import frame_handler
-        from runtime.debris_spawn import bake_debris
+        from runtime.debris_bake import bake_debris
         bake = bake_debris(
             summary.get("hero_objects", []),
             summary.get("bake_start", scene.frame_start),

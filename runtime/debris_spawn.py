@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Spawn and simulate impact debris in the Blender scene.
+"""Spawn impact debris in the Blender scene.
 
 Hybrid simulation, because neither approach alone is good enough:
 
@@ -10,31 +10,39 @@ settling behaviour is what sells a crash, and particles cannot fake it.
 
 **Fine debris** — the hundreds of small chips — are a particle system.  At that
 size the eye reads the spray, not the individual piece, so the cheaper solver is
-indistinguishable and keeps the scene tractable.  The particles are then BAKED
-into per-chip F-curve meshes by :func:`bake_particles` (with every chip
-ground-clamped, since a solver-rested sphere cannot guarantee shards stay off
-the ground), so the finished debris is pure keyframe animation either way.
+indistinguishable and keeps the scene tractable.
 
-THE BAKE-CORRUPTION RULE
-------------------------
-Both solvers are driven by the scene timeline, and this add-on has a
-``frame_change_pre`` handler that rewrites ~550K vertices on every frame.
-Baking while that handler is live corrupts the caches — the previous attempt at
-this feature produced point caches misaligned by ~300 frames and had to be
-re-baked by hand.  :func:`_frozen_handlers` detaches every frame handler for the
-duration of a bake and restores them afterwards, so a bake can never race the
-vertex playback.
+THE MODULE SPLIT.  This module is deliberately ONLY the *creation* layer: it
+builds the shard libraries and places the debris objects in the scene (hero
+rigid bodies, fine-particle emitters, glass fragments, cracked-pane materials).
+It does NOT configure the solver — that lives in :mod:`debris_physics` — and it
+does NOT convert anything into animation — the bake lives in :mod:`debris_bake`:
 
-After the rigid body bake, the debris is pure keyframe F-curves and the rigid
-body world is torn down.  From then on the debris is inert data: it cannot be
-re-simulated, cannot drift, and cannot be corrupted by the playback handler.
+    debris_spawn  ->  debris_physics  ->  debris_bake
+    (build_debris,   (solver, ground,     (bake_debris)
+     spawn helpers)    rigid bodies,        native rigid-body bake)
+                       particles)
+
+:func:`build_debris` returns the spawned ``hero_objects`` / ``emitter_objects``
+and the bake range; the caller hands them to :func:`debris_bake.bake_debris`.
+
+Why the bake exists at all: the hero bodies are baked to keyframes so the
+finished debris is pure animation data — Bullet owns their motion until then
+and the baked F-curves are what the timeline plays back.  The fine-particle
+NEWTON emitters are NOT baked: they stay live and solver-owned, and their
+emission windows are re-timed by ``debris_retime`` when the playback sliders
+move.  The bake runs with every frame handler detached — the add-on's
+``frame_change_pre`` handler rewrites ~550K vertices per frame, and baking with
+it live corrupts the point caches (the previous attempt produced caches
+misaligned by ~300 frames and had to be re-baked by hand).
 """
 
-from contextlib import contextmanager
-from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+
+import zlib
 
 from .debris_shards import (
     FRACTURE_PROFILES,
@@ -55,6 +63,37 @@ from .impact_detect import (
     local_to_world,
     resolve_glass_damage,
 )
+from .debris_physics import (
+    DEBRIS_COLLECTION,
+    GLASS_COLLECTION,
+    GROUND_CLEARANCE,
+    GROUND_NAME,
+    LAUNCH_FRAMES,
+    LAUNCH_PROP,
+    PARTICLE_BAKED_COLLECTION,
+    PARTICLE_BAKED_PROP,
+    PARTICLE_GROUND_NAME,
+    PARTICLE_SHARD_COLLECTION,
+    SHARD_COLLECTION,
+    DebrisSettings,
+    _bounce_params,
+    _disable_ground_particle_collision,
+    _ensure_ground,
+    _ensure_particle_ground,
+    _ensure_particle_templates,
+    _ensure_rigidbody_world,
+    _frozen_handlers,
+    _get_collection,
+    _key_visibility,
+    _linearise,
+    _local_verts,
+    _safe_name,
+    _viewport_context,
+    configure_glass_rigidbody,
+    configure_particle_physics,
+    configure_rigidbody,
+    link_ground_to_rigidbody_world,
+)
 
 try:  # pragma: no cover - only inside Blender
     import bpy
@@ -62,8 +101,6 @@ try:  # pragma: no cover - only inside Blender
 except ImportError:  # pragma: no cover
     bpy = None
     mathutils = None
-
-import zlib
 
 
 def _stable_hash(text: str) -> int:
@@ -75,25 +112,6 @@ def _stable_hash(text: str) -> int:
     rebuilds identically" actually requires.
     """
     return zlib.crc32(text.encode("utf-8", "surrogatepass"))
-
-
-DEBRIS_COLLECTION = "BeamNG Debris"
-SHARD_COLLECTION = "BeamNG Debris Shards"
-GROUND_NAME = "BeamNG_DebrisGround"
-
-#: Frames a hero piece travels kinematically before the solver takes over.
-#: This is how launch velocity is transferred — see :func:`_spawn_hero_pieces`.
-#: Fewer than ~3 transfers no measurable velocity.
-LAUNCH_FRAMES = 3
-
-#: Clearance kept between a body's LOWEST POINT and the ground collider.
-#: Not between its origin and the ground — see :func:`_lowest_point_offset`.
-GROUND_CLEARANCE = 0.004
-
-#: Custom property holding the frame a hero piece becomes visible.  The bake
-#: clears each body's animation data, so the visibility keys written at spawn
-#: have to be re-derivable afterwards — see :func:`_key_visibility`.
-LAUNCH_PROP = "_beamng_debris_launch"
 
 
 def _lowest_point_offset(template: "bpy.types.Object",
@@ -127,30 +145,6 @@ def _lowest_point_offset(template: "bpy.types.Object",
     return float(min(0.0, (co @ basis.T)[:, 2].min()))
 
 
-def _local_verts(obj: "bpy.types.Object",
-                 _cache: Dict[str, np.ndarray] = {}) -> Optional[np.ndarray]:
-    """Object-space vertices of ``obj`` as an ``(N, 3)`` float64 array.
-
-    Cached by mesh name.  The bake calls this once per body per frame across
-    hundreds of bodies and thousands of frames, and ``foreach_get`` on a fresh
-    buffer every time is what turns the ground-snap pass from seconds into
-    minutes.  Hero shards deliberately SHARE mesh data between instances (see
-    :func:`_spawn_hero_pieces`), so the cache hit rate is high.
-    """
-    mesh = getattr(obj, "data", None)
-    count = len(mesh.vertices) if mesh is not None else 0
-    if not count:
-        return None
-    hit = _cache.get(mesh.name)
-    if hit is not None and len(hit) == count:
-        return hit
-    co = np.empty(count * 3, dtype=np.float64)
-    mesh.vertices.foreach_get("co", co)
-    co = co.reshape(-1, 3)
-    _cache[mesh.name] = co
-    return co
-
-
 def _lowest_world_z(obj: "bpy.types.Object", mat) -> Optional[float]:
     """World Z of the body's LOWEST vertex under world matrix ``mat``.
 
@@ -167,274 +161,6 @@ def _lowest_world_z(obj: "bpy.types.Object", mat) -> Optional[float]:
     # Only the Z row is needed: z = m[2,0]x + m[2,1]y + m[2,2]z + m[2,3]
     z = co @ m[2, :3] + m[2, 3]
     return float(z.min())
-
-
-def _linearise(obj: "bpy.types.Object", data_path: str) -> None:
-    """Force LINEAR interpolation on every key of ``data_path``.
-
-    Used for the kinematic launch keys, which encode constant-velocity motion.
-    Blender keys default to Bezier with auto-clamped handles, which eases into
-    and out of every keyframe — so a body meant to travel at a steady v arrives
-    at its release frame with a slope nowhere near v.
-    """
-    action = obj.animation_data.action if obj.animation_data else None
-    if action is None:
-        return
-    for fc in action.fcurves:
-        if fc.data_path != data_path:
-            continue
-        for kp in fc.keyframe_points:
-            kp.interpolation = "LINEAR"
-
-
-def _bounce_params(bounciness: float) -> Tuple[float, float, float]:
-    """Map the single bounciness dial onto ``(restitution, lin_damp, ang_damp)``.
-
-    Restitution alone does not give the behaviour the dial promises.  A Bullet
-    body with ``restitution = 0`` still keeps every bit of its *tangential*
-    velocity on contact, so a shard dropped onto the ground does not bounce but
-    does skate and spin across it for hundreds of frames — which reads as
-    ice-skating debris, not as "no bounce".  Damping is what actually removes
-    the energy, so the dial drives both: as bounciness falls, damping rises.
-
-    At 0.0 the damping is high enough that a piece touching the ground is dead
-    within a few frames — one contact, then it stays put, which is exactly what
-    the 0 end of the slider is documented to do.  At 1.0 damping is near zero
-    and restitution is high, so pieces bounce several times.
-    """
-    b = float(np.clip(bounciness, 0.0, 1.0))
-    restitution = 0.72 * b
-    # Damping ramps the other way. The floor at b=1 stays slightly above 0 so a
-    # fully bouncy scene still settles eventually instead of jittering forever.
-    lin_damp = 0.85 - 0.79 * b
-    ang_damp = 0.92 - 0.80 * b
-    return restitution, lin_damp, ang_damp
-
-
-def _key_visibility(obj: "bpy.types.Object", launch_frame: int) -> None:
-    """Hide a hero piece until the frame it is thrown.
-
-    Without this every piece sits fully visible at its spawn point from frame 1
-    — a static clump hanging in the air for the whole pre-crash run, while the
-    debris that has already launched moves around it.  ``hide_render`` matters
-    as much as ``hide_viewport``: the two are independent, and keying only the
-    viewport leaves the clump in the render.
-    """
-    for attr in ("hide_viewport", "hide_render"):
-        setattr(obj, attr, True)
-        obj.keyframe_insert(attr, frame=launch_frame - 1)
-        setattr(obj, attr, False)
-        obj.keyframe_insert(attr, frame=launch_frame)
-    # Constant interpolation: a float F-curve ramping between 1.0 and 0.0 is
-    # read as visible the moment it drops below 0.5, so a default Bezier key
-    # would pop the piece in a frame early.
-    action = obj.animation_data.action if obj.animation_data else None
-    if action is not None:
-        for fc in action.fcurves:
-            if fc.data_path in ("hide_viewport", "hide_render"):
-                for kp in fc.keyframe_points:
-                    kp.interpolation = "CONSTANT"
-
-
-@dataclass
-class DebrisSettings:
-    """Tunables exposed on the add-on panel."""
-
-    #: Global multiplier on how much debris every impact sheds.
-    density: float = 1.0
-    #: Global multiplier on shard size.
-    scale: float = 1.0
-    #: Pieces simulated as real rigid bodies, per impact, before bias.
-    hero_count: int = 14
-    #: Fine particles emitted per impact, before bias.
-    fine_count: int = 90
-    #: Launch speed in m/s at severity 1.0.
-    #:
-    #: DEFAULT 0 — deliberately.  A radial cone launch from a single point is
-    #: precisely what reads as a firework: every piece leaves one spot at once,
-    #: on a clean parabola, in an expanding shell.  Real crash debris is not
-    #: *fired*, it is *shed* — it separates from the panel and falls, carrying
-    #: only whatever momentum the panel already had.  With speed 0 the pieces
-    #: drop from the impact and the solver does the rest.  Raise it if a
-    #: particular shot wants material thrown.
-    speed: float = 0.0
-    #: How much of the part's own velocity the debris inherits.  This is NOT a
-    #: blast: it is the momentum the material genuinely had when it broke off,
-    #: and it is what makes debris trail behind a moving wreck instead of
-    #: dropping in a vertical column.  Kept modest so a fast impact does not
-    #: turn into a launch by the back door.
-    inherit_velocity: float = 0.3
-    #: Minimum sideways scatter (m/s) given to shed material regardless of
-    #: ``speed``.  Without it every piece of an impact falls from the same
-    #: point and lands in a single tight stack; with it they spread over a
-    #: small patch the way material peeling off a panel does.  Far too small to
-    #: read as a throw.
-    scatter: float = 0.45
-    #: Floor on the RANDOM launch velocity (m/s) for every impact, including
-    #: below-blast grazes.  The blast machinery only hands out directed speed
-    #: above :attr:`min_blast_severity`; below it the spray previously got
-    #: whatever ``scatter`` alone provided and a ground-level graze puddled —
-    #: its particles barely moved (measured: 25 of 121 emitters with centroid
-    #: travel under 0.10 m).  This guarantees the cloud visibly travels in every
-    #: direction.  Deliberately random, not a directed cone, so it reads as a
-    #: puff instead of the firework the blast threshold exists to suppress.
-    min_launch_speed: float = 1.0
-    #: Cone half-angle (degrees) the debris sprays into.
-    spread: float = 55.0
-    #: Ground plane height.
-    ground_z: float = 0.0
-    #: PARTICLES + DEBRIS BOUNCINESS.  One dial for every piece of debris in the
-    #: scene — hero rigid bodies, glass fragments and fine particles alike, both
-    #: against the ground and against each other.
-    #:
-    #: 0.0 means literally no bounce: a piece that touches the ground stays
-    #: there.  Bullet's restitution alone does not achieve that — a body with
-    #: restitution 0 still skitters and rolls for a long time on residual
-    #: tangential velocity — so at low bounciness the damping is raised in step
-    #: (see :func:`_bounce_params`), which is what actually kills the motion.
-    bounciness: float = 0.25
-    friction: float = 0.72
-    #: Only spawn for events at or above this severity.
-    #:
-    #: NOTE this is a weak capacity lever on real captures: detection normalises
-    #: severity to [0, 1] and its relative floor (0.18 x peak) keeps the events
-    #: clustered in a narrow band — measured 94 of 121 events still pass a 0.3
-    #: threshold.  The effective cap is :attr:`max_hero_total`.
-    min_severity: float = 0.12
-    #: Blast threshold.  Impacts BELOW this severity still shed debris, but get
-    #: NO launch blast — no cone spray, no inherited throw — the pieces simply
-    #: fall straight from the impact point and let the physics settle them.
-    #: Without this, even a gentle back-of-car brushing the ground (severity
-    #: ~0.2) fired a full firework: the speed formula
-    #: ``speed * (0.35 + 0.65 * severity)`` has a 0.35 floor, so every event
-    #: sprayed at 1.6+ m/s.  Measured on the real capture the back-landing is
-    #: 0.20-0.23 and the door-smash is 0.41-0.55, so 0.35 cleanly separates
-    #: "fall straight" from "blast".
-    min_blast_severity: float = 0.35
-    #: Cap on total spawned rigid bodies, so a huge capture cannot hang Blender.
-    #: 900 measured ~28 min to bake a 1200-frame capture (900 bodies x ~3000
-    #: frames x 7 fcurves); 240 is the sane default.  The budget is allocated
-    #: PROPORTIONALLY to severity, so the first crash dominates (measured ~133
-    #: of 240) but follow-up impacts — the car slamming onto its side, then
-    #: landing on its back — still shed a visible medium share instead of being
-    #: starved to zero by a greedy budget (which let the opening crash swallow
-    #: all 200).
-    max_hero_total: int = 240
-    #: Distinct shard meshes generated per (part, material).
-    variants: int = 8
-    #: Extra frames simulated past the last impact so debris comes to rest.
-    settle_frames: int = 260
-    #: Random seed, so a given scene always rebuilds identically.
-    seed: int = 12345
-    #: Shatter glass members out of the car when they break.
-    shatter_glass: bool = True
-
-    # --- realism -----------------------------------------------------------
-    #: Air drag on fine particles (Blender's ``ParticleSettings.damping``).
-    #: Zero drag is what produces the "firework" read: every chip flies a clean
-    #: ballistic parabola and the whole spray stays a coherent expanding shell.
-    #: Real debris is light with a large frontal area, so it decelerates fast,
-    #: the spray loses its shape within a few metres, and small pieces fall
-    #: short of big ones.
-    air_drag: float = 0.35
-    #: Solver subframes for fine particles.  Particles are launched at 10-25 m/s
-    #: and at 60 fps that is up to 0.4 m per frame — several times a shard's own
-    #: size — so a single-step solver lets them pass through the ground before
-    #: it ever tests a collision.  4 subframes cut that to ~0.1 m per substep,
-    #: which still lets a fast particle skip across the COLLISION surface; the
-    #: rigid-body slab has real thickness to catch what tunnels, but NEWTON
-    #: particles collide against the mesh and have no "inside".  10 subframes
-    #: plus the collision thickness in _ensure_ground keeps the spray above the
-    #: plane (measured: the old value dropped a visible share of shards to
-    #: z=-40).
-    particle_subframes: int = 10
-    #: Emission window in frames.  A 2-frame window fires the entire spray as
-    #: one shell, which is the other half of the firework look.  Spreading
-    #: emission over a handful of frames staggers the departure the way real
-    #: material peels off over the duration of the crush.
-    emit_window: int = 6
-    #: Fraction of the launch speed that is randomised per particle.  Real
-    #: fragments leave at wildly different speeds; a tight distribution reads
-    #: as a coordinated burst.
-    speed_spread: float = 1.0
-    #: Extra spread (degrees) added to the cone at full severity.  A harder hit
-    #: throws material over a wider arc.
-    spread_gain: float = 40.0
-    #: Multiplier on how strongly severity drives particle count.  This is the
-    #: "intensity" dial: at 0 every impact sheds the same amount, at 1 the
-    #: count scales fully with how hard the hit was.
-    intensity_gain: float = 1.0
-
-
-# ---------------------------------------------------------------------------
-# Handler safety
-# ---------------------------------------------------------------------------
-
-
-@contextmanager
-def _viewport_context():
-    """Run an operator as if invoked from the 3D viewport.
-
-    ``rigidbody.bake_to_keyframes`` is a Python operator that internally calls
-    ``anim.keyframe_insert_by_name``, whose poll fails outside a VIEW_3D area.
-    Called from a panel button the context is already right, but from a script,
-    a timer, or a headless run it is not, and the bake dies partway through with
-    "context is incorrect" — after having already created some keyframes.
-    Overriding onto a real viewport area makes the bake work from anywhere.
-    """
-    if bpy is None:
-        yield
-        return
-    win = getattr(bpy.context, "window", None)
-    screen = getattr(win, "screen", None) if win else None
-    area = next((a for a in screen.areas if a.type == "VIEW_3D"), None) if screen else None
-    region = next((r for r in area.regions if r.type == "WINDOW"), None) if area else None
-
-    if area is None or region is None:
-        # Headless / no viewport: run unmodified and let the caller handle it.
-        yield
-        return
-    with bpy.context.temp_override(window=win, area=area, region=region):
-        yield
-
-
-@contextmanager
-def _frozen_handlers():
-    """Detach every frame-change handler for the duration of a bake.
-
-    See the module docstring: baking with the BeamNG vertex-playback handler
-    live produces corrupt point caches.  Restores the exact handler list on the
-    way out, including on exception.
-    """
-    if bpy is None:
-        yield
-        return
-    pre = list(bpy.app.handlers.frame_change_pre)
-    post = list(bpy.app.handlers.frame_change_post)
-    bpy.app.handlers.frame_change_pre.clear()
-    bpy.app.handlers.frame_change_post.clear()
-    try:
-        yield
-    finally:
-        bpy.app.handlers.frame_change_pre.clear()
-        bpy.app.handlers.frame_change_post.clear()
-        for h in pre:
-            bpy.app.handlers.frame_change_pre.append(h)
-        for h in post:
-            bpy.app.handlers.frame_change_post.append(h)
-
-
-# ---------------------------------------------------------------------------
-# Scene helpers
-# ---------------------------------------------------------------------------
-
-
-def _get_collection(name: str, parent=None) -> "bpy.types.Collection":
-    coll = bpy.data.collections.get(name)
-    if coll is None:
-        coll = bpy.data.collections.new(name)
-        (parent or bpy.context.scene.collection).children.link(coll)
-    return coll
 
 
 #: Prefix of every material :func:`_apply_glass_crack` builds.  Used to find
@@ -505,7 +231,7 @@ def clear_debris() -> int:
             scene.rigidbody_world = None
 
     # Safety: remove any leftover debris emitters that might not have been
-    # cleaned up (e.g. if bake_particles wasn't called).
+    # cleaned up by a previous interrupted build.
     for obj in list(bpy.data.objects):
         if obj.name.startswith("debris_emit_"):
             bpy.data.objects.remove(obj, do_unlink=True)
@@ -533,382 +259,6 @@ def clear_debris() -> int:
     except Exception:
         pass
     return removed
-
-
-def _ensure_ground(settings: DebrisSettings) -> "bpy.types.Object":
-    """A large passive collision slab for the debris to land on.
-
-    The collider has real thickness (not a zero-thickness plane): a shard
-    released fast enough to skip across the top surface in one solver substep
-    still lands *inside* the slab and is pushed back up.  With a plain quad the
-    same shard tunnels straight through and falls out of the world (measured on
-    real capture data: glass at z=-50, 20+ m of sideways drift).
-    """
-    ground = bpy.data.objects.get(GROUND_NAME)
-    if ground is None:
-        mesh = bpy.data.meshes.new(GROUND_NAME)
-        size = 400.0
-        thickness = 0.2
-        verts = [(-size, -size, 0.0), (size, -size, 0.0),
-                 (size, size, 0.0), (-size, size, 0.0),
-                 (-size, -size, -thickness), (size, -size, -thickness),
-                 (size, size, -thickness), (-size, size, -thickness)]
-        faces = [(0, 1, 2, 3), (4, 5, 6, 7),
-                 (0, 1, 5, 4), (1, 2, 6, 5),
-                 (2, 3, 7, 6), (3, 0, 4, 7)]
-        mesh.from_pydata(verts, [], faces)
-        mesh.update()
-        ground = bpy.data.objects.new(GROUND_NAME, mesh)
-        _get_collection(DEBRIS_COLLECTION).objects.link(ground)
-    ground.location = (0.0, 0.0, settings.ground_z)
-    ground.hide_render = True
-    ground.display_type = "WIRE"
-
-    # NEWTON particles only collide with objects carrying a COLLISION modifier;
-    # the rigid-body slab is invisible to them, so fine debris used to fall
-    # straight through (measured: shards dropped under the ground).  The same
-    # ground can be both a rigid body (hero pieces) and a COLLISION collider
-    # (fine debris) — the two systems are independent.
-    if not any(m.type == "COLLISION" for m in ground.modifiers):
-        ground.modifiers.new(name="Collision", type="COLLISION")
-    if getattr(ground, "collision", None) is not None:
-        col = ground.collision
-        col.friction_factor = settings.friction
-        col.permeability = 0.0
-        # PARTICLE bounce lives on ``damping_factor``, NOT on ``damping``.
-        # ``damping`` is the soft-body/cloth field and has no effect whatsoever
-        # on a NEWTON particle system, so the old value here was doing nothing
-        # and every chip bounced with Blender's default elasticity — half of why
-        # the fine debris pinballed instead of settling.  ``damping_factor`` is
-        # inverted relative to restitution: 1.0 absorbs all the impact energy.
-        bounciness = float(np.clip(settings.bounciness, 0.0, 1.0))
-        col.damping_factor = 1.0 - 0.85 * bounciness
-        col.damping_random = 0.15 * bounciness
-        # Kill the tangential skate at low bounciness for the same reason the
-        # rigid bodies get extra damping: restitution 0 stops the bounce but not
-        # the slide, and a chip sliding across the road forever reads as wrong.
-        col.friction_factor = float(np.clip(
-            settings.friction + 0.6 * (1.0 - bounciness), 0.0, 5.0))
-        col.damping = 0.6
-        # A thin collision surface lets a fast particle cross the top face
-        # inside one substep and fall out of the world — the COLLISION system,
-        # unlike the rigid-body slab, has no thickness to catch it once past.
-        # Thickening the outer zone deflects the particle while it is still
-        # above the plane (measured: shards at z=-40 with the default 0.02).
-        #
-        # ``thickness_outer`` is an absolute distance in METRES, and it stacks on
-        # top of the collision radius: a particle rests at ``radius + outer``
-        # above the plane.  With radius collision enabled (see
-        # :func:`_ensure_particle_templates`) 0.12 m of it would park every chip
-        # a hand's width in the air — the exact hovering failure the radius
-        # change exists to remove — so :func:`_disable_ground_particle_collision`
-        # removes this modifier entirely once the sunk particle deflector exists.
-        # The value here is the
-        # point-collision default, which is what a build with no scaled
-        # templates falls back to.
-        ground.collision.thickness_outer = 0.12
-        ground.collision.thickness_inner = 0.06
-    return ground
-
-
-#: Separate deflector for the fine particles, sunk below the visible ground.
-#: See :func:`_ensure_particle_ground`.
-PARTICLE_GROUND_NAME = "BeamNG_DebrisGround_Particles"
-
-
-def _ensure_particle_ground(settings: DebrisSettings, radius: float,
-                            drop: float, suffix: str = "",
-                            ) -> Optional["bpy.types.Object"]:
-    """Deflector for the particles, sunk so their SHARDS land on ``ground_z``.
-
-    Colliding on a radius stops chips sinking, but it introduces the opposite
-    error: the solver rests the particle's SPHERE on the plane, while the flat
-    shard drawn inside that sphere extends less than a radius downward, so the
-    piece floats by the difference (measured ~20 mm — visible, and the contact
-    shadow still detaches).  The radius cannot simply be shrunk to fix it: it is
-    also the anti-tunnelling buffer, and a radius smaller than the shard's own
-    extent puts the piece back under the ground.
-
-    The two jobs come apart by moving the PLANE instead of the radius.  This
-    deflector sits ``drop`` below the visible ground, where ``drop`` is the
-    systematic hover measured from the geometry, so a chip resting on it lands
-    its shard on ``ground_z``.  It cannot be the same object as the rigid-body
-    ground — the hero shards must keep colliding with the true surface, and they
-    are baked and ground-snapped separately.
-
-    ONE PLANE PER MATERIAL.  ``drop`` is derived from the shard size, and the
-    libraries span a 10x range (glass 12-55 mm, paint 30-130 mm), so a single
-    shared plane would be right for one material and wrong for the rest.  Blender
-    deflects a particle against EVERY collider in the scene, so these cannot
-    simply be stacked at different heights — a glass chip would stop on the
-    paint plane if that one happened to be higher.  Each is therefore restricted
-    to its own emitter's particles via the collision collection set on the
-    particle system (see ``_spawn_fine_particles``).
-
-    ``hide_render``/``hide_viewport`` are both left on: a COLLISION modifier
-    keeps deflecting while the object is hidden from the render, and this slab
-    is a physics proxy that must never appear in a shot.
-    """
-    if bpy is None or radius <= 0.0:
-        return None
-    name = f"{PARTICLE_GROUND_NAME}{suffix}"
-    ground = bpy.data.objects.get(name)
-    if ground is None:
-        mesh = bpy.data.meshes.new(name)
-        size = 400.0
-        mesh.from_pydata([(-size, -size, 0.0), (size, -size, 0.0),
-                          (size, size, 0.0), (-size, size, 0.0)],
-                         [], [(0, 1, 2, 3)])
-        mesh.update()
-        ground = bpy.data.objects.new(name, mesh)
-        _get_collection(DEBRIS_COLLECTION).objects.link(ground)
-    ground.location = (0.0, 0.0, settings.ground_z - drop)
-    ground.hide_render = True
-    ground.display_type = "WIRE"
-
-    if not any(m.type == "COLLISION" for m in ground.modifiers):
-        ground.modifiers.new(name="Collision", type="COLLISION")
-    col = getattr(ground, "collision", None)
-    if col is not None:
-        bounciness = float(np.clip(settings.bounciness, 0.0, 1.0))
-        col.damping_factor = 1.0 - 0.85 * bounciness
-        col.damping_random = 0.15 * bounciness
-        col.friction_factor = float(np.clip(
-            settings.friction + 0.6 * (1.0 - bounciness), 0.0, 5.0))
-        col.permeability = 0.0
-        col.damping = 0.6
-        # The radius now supplies the standoff that the thick skin used to, so
-        # the skin drops to a thin safety margin.  See _ensure_particle_ground,
-        # which builds the per-material deflector that replaces this one.
-        col.thickness_outer = max(0.001, min(0.02, radius * 0.25))
-        col.thickness_inner = max(0.001, col.thickness_outer * 0.5)
-    return ground
-
-
-def _disable_ground_particle_collision() -> None:
-    """Stop the MAIN ground deflecting particles, once the sunk one exists.
-
-    The two deflectors are at different heights, and a falling chip stops at
-    whichever it meets first — which is the higher, main one.  Leaving both
-    active silently defeats the sunk plane: the particles rest a radius above
-    ``ground_z`` exactly as they did before, and the offset looks like it had no
-    effect at all.
-
-    Only the COLLISION modifier is removed.  The main ground keeps its PASSIVE
-    rigid body, which is what the hero shards and glass fragments collide with —
-    those are baked and ground-snapped, and must land on the true surface.
-    """
-    ground = bpy.data.objects.get(GROUND_NAME) if bpy is not None else None
-    if ground is None:
-        return
-    for mod in list(ground.modifiers):
-        if mod.type == "COLLISION":
-            ground.modifiers.remove(mod)
-
-
-#: Collection of shard templates pre-scaled for the PARTICLE system.  See
-#: :func:`_ensure_particle_templates` for why this cannot be the same collection
-#: the hero pieces instance from.
-PARTICLE_SHARD_COLLECTION = "BeamNG Debris Shards (Particles)"
-
-
-#: Percentile of the shards' DOWNWARD extent used as the particle collision
-#: radius.  See :func:`_shard_radius` for why it is not the bounding radius and
-#: not the median.
-_SHARD_RADIUS_PCT = 70.0
-
-#: Percentile of the extents used to compute the deflector ``drop`` — the
-#: systematic hover the radius leaves, which the sunk plane cancels.  See the
-#: comment block inside :func:`_ensure_particle_templates`.
-_SHARD_DROP_PCT = 65.0
-
-#: Random orientations sampled per template when measuring that extent.  A
-#: particle lands at an arbitrary angle, so the extent has to be averaged over
-#: orientations rather than read off the template's rest pose.
-_RADIUS_ORIENTATIONS = 24
-
-
-def _shard_extents(objs: Sequence["bpy.types.Object"],
-                   seed: int = 0) -> np.ndarray:
-    """How far each template extends BELOW its own centre, over random landings.
-
-    A particle comes to rest at an arbitrary orientation, so the quantity that
-    decides whether the shard drawn around it looks buried or floating is this
-    per-orientation downward extent — not anything measurable from the
-    template's rest pose.  Returned as a flat array over (template x
-    orientation) so callers can take whatever statistic they need.
-    """
-    rng = np.random.default_rng(seed)
-    out: List[float] = []
-    for obj in objs:
-        co = _local_verts(obj)
-        if co is None:
-            continue
-        # Random rotations via normalised quaternions (uniform on SO(3)).
-        q = rng.normal(size=(_RADIUS_ORIENTATIONS, 4))
-        q /= np.linalg.norm(q, axis=1, keepdims=True)
-        w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-        # Only the matrix's Z row matters — it is what projects onto the ground
-        # normal — so build that directly instead of the full basis.
-        zrow = np.stack([2 * (x * z - y * w),
-                         2 * (y * z + x * w),
-                         1 - 2 * (x * x + y * y)], axis=1)   # (K, 3)
-        out.extend((-(co @ zrow.T).min(axis=0)).tolist())
-    return np.asarray(out, dtype=np.float64)
-
-
-def _shard_radius(objs: Sequence["bpy.types.Object"],
-                  seed: int = 0) -> float:
-    """Collision radius that lands a tumbling shard closest to flat on the plane.
-
-    A NEWTON particle collides as a SPHERE, but a shard is a flat, jagged plate
-    — so no single radius is right for every landing.  What the radius should
-    approximate is how far the piece extends BELOW ITS OWN CENTRE once it comes
-    to rest at whatever angle it happened to land at, which is measured here by
-    sampling random orientations of each template.
-
-    Why not the bounding radius (origin to farthest vertex).  That is the
-    distance to a CORNER, and a flat plate resting on its face extends only a
-    fraction of that downward, so the sphere holds the piece up in the air by
-    the difference: measured 16-21 mm of median hover across the materials, and
-    up to 46 mm at p90.  Trading "half sunk" for "visibly floating" is not a
-    fix — the shadow still detaches.
-
-    Why not the median extent either.  It centres the error on zero, but the
-    distribution is skewed: half the pieces then sink, by up to 23-30 mm at p90.
-    A shard poking through the ground reads as a bug, while the same distance of
-    hover reads merely as a small piece resting on a chip below it, so the
-    percentile is pushed above the median to buy sink-resistance cheaply.  At
-    p70 the worst-case sink drops to 13-21 mm and hover stays under 23 mm —
-    both roughly HALF the current point-collision burial (17-27 mm median,
-    40-57 mm at p90), which is what makes this worth doing at all.
-    """
-    extents = _shard_extents(objs, seed=seed)
-    if not len(extents):
-        return 0.02
-    return float(np.percentile(extents, _SHARD_RADIUS_PCT))
-
-
-def _ensure_particle_templates(
-        settings: DebrisSettings,
-        key: str = "",
-        templates: Optional[Sequence["bpy.types.Object"]] = None,
-        cache: Optional[Dict[str, Tuple]] = None,
-) -> Tuple[Optional["bpy.types.Collection"], float, float]:
-    """Shard templates pre-scaled so particles can collide with a real radius.
-
-    THE HALF-SUBMERGED PARTICLE BUG.  ``ParticleSettings.particle_size`` is
-    ONE number doing TWO jobs: it is the render scale applied to the instanced
-    object AND (with ``use_size_deflect``) the collision radius.  The shard
-    templates are modelled at their true size, so the render job pins it at
-    ~1.0 — and a 1 m collision radius is absurd, which is why the previous fix
-    attempt (just switching ``use_size_deflect`` on) left chips resting at
-    z = 0.35-0.75, hovering half a metre up.  Turning it back OFF collides the
-    particle as a POINT, so the solver rests the shard's CENTRE on the ground
-    and the instance drawn around that centre is exactly half buried — which is
-    precisely the "not a quarter, not too little, exactly half submerged" in the
-    reference screenshot.
-
-    The two jobs are separable by changing the templates instead of the number.
-    A copy of each template scaled UP by ``1/r`` renders at true size when
-    ``particle_size = r``::
-
-        rendered = template_scale x particle_size = (size/r) x r = size
-
-    while the collision radius becomes ``r`` — the shard's actual radius — so a
-    settled chip rests TOUCHING the plane.  The copies must live in their own
-    collection: the hero pieces instance the unscaled originals and would be
-    inflated by ``1/r`` (a 50x blow-up) if this reused SHARD_COLLECTION.
-
-    PER (part, material), not once globally.  The libraries span a 10x size
-    range — glass shards are 12-55 mm, paint flakes 30-130 mm — and one radius
-    across all of them fits none: it buries the glass and floats the paint.  The
-    emitters are already per-material, so each gets templates scaled to its own
-    material's radius.  ``cache`` memoises by ``key`` so the work is done once
-    per library rather than once per impact.
-
-    Returns ``(collection, radius, drop)``.  ``drop`` is the residual hover the
-    radius leaves — the solver rests the SPHERE on the plane while the flatter
-    shard inside reaches less far down — which :func:`_ensure_particle_ground`
-    cancels by sinking the particles' deflector.  The collection is ``None``
-    when there are no templates to scale, in which case the caller keeps point
-    collision.
-    """
-    if cache is not None and key in cache:
-        return cache[key]
-
-    src = list(templates) if templates else None
-    if not src:
-        coll_src = bpy.data.collections.get(SHARD_COLLECTION)
-        src = list(coll_src.objects) if coll_src is not None else []
-    if not src:
-        return None, 0.0, 0.0
-
-    scale = max(1e-6, float(settings.scale))
-    extents = _shard_extents(src, seed=settings.seed) * scale
-    if not len(extents):
-        return None, 0.0, 0.0
-    radius = float(np.percentile(extents, _SHARD_RADIUS_PCT))
-    if radius <= 1e-6:
-        return None, 0.0, 0.0
-    # THE REST HEIGHT IS EXACTLY ``particle_size``.  Measured in Blender 4.5:
-    # a settled particle's CENTRE comes to rest at radius + 0.1 mm, and that is
-    # invariant under both the deflector's ``thickness_outer`` (tried 1-20 mm:
-    # rest height did not move) and the particle's own orientation — the solver
-    # deflects a SPHERE and neither the skin thickness nor the instanced mesh
-    # enters the calculation.
-    #
-    # So the hover is not a statistical effect to be minimised, it is a constant
-    # to be cancelled: the centre sits at ``radius`` while the shard drawn
-    # around it reaches ``median(extents)`` below that centre.  Sinking the
-    # deflector by the difference puts the typical shard's lowest point exactly
-    # on ``ground_z``.  Only the spread of extents remains, which is what
-    # _SHARD_RADIUS_PCT trades off.
-    #
-    # The percentile trades the two directions off.  Measured sink/hover at p90
-    # of the extents (mm, glass / paint / steel):
-    #
-    #     p50   13.7/7.4   18.9/16.5   13.3/11.4
-    #     p65   10.2/11.0  13.0/22.4    9.4/15.4   <- balanced
-    #     p80    5.8/15.4   5.8/29.5    4.7/20.0
-    #
-    # p65 sits where the two are about equal for glass — the material with the
-    # most pieces on screen — and it keeps the worst-case sink well under the
-    # 16-30 mm the piece is buried by today.  Biased slightly ABOVE the median
-    # because a shard poking through the ground reads as a bug while the same
-    # distance of hover reads as the piece resting on a chip underneath it.
-    drop = max(0.0, radius - float(np.percentile(extents, _SHARD_DROP_PCT)))
-
-    # One collection per library, since each is scaled by its own 1/r.
-    coll_name = (f"{PARTICLE_SHARD_COLLECTION} {key}" if key
-                 else PARTICLE_SHARD_COLLECTION)
-    coll = bpy.data.collections.get(coll_name)
-    if coll is None:
-        coll = bpy.data.collections.new(coll_name)
-    else:
-        for obj in list(coll.objects):
-            coll.objects.unlink(obj)
-            if obj.users == 0:
-                bpy.data.objects.remove(obj)
-
-    # The user's Shard Scale is folded in here rather than left to
-    # ``particle_size``, which is already carrying the collision radius.
-    inv = scale / radius
-    for tpl in src:
-        dup = tpl.copy()          # share mesh data; only the scale differs
-        dup.data = tpl.data
-        dup.name = f"{tpl.name}_pcoll"
-        dup.scale = (inv, inv, inv)
-        coll.objects.link(dup)
-
-    # Never linked into the scene: an instance collection only has to exist in
-    # bpy.data, and linking it would drop a pile of 50x shards at the origin.
-    # (Contrast _detach_template_collection, which has to UNLINK the originals —
-    # they are linked so build_shard_library can evaluate them.)
-    out = (coll, radius, drop)
-    if cache is not None:
-        cache[key] = out
-    return out
 
 
 def _detach_template_collection(scene) -> None:
@@ -945,35 +295,6 @@ def _detach_template_collection(scene) -> None:
     for parent in list(bpy.data.collections) + [scene.collection]:
         if coll.name in parent.children:
             parent.children.unlink(coll)
-
-
-def _ensure_rigidbody_world(scene, frame_start: int, frame_end: int) -> None:
-    """Create/point the rigid body world at a collection we control."""
-    if scene.rigidbody_world is None:
-        bpy.ops.rigidbody.world_add()
-
-    rbw = scene.rigidbody_world
-    rb_coll = bpy.data.collections.get("RigidBodyWorld")
-    if rb_coll is None:
-        rb_coll = bpy.data.collections.new("RigidBodyWorld")
-    rbw.collection = rb_coll
-
-    if rbw.constraints is None:
-        con = bpy.data.collections.get("RigidBodyConstraints")
-        if con is None:
-            con = bpy.data.collections.new("RigidBodyConstraints")
-        rbw.constraints = con
-
-    rbw.enabled = True
-    # Substeps/iterations well above default: shards are small and fast, and the
-    # default 10 lets them tunnel straight through the ground plane.
-    rbw.substeps_per_frame = 12
-    rbw.solver_iterations = 24
-    rbw.point_cache.frame_start = frame_start
-    rbw.point_cache.frame_end = frame_end
-
-    scene.use_gravity = True
-    scene.gravity = (0.0, 0.0, -9.81)
 
 
 # ---------------------------------------------------------------------------
@@ -1116,8 +437,9 @@ def _spawn_hero_pieces(event: ImpactEvent, count: int,
         obj.name = f"debris_{event.material}_{spawn_frame}_{i:03d}"
 
         # Increase spawn jitter significantly: 4.5cm was too small, pieces overlapped
-        # at birth and got stuck together.  15-25cm gives proper initial separation.
-        jitter = rng.normal(0.0, 0.20, 3)
+        # at birth and got stuck together.  30-40cm gives proper initial separation
+        # so pieces don't collide and stick at birth.
+        jitter = rng.normal(0.0, 0.35, 3)
         spawn_at = origin + jitter
         rotation = tuple(rng.uniform(0.0, 2.0 * np.pi, 3))
         obj.rotation_euler = rotation
@@ -1172,9 +494,10 @@ def _spawn_hero_pieces(event: ImpactEvent, count: int,
         dir_rot = dir_rot / np.linalg.norm(dir_rot)
 
         # Base separation speed: even at speed=0, give a random outward kick
-        # so pieces don't fall as a tight cluster.  Increased from 0.7-1.6
-        # to ensure separation at default scatter (0.45).
-        base_sep = scatter * float(rng.uniform(1.0, 2.0))
+        # so pieces don't fall as a tight cluster.  Increased significantly:
+        # at default scatter=0.45, severity≈0.5 → scatter≈0.315.
+        # Need much stronger kick (5-8×) to overcome clumping from single-point radial spawn.
+        base_sep = scatter * float(rng.uniform(5.0, 8.0))
         speed_mult = speed * float(rng.uniform(0.6, 1.35)) if speed > 0 else 0.0
         sep = dir_rot * (base_sep + speed_mult)
         sep[2] = abs(sep[2]) * 0.25
@@ -1255,45 +578,22 @@ def _spawn_hero_pieces(event: ImpactEvent, count: int,
 
     # Phase 2: let the depsgraph evaluate the freshly-placed pieces so their
     # world matrices are real before the rigid bodies register against them.
+    # The registration itself happens on the next evaluation, which reads the
+    # phase-1 world matrix — not origin.  Mass is derived from the material
+    # profile and the piece's scale here (the caller owns the profile lookup);
+    # the actual body configuration — kinematic keys, body type, collision
+    # shape, restitution/damping, deactivation — is delegated to
+    # configure_rigidbody in debris_physics.
     bpy.context.view_layer.update()
     for obj, launch_start, s, is_blast in placed:
         rb_coll.objects.link(obj)
-        rb = obj.rigid_body
-        if rb is None:
+        if obj.rigid_body is None:
             continue
-
-        if is_blast:
-            # Kinematic keyframes ride on the RIGID BODY, so they have to be
-            # inserted here, after the body exists.  The registration itself
-            # happens on the next evaluation, which reads the phase-1 world
-            # matrix — not origin.
-            for k in range(LAUNCH_FRAMES + 1):
-                rb.kinematic = k < LAUNCH_FRAMES
-                rb.keyframe_insert("kinematic", frame=launch_start + k)
-            rb.type = "ACTIVE"
-        else:
-            rb.type = "ACTIVE"
-        # Convex hull is both cheaper and more stable than mesh collision for
-        # small chunky solids, and our shards are convex by construction.
-        rb.collision_shape = "CONVEX_HULL"
-        rb.mass = max(0.004, profile.thickness * 90.0 * s ** 3)
-        # One dial drives restitution AND damping — see _bounce_params for why
-        # restitution alone cannot deliver "0 = no bounce at all".
-        rest, lin_damp, ang_damp = _bounce_params(settings.bounciness)
-        rb.restitution = rest
-        rb.friction = settings.friction
-        rb.linear_damping = lin_damp
-        rb.angular_damping = ang_damp
-        rb.use_margin = True
-        rb.collision_margin = 0.002
-        # Let a settled piece fall asleep instead of jittering on the ground
-        # forever; a sleeping body is also what makes the bake's tail cheap.
-        rb.use_deactivation = True
-        rb.use_start_deactivated = False
-        rb.deactivate_linear_velocity = 0.06 + 0.14 * (
-            1.0 - float(np.clip(settings.bounciness, 0.0, 1.0)))
-        rb.deactivate_angular_velocity = 0.12 + 0.28 * (
-            1.0 - float(np.clip(settings.bounciness, 0.0, 1.0)))
+        configure_rigidbody(
+            obj, settings,
+            mass=profile.thickness * 90.0 * s ** 3,
+            is_blast=is_blast,
+            launch_start=launch_start)
 
     return spawned
 
@@ -1313,6 +613,12 @@ def _spawn_fine_particles(event: ImpactEvent, count: int,
     rather than sliding along like decals) and the emitter carries the part's
     own velocity, so the spray is thrown *off the part* instead of merely
     falling from a fixed point.
+
+    The NEWTON solver settings, the collision radius (from the pre-scaled
+    templates), the sunk per-material deflector and the drag/rotation physics
+    are configured by :func:`debris_physics.configure_particle_physics`; this
+    function owns the EMISSION (count, window, lifetime, velocities) and the
+    RENDER (which instanced collection, rotation instancing) side.
     """
     if not templates or count <= 0:
         return None
@@ -1373,76 +679,15 @@ def _spawn_fine_particles(event: ImpactEvent, count: int,
     st.lifetime_random = 0.05
     st.emit_from = "FACE"
     st.use_emit_random = True
-    st.physics_type = "NEWTON"
-    st.mass = max(0.002, profile.thickness * 40.0)
 
-    # SIZE.  ``particle_size`` is both the render scale for instanced objects
-    # AND the collision radius.  The old 0.5 gave a ~0.18 m collision radius
-    # around shards that render at ~0.014 m, so particles rested a hand's width
-    # above the ground and bounced off each other like beach balls.  The shard
-    # SIZE / COLLISION RADIUS.  These are the same field, so the templates are
-    # pre-scaled to separate them — see _ensure_particle_templates.  With the
-    # scaled collection in play ``particle_size`` becomes the shard's real
-    # radius (~1-3 cm) and the instances still render at true size; without it
-    # this falls back to the old true-size/point-collision pairing.
-    pcoll, pradius, pdrop = (particle_templates if particle_templates is not None
-                             else _ensure_particle_templates(settings))
-    # With the scaled collection the Shard Scale already lives in the template
-    # scale, so this field carries ONLY the collision radius.
-    st.particle_size = pradius if pcoll is not None else 1.0 * settings.scale
-    # SIZE VARIATION scales the collision radius per particle as well as the
-    # render size. The sunk deflector is calibrated for ONE radius, so a spread
-    # would re-scatter rest heights during the live simulation — but the bake
-    # step (bake_particles) clamps every particle to the ground per-frame,
-    # fixing any penetration/hover from size variation. This gives the visual
-    # variety of a statistical spray without the half-submerged bug.
-    st.size_random = 0.35 if pcoll is not None else 0.7
-    # Mass follows size, so big fragments carry momentum and small chips are
-    # stopped by drag — without this every piece decelerates identically.
-    st.use_multiply_size_mass = True
-
-    # THIS EMITTER'S OWN DEFLECTOR, sunk by the drop its shard size implies.
-    # ``collision_collection`` restricts the system to that one plane, which is
-    # what makes per-material drops possible: Blender otherwise deflects a
-    # particle against EVERY collider in the scene, so a glass chip would stop
-    # on whichever material's plane happened to sit highest.
-    # Keyed by LIBRARY — the same (part, material) key the scaled templates and
-    # therefore the radius come from, so the plane a system collides with is
-    # always the one calibrated for the shards it is instancing.  Two parts of
-    # the same material have different shard sizes and so need different planes.
-    # This is per library, not per impact: ~a dozen planes, not one per event.
-    if pcoll is not None:
-        tag = _safe_name(f"{event.part}_{event.material}")
-        pground = _ensure_particle_ground(settings, pradius, pdrop,
-                                          suffix=f"_{tag}")
-        if pground is not None:
-            holder = _get_collection(f"{PARTICLE_GROUND_NAME}_{tag}",
-                                     parent=_get_collection(DEBRIS_COLLECTION))
-            if pground.name not in holder.objects:
-                holder.objects.link(pground)
-            st.collision_collection = holder
-
-    # AIR DRAG.  The single biggest cue that debris is light: it sheds speed
-    # fast, so the spray loses its shape instead of holding a clean parabola.
-    # At low bounciness the drag is raised too, so a chip that has landed loses
-    # its remaining speed instead of sliding away across the road.
-    bounciness = float(np.clip(settings.bounciness, 0.0, 1.0))
-    st.damping = float(np.clip(settings.air_drag + 0.45 * (1.0 - bounciness),
-                               0.0, 1.0))
-    # Sub-stepping the solver: at 10-25 m/s a particle covers up to 0.4 m per
-    # frame, several times its own size, and would tunnel through the ground.
-    st.subframes = int(max(0, settings.particle_subframes))
-    # RADIUS collision, now that ``particle_size`` carries the shard's true
-    # radius instead of its render scale.  Point collision (the previous
-    # behaviour, kept as the fallback) rests the shard's CENTRE on the ground,
-    # so the instance drawn around it is exactly half buried — the reported
-    # bug.  Deflecting on the radius rests the shard's SURFACE on the ground.
-    #
-    # The earlier attempt at this flag failed only because ``particle_size`` was
-    # still ~1.0, giving a half-metre collision radius and chips hovering at
-    # z=0.35-0.75; see _ensure_particle_templates for how the render scale and
-    # the collision radius were separated.
-    st.use_size_deflect = pcoll is not None
+    # NEWTON solver + collision physics: physics type, mass, the collision
+    # radius carried by ``particle_size`` (from the pre-scaled templates), the
+    # sunk per-material deflector, drag, subframes, radius deflection and
+    # dynamic rotation.  Returns the pre-scaled template collection the RENDER
+    # side needs below.
+    pcoll = configure_particle_physics(
+        st, event, settings, particle_templates,
+        mass=profile.thickness * 40.0)
 
     # NORMAL_FACTOR is emission ALONG THE EMITTER'S NORMAL — i.e. every particle
     # leaving in the same direction at the same speed from the same point.  That
@@ -1454,12 +699,19 @@ def _spawn_fine_particles(event: ImpactEvent, count: int,
     # The scatter goes in as RANDOM velocity instead, so the pieces separate
     # from each other rather than all flying outward together.  Random velocity
     # has no preferred direction, so it cannot produce a shell.
-    scatter = max(0.0, float(settings.scatter)) * (0.4 + 0.6 * intensity)
-    # FLOOR so even a grazing impact sheds material that visibly travels
-    # (see ``min_launch_speed``): a puff in every direction, not a cone.
-    scatter = max(scatter,
-                  settings.min_launch_speed * (0.4 + 0.6 * intensity))
-    st.factor_random = (scatter
+    # Scatter velocity: scale aggressively with settings.scatter so that
+    # scatter=5 gives a massive random velocity kick, while scatter=0.45
+    # remains gentle.  The old linear mapping capped at ~3.5 m/s even at
+    # scatter=5; now it scales quadratically so scatter=5 gives ~50 m/s
+    # random velocity, enough to overcome radial clumping.
+    base_scatter = max(0.0, float(settings.scatter))
+    intensity_factor = 0.4 + 0.6 * intensity
+    # Quadratic scaling: scatter=0.45 -> ~0.2, scatter=1.0 -> ~1.0, scatter=5.0 -> ~25
+    effective_scatter = base_scatter * base_scatter * intensity_factor
+    # Floor: even at low scatter, ensure minimum separation
+    effective_scatter = max(effective_scatter,
+                            settings.min_launch_speed * intensity_factor)
+    st.factor_random = (effective_scatter
                         + speed * float(np.clip(settings.speed_spread, 0.0, 2.0)))
     # Inherit the part's momentum so the spray trails the moving wreck. This is
     # the only *directed* velocity left by default, and it is the correct one:
@@ -1486,9 +738,6 @@ def _spawn_fine_particles(event: ImpactEvent, count: int,
         st.use_collection_pick_random = True
     st.use_rotation_instance = True
 
-    st.effector_weights.gravity = 1.0
-    st.use_dynamic_rotation = True
-
     # Hide the emitter quad until the impact, so it does not sit as a tiny
     # fixed square at each impact point from frame 1 (measured: 121 quads
     # visible at frame 1).  Emission itself was always gated by frame_start;
@@ -1511,9 +760,6 @@ def _spawn_fine_particles(event: ImpactEvent, count: int,
     emitter.keyframe_insert("hide_viewport", frame=end_hide)
 
     return emitter
-
-
-GLASS_COLLECTION = "BeamNG Debris Glass"
 
 
 @dataclass
@@ -1569,10 +815,11 @@ def _spawn_glass_pane(part: str, tier: str, event: ImpactEvent,
                       settings: DebrisSettings,
                       glass_settings: GlassSettings,
                       coll: "bpy.types.Collection",
-                      rb_coll: Optional["bpy.types.Collection"],
                       material: Optional["bpy.types.Material"],
                       rng: np.random.Generator,
                       output_fps: float = 24.0,
+                      frame_end: int = 0,
+                      rb_coll: Optional["bpy.types.Collection"] = None,
                       ) -> Tuple[List["bpy.types.Object"], int]:
     """Break one pane into fragments and place them in the scene.
 
@@ -1604,6 +851,14 @@ def _spawn_glass_pane(part: str, tier: str, event: ImpactEvent,
     )
     if not fragments:
         return [], 0
+
+    # Compute pane normal from fragment centres (all lie on the pane plane).
+    centres = np.array([f.centre for f in fragments], dtype=np.float64)
+    centred = centres - centres.mean(axis=0)
+    _, _, vt = np.linalg.svd(centred.T @ centred)
+    pane_normal = vt[2]  # smallest singular vector = plane normal
+    if pane_normal @ np.array(event.velocity, dtype=np.float64) < 0:
+        pane_normal = -pane_normal  # point outward from car
 
     intensity = impact_intensity(event, settings)
     part_vel = np.array(event.velocity, dtype=np.float64)
@@ -1638,122 +893,125 @@ def _spawn_glass_pane(part: str, tier: str, event: ImpactEvent,
         obj = bpy.data.objects.new(f"glassfrag_{part}_{i:03d}", mesh)
         obj.location = tuple(float(c) for c in frag.centre)
         coll.objects.link(obj)
+        dynamic.append(obj)
 
-        # Fragments closest to the impact are thrown hardest — the strike drives
-        # them out while the far side of the pane merely falls away.
-        blow = float(np.exp(-2.4 * frag.impact_distance))
-        away = np.array(frag.centre, dtype=np.float64) - np.array(
-            event.position, dtype=np.float64)
-        n = np.linalg.norm(away)
-        away = away / n if n > 1e-6 else np.array((0.0, 0.0, 1.0))
+        # Disable auto-keying for this object's animation.
+        obj.animation_data_clear()
 
-        # ``away`` is the outward direction from the impact.  With ``speed`` 0
-        # by default the launch term vanishes and glass should simply fall out
-        # of the aperture.  Scatter alone (0.45 m/s) is too small to break the
-        # clump — we add per-fragment direction jitter and a small base
-        # separation velocity so fragments fan out naturally instead of staying
-        # in a tight ball.
-        scatter = max(0.0, float(settings.scatter)) * (0.4 + 0.6 * intensity)
-
-        # Per-fragment direction variation: rotate the radial ``away`` vector by
-        # a random angle around the pane normal (up to ±35°) plus a small
-        # out-of-plane tilt (±15°).  This fans the spray into a proper cloud.
-        pane_normal = np.array(event.normal, dtype=np.float64)
-        nrm = np.linalg.norm(pane_normal)
-        pane_normal = pane_normal / nrm if nrm > 1e-6 else np.array((0.0, 0.0, 1.0))
-        # Random axis in the pane plane
-        theta = float(rng.uniform(-0.61, 0.61))  # ±35°
-        c, s = np.cos(theta), np.sin(theta)
-        # Rotate ``away`` around pane_normal by theta (Rodrigues)
-        away_rot = (away * c +
-                    np.cross(pane_normal, away) * s +
-                    pane_normal * (pane_normal @ away) * (1 - c))
-        # Small out-of-plane tilt
-        tilt = float(rng.uniform(-0.26, 0.26))  # ±15°
-        away_rot = away_rot * np.cos(tilt) + pane_normal * np.sin(tilt)
-        away = away_rot / np.linalg.norm(away_rot)
-
-        # Base separation speed: even at speed=0, give each fragment a small
-        # random outward kick so they don't fall as a solid sheet.
-        base_sep = scatter * float(rng.uniform(0.8, 1.8))
-        launch_speed = (settings.speed * profile_for("glass").speed_bias
-                        * (0.3 + 1.4 * intensity))
-        vel = away * (launch_speed + base_sep) * blow * float(rng.uniform(0.55, 1.4))
-
-        # Add inherited velocity BEFORE Z clamp so it's also flattened.
-        vel = vel + part_vel * settings.inherit_velocity * intensity
-
-        # Flatten the outward throw: glass falling out of a window should not be
-        # lobbed upward off the car.  KILL all upward Z velocity entirely.
-        vel[2] = min(vel[2], 0.0)
-
-        # Per-fragment position jitter: offset the start position slightly along
-        # the pane plane so fragments don't all begin at the exact same point.
-        # Scale by fragment size (~2-5 cm) so the jitter is subtle but breaks
-        # the perfect grid alignment of Voronoi centroids.
-        jitter_scale = 0.03 * float(rng.uniform(0.5, 1.5))
+        # Launch frame parameters.
+        launch_start = spawn_frame - LAUNCH_FRAMES
+        death = frame_end  # glass lives until scene end
+        low_off = _lowest_point_offset(obj, (0.0, 0.0, 0.0), 1.0)
+        floor = settings.ground_z + GROUND_CLEARANCE - low_off
+        # Position jitter: offset start SIGNIFICANTLY along pane plane to prevent clumping.
+        # Was 3cm, now 0.5-2.0m to ensure fragments start separated.
+        jitter_scale = float(rng.uniform(0.5, 2.0))
         jitter_dir = np.array([float(rng.uniform(-1, 1)),
                                float(rng.uniform(-1, 1)), 0.0])
         jitter_dir = jitter_dir / (np.linalg.norm(jitter_dir) + 1e-9)
         base = np.array(frag.centre, dtype=np.float64) + jitter_dir * jitter_scale
-        # Clamp on the fragment's LOWEST POINT, not its origin — exactly as the
-        # hero pieces do (see _lowest_point_offset).  The launch phase is
-        # KINEMATIC and ignores collisions, so a strong inherited downward
-        # velocity carries the centre down to the ground_z + GROUND_CLEARANCE
-        # floor while the hull, which extends several cm BELOW the centre, is
-        # already buried in the slab.  Bullet resolves that initial penetration
-        # by ejecting the body through the nearest face — for a thin flat shard
-        # that is downward — and the fragment free-falls out of the world
-        # (measured on the real cache: 15 backlight/trunkglass fragments ended
-        # at z=-107 to -118 with the centre-only clamp).  Skimming on the lowest
-        # point keeps the hull clear of the collider at release.
-        low_off = _lowest_point_offset(obj, (0.0, 0.0, 0.0), 1.0)
-        floor = settings.ground_z + GROUND_CLEARANCE - low_off
-        for k in range(LAUNCH_FRAMES + 1):
-            loc = base + vel * dt * k
+        # Clamp the initial position so the fragment's lowest vertex sits
+        # above ground.  Without this, fragments spawned on the lower half of
+        # a glass pane extend below ground_z from birth and the bake captures
+        # those positions.
+        if base[2] < floor:
+            base[2] = floor
+        obj.location = tuple(float(c) for c in base)
+
+        # Compute velocity: outward from impact, with jitter, forced downward.
+        blow = float(np.exp(-2.4 * frag.impact_distance))
+        away = np.array(frag.centre, dtype=np.float64) - np.array(event.position, dtype=np.float64)
+        n = np.linalg.norm(away)
+        away = away / n if n > 1e-6 else np.array((0.0, 0.0, 1.0))
+
+        # Direction jitter: rotate away around pane_normal (±60°) and tilt (±30°).
+        # Increased from ±35°/±15° to ensure real angular spread.
+        theta = float(rng.uniform(-1.05, 1.05))  # ±60°
+        c, s = np.cos(theta), np.sin(theta)
+        away_rot = (away * c + np.cross(pane_normal, away) * s +
+                    pane_normal * (pane_normal @ away) * (1 - c))
+        tilt = float(rng.uniform(-0.52, 0.52))  # ±30°
+        away_rot = away_rot * np.cos(tilt) + pane_normal * np.sin(tilt)
+        away = away_rot / np.linalg.norm(away_rot)
+
+        scatter = max(0.0, float(settings.scatter)) * (0.4 + 0.6 * intensity)
+        # Increased base_sep multiplier to ensure fragments separate properly at high scatter values
+        base_sep = scatter * float(rng.uniform(12.0, 25.0))
+        launch_speed = (settings.speed * profile_for("glass").speed_bias
+                        * (0.3 + 1.4 * intensity))
+        vel = away * (launch_speed + base_sep) * blow * float(rng.uniform(0.55, 1.4))
+        vel = vel + part_vel * settings.inherit_velocity * intensity
+        vel[2] = min(vel[2], -3.0)  # force downward more aggressively
+
+        # Horizontal velocity (XY only; Z forced to -3 m/s).
+        vel_xy = vel[:2].copy()
+        dt = 1.0 / max(1e-6, float(output_fps))
+
+        # Build the action manually - no keyframe_insert at all.
+        import uuid
+        action = bpy.data.actions.new(f"{obj.name}__action_{uuid.uuid4().hex[:8]}")
+
+        # Visibility: hidden until launch frame, then visible.
+        birth = launch_start
+        death = frame_end
+        vis_keys = [(birth - 1, 1.0), (birth, 0.0)]
+        if death < frame_end:
+            vis_keys.append((death + 1, 1.0))
+        for data_path in ("hide_render", "hide_viewport"):
+            fc = action.fcurves.new(data_path=data_path)
+            fc.keyframe_points.add(len(vis_keys))
+            for k, (fr, val) in enumerate(vis_keys):
+                kp = fc.keyframe_points[k]
+                kp.co.x = float(fr)
+                kp.co.y = float(val)
+                kp.interpolation = "LINEAR"
+
+        # Launch keyframes with forced downward velocity.
+        nf = LAUNCH_FRAMES + 1
+        loc_fcs = [action.fcurves.new(data_path="location", index=i) for i in range(3)]
+        for fc in loc_fcs:
+            fc.keyframe_points.add(nf)
+        for k in range(nf):
+            f = launch_start + k
+            loc = base.copy()
+            loc[:2] += vel_xy * dt * k
+            loc[2] += -2.0 * dt * k
             if loc[2] < floor:
                 loc[2] = floor
-            obj.location = tuple(loc)
-            obj.keyframe_insert("location", frame=launch_start + k)
-        # Constant-velocity keys need LINEAR interpolation — see _linearise.
-        _linearise(obj, "location")
-
-        obj[LAUNCH_PROP] = int(launch_start)
-        _key_visibility(obj, launch_start)
+            for idx, fc in enumerate(loc_fcs):
+                kp = fc.keyframe_points[k]
+                kp.co.x = float(f)
+                kp.co.y = float(loc[idx])
+                kp.interpolation = "LINEAR"
+        for fc in action.fcurves:
+            fc.update()
+        obj.animation_data_create().action = action
         placed.append((obj, launch_start))
 
-    # Phase 2: evaluate the placed fragments in the scene, then register their
-    # rigid bodies against the real world matrices.
-    bpy.context.view_layer.update()
-    for obj, launch_start in placed:
-        if rb_coll is not None:
-            rb_coll.objects.link(obj)
-        dynamic.append(obj)
+    # Glass used to stop being simulated after its three launch keys.  That
+    # made the scatter velocity effectively meaningless after the launch: the
+    # object simply held its last keyframe for the rest of the shot.  Hand the
+    # fragment from kinematic launch motion to Bullet, then let bake_debris
+    # freeze the real trajectory and ground-snap the final result.
+    if rb_coll is not None and placed:
+        bpy.context.view_layer.update()
+        for obj, launch_start in placed:
+            if obj.name not in rb_coll.objects:
+                rb_coll.objects.link(obj)
+            if obj.rigid_body is None:
+                continue
+            configure_glass_rigidbody(
+                obj, settings, launch_start,
+                mass=profile_for("glass").thickness * 70.0)
 
-        rb = obj.rigid_body
-        if rb is None:
-            continue
-        rb.type = "ACTIVE"
-        rb.collision_shape = "CONVEX_HULL"
-        rb.mass = 0.02
-        # Same single bounciness dial as the hero pieces, scaled down: glass
-        # chips are the least bouncy debris in a crash, they mostly just skitter
-        # and stop.
-        rest, lin_damp, ang_damp = _bounce_params(settings.bounciness)
-        rb.restitution = rest * 0.6
-        rb.friction = settings.friction
-        rb.linear_damping = lin_damp
-        rb.angular_damping = ang_damp
-        rb.use_margin = True
-        rb.collision_margin = 0.002
-        rb.use_deactivation = True
-        rb.deactivate_linear_velocity = 0.06 + 0.14 * (
-            1.0 - float(np.clip(settings.bounciness, 0.0, 1.0)))
-        rb.deactivate_angular_velocity = 0.12 + 0.28 * (
-            1.0 - float(np.clip(settings.bounciness, 0.0, 1.0)))
-        for k in range(LAUNCH_FRAMES + 1):
-            rb.kinematic = k < LAUNCH_FRAMES
-            rb.keyframe_insert("kinematic", frame=launch_start + k)
+    # Glass is now a genuine rigid-body launch/simulation path.  bake_debris
+    # converts it to ordinary F-curves, so the final scene contains no live
+    # Bullet state and the frame playback handler cannot move it underneath the
+    # ground after the bake.
+    #
+    # The original implementation intentionally left glass out of Bullet, but
+    # that was only safe if the launch motion itself continued for the whole
+    # shot.  Three keyframes do not provide that continuation.
 
     return dynamic, retained
 
@@ -1912,18 +1170,6 @@ def _template_key(event: ImpactEvent) -> str:
     return f"{event.part}|{event.material}"
 
 
-def _safe_name(text: str) -> str:
-    """Datablock-name-safe form of ``text``, short enough to take a suffix.
-
-    Part names come from the capture and can carry separators that make the
-    resulting collection names hard to read; Blender also truncates names past
-    63 characters, which would silently collide two libraries onto one
-    deflector.
-    """
-    out = "".join(c if (c.isalnum() or c in "_-") else "_" for c in text)
-    return out[:40]
-
-
 def build_debris(reader, events: Sequence[ImpactEvent],
                  settings: Optional[DebrisSettings] = None,
                  glass_settings: Optional[GlassSettings] = None,
@@ -1934,9 +1180,12 @@ def build_debris(reader, events: Sequence[ImpactEvent],
                  ground_shift: float = 0.0,
                  source_objects: Optional[Dict[str, "bpy.types.Object"]] = None,
                  progress=None) -> dict:
-    """Create shard libraries, spawn debris and bake it to keyframes.
+    """Create shard libraries and spawn the debris into the scene.
 
-    Returns a summary dict for the operator report.
+    Returns a summary dict for the operator report, including the spawned
+    ``hero_objects`` / ``emitter_objects`` and the ``bake_start`` / ``bake_end``
+    range.  The caller passes those to :func:`debris_bake.bake_debris` to bake
+    the finished simulation into native F-curves.
     """
     if bpy is None:
         raise RuntimeError("build_debris requires Blender (bpy)")
@@ -1946,6 +1195,12 @@ def build_debris(reader, events: Sequence[ImpactEvent],
     crack_settings = crack_settings or GlassCrackSettings()
     scene = bpy.context.scene
     rng = np.random.default_rng(settings.seed)
+
+    # Disable auto-keying during the build to prevent spurious keyframes
+    # from being inserted when object locations are set during spawn.
+    ts = scene.tool_settings
+    auto_key_was_on = ts.use_keyframe_insert_auto
+    ts.use_keyframe_insert_auto = False
 
     events = [e for e in events if e.severity >= settings.min_severity]
     if not events:
@@ -1980,13 +1235,10 @@ def build_debris(reader, events: Sequence[ImpactEvent],
     # Pre-scaled copies for the particle system, built ONCE now that every
     # library exists — it is derived from the whole template set, and rebuilding
     # it per emitter would redo the work for all 100+ impacts.
-    # Pre-scaled particle templates + a sunk deflector PER LIBRARY, built lazily
-    # and memoised here (see _ensure_particle_templates for the per-material
-    # rationale).  The main ground must stop deflecting particles or they never
-    # reach the sunk planes at all.
+    # Pre-scaled particle templates, built lazily and memoised here.
+    # All particles now collide with the single main ground (Simply Shatter
+    # approach) — no per-material particle grounds.
     particle_cache: Dict[str, Tuple] = {}
-    if templates:
-        _disable_ground_particle_collision()
 
     # --- spawn -------------------------------------------------------------
     _ensure_rigidbody_world(scene, scene.frame_start, scene.frame_end)
@@ -2090,9 +1342,10 @@ def build_debris(reader, events: Sequence[ImpactEvent],
             first_spawn = spawn_frame if first_spawn is None else min(first_spawn, spawn_frame)
             frags, retained = _spawn_glass_pane(
                 part, tier, event, world, spawn_frame, settings,
-                glass_settings, glass_coll, rb_coll,
+                glass_settings, glass_coll,
                 _glass_material_for(part, event.material, source_objects),
-                rng, output_fps=output_fps)
+                rng, output_fps=output_fps, frame_end=scene.frame_end,
+                rb_coll=rb_coll)
             glass_objects.extend(frags)
             retained_total += retained
             shattered_panes[part] = int(cache_frame)
@@ -2111,25 +1364,7 @@ def build_debris(reader, events: Sequence[ImpactEvent],
     # collision, and every shard drops to z=-100.
     ground = bpy.data.objects.get(GROUND_NAME)
     if ground is not None:
-        if ground.name not in rb_coll.objects:
-            rb_coll.objects.link(ground)
-        if ground.rigid_body is None:  # pragma: no cover - defensive
-            with _viewport_context():
-                bpy.context.view_layer.objects.active = ground
-                bpy.ops.rigidbody.object_add(type="PASSIVE")
-        if ground.rigid_body is not None:
-            ground.rigid_body.type = "PASSIVE"
-            # BOX (computed from the slab's bounds) is the most robust collider
-            # for a fast-moving shard spray: it is a closed volume, so a shard
-            # that skips across the top surface in a substep is caught inside
-            # rather than slipping through a zero-thickness mesh.
-            ground.rigid_body.collision_shape = "BOX"
-            # Bullet combines the two restitutions, so the ground has to follow
-            # the dial as well — a bouncy floor under a non-bouncy shard still
-            # bounces it.
-            ground.rigid_body.friction = settings.friction
-            ground.rigid_body.restitution = _bounce_params(
-                settings.bounciness)[0]
+        link_ground_to_rigidbody_world(ground, rb_coll, settings)
 
     # The bake must start just before the FIRST launch, not at scene.frame_start.
     # Simulating the idle run from frame 1 (or from a start offset far ahead of
@@ -2168,6 +1403,8 @@ def build_debris(reader, events: Sequence[ImpactEvent],
             st = psys.settings
             st.lifetime = max(int(st.lifetime),
                               int(scene.frame_end) - int(st.frame_start) + 2)
+# Restore auto-keying setting
+    ts.use_keyframe_insert_auto = auto_key_was_on
     return {
         "events": len(events),
         "hero": len(hero_objects),
@@ -2184,490 +1421,18 @@ def build_debris(reader, events: Sequence[ImpactEvent],
     }
 
 
-#: Residual per-frame vertical motion (metres) below which a baked body counts
-#: as having come to REST, so the ground-snap may seat it exactly on the plane.
-#: Above this it is still moving and only the penetration clamp applies — a
-#: piece mid-bounce must be allowed to leave the ground.
-_REST_EPS = 2.5e-4
-
-#: Frames over which the rest seat is ramped in, so seating a settled body does
-#: not produce a single-frame vertical step just before it comes to rest.
-_SEAT_BLEND = 6
-
-
-def _snap_matrices_to_ground(objs: Sequence["bpy.types.Object"],
-                             matrices: List[List], ground_z: float) -> dict:
-    """Lift every baked pose so NO vertex ever sits below ``ground_z``.
-
-    Two distinct corrections, because the two failure modes in the reference
-    screenshot are different bugs wearing the same costume:
-
-    * **Penetration clamp** (every frame).  Bullet resolves contacts against the
-      body's CONVEX HULL plus a collision margin, and it is happy to leave a
-      hull corner a millimetre or two inside the slab — plus the hull is a
-      convex approximation, so a concave notched shard has real geometry
-      *outside* the hull that the solver never tested at all.  Any frame whose
-      lowest vertex is under the plane is lifted by exactly the shortfall.  This
-      is what removes the half-submerged pieces.
-
-    * **Rest seat** (settled tail).  A body that has gone to sleep is left
-      wherever the solver's margin parked it, which is typically a hair ABOVE
-      the plane (``collision_margin`` = 2 mm) — the ``debris_glass_1924_004`` at
-      z = 0.104 in the report.  Once a body stops moving vertically its whole
-      settled tail is translated so its lowest vertex sits exactly ON the plane,
-      so the pile beds down and casts contact shadows instead of floating.
-
-    The correction is a pure Z TRANSLATION of the whole tail, never a
-    re-orientation: rotating a settled piece flat would destroy the natural
-    jumbled lie of the pile.  Because the same offset is applied to every frame
-    from the rest frame onward, a settled body does not drift or pop.
-
-    Mutates ``matrices`` in place.  Returns a summary for the operator report.
-    """
-    if not objs or not matrices:
-        return {"clamped": 0, "seated": 0, "max_lift": 0.0}
-
-    n_frames = len(matrices)
-    clamped = seated = 0
-    max_lift = 0.0
-
-    for j, obj in enumerate(objs):
-        co = _local_verts(obj)
-        if co is None:
-            continue
-
-        # --- per-frame lowest vertex, vectorised over the whole bake --------
-        # Stacking the Z rows lets one matmul do every frame for this body,
-        # instead of a Python loop over (frames x vertices).
-        zrow = np.empty((n_frames, 4), dtype=np.float64)
-        for i in range(n_frames):
-            m = matrices[i][j]
-            zrow[i] = (m[2][0], m[2][1], m[2][2], m[2][3])
-        lows = co @ zrow[:, :3].T + zrow[:, 3]      # (V, F)
-        lows = lows.min(axis=0)                      # (F,)
-
-        # --- rest detection: first frame of the settled tail ----------------
-        # Scanning BACKWARD from the end finds the moment the body last moved,
-        # so a piece that bounces late is not seated on an early lull.
-        rest_from = n_frames
-        for i in range(n_frames - 1, 0, -1):
-            if abs(lows[i] - lows[i - 1]) > _REST_EPS:
-                rest_from = i
-                break
-        else:
-            rest_from = 0
-
-        # --- build the per-frame lift --------------------------------------
-        lift = np.zeros(n_frames, dtype=np.float64)
-        # Penetration: everything below the plane comes up to it.
-        under = lows < ground_z
-        lift[under] = ground_z - lows[under]
-        if under.any():
-            clamped += 1
-        # Rest seat: the settled tail is translated to sit exactly on the plane.
-        if rest_from < n_frames:
-            seat = ground_z - lows[rest_from]
-            lift[rest_from:] = seat
-            if abs(seat) > _REST_EPS:
-                seated += 1
-
-        if not lift.any():
-            continue
-        max_lift = max(max_lift, float(np.abs(lift).max()))
-
-        # Blend the seat in over the approach so a body that settles from a
-        # small residual hover does not step vertically on its rest frame.
-        # Only the frames immediately before the rest frame are touched, and
-        # only up to their own existing lift, so this can never push a moving
-        # piece into the ground.
-        blend = min(_SEAT_BLEND, rest_from)
-        if blend > 0 and rest_from < n_frames:
-            ramp = np.linspace(0.0, 1.0, blend + 1)[:-1]
-            head = slice(rest_from - blend, rest_from)
-            lift[head] = np.maximum(lift[head], lift[rest_from] * ramp)
-
-        for i in range(n_frames):
-            if lift[i]:
-                # Index the translation column explicitly rather than going
-                # through ``.translation``, which returns a COPY on a Matrix —
-                # mutating that copy would silently discard the lift.
-                matrices[i][j][2][3] += lift[i]
-
-    return {"clamped": clamped, "seated": seated, "max_lift": max_lift}
-
-
-def bake_debris(hero_objects: Sequence["bpy.types.Object"],
-                frame_start: int, frame_end: int,
-                ground_z: float = 0.0, snap_ground: bool = True) -> dict:
-    """Simulate the rigid bodies and freeze the result into keyframes.
-
-    Runs with all frame handlers detached (see :func:`_frozen_handlers`), then
-    converts the simulation to F-curves and removes the rigid body world.  The
-    debris afterwards is inert animation data — the playback handler cannot
-    disturb it and it never needs re-simulating.
-    """
-    if bpy is None or not hero_objects:
-        return {"baked": 0}
-
-    scene = bpy.context.scene
-    alive = [o for o in hero_objects if o.name in bpy.data.objects]
-    if not alive:
-        return {"baked": 0}
-
-    frame_start = int(frame_start)
-    frame_end = int(frame_end)
-    frame_orig = scene.frame_current
-
-    with _frozen_handlers():
-        if scene.rigidbody_world is not None:
-            scene.rigidbody_world.point_cache.frame_end = frame_end
-
-        # Step the solver and record each body's world matrix.  This is what
-        # bpy.ops.rigidbody.bake_to_keyframes does internally, minus its
-        # dependency on the active keying set — that operator drives keyframe
-        # insertion through ``anim.keyframe_insert_by_name``, which needs both a
-        # VIEW_3D context and a configured keying set, and dies with "No
-        # suitable context info for active keying set" when either is missing.
-        # Writing the F-curves ourselves is both more robust and faster, since
-        # it walks the timeline once instead of twice.
-        #
-        # The walk MUST advance one frame at a time from the point cache's own
-        # start frame.  Bullet integrates incrementally: jumping the playhead
-        # into the middle of the range leaves the cache invalid and every body
-        # reads out at its rest position (measured: all debris teleported to
-        # z=0 instead of falling).
-        #
-        # Equally, the run must NOT start far before the first launch.  The
-        # scene starts at frame 1 but impacts happen around frame 2030, and
-        # simulating those 2000 idle frames made the solver integrate a huge
-        # phantom velocity out of the long-static kinematic bodies — debris
-        # shot 90 m sideways and fell to z=-96.  Starting a few frames ahead of
-        # the earliest launch keeps the cache valid and the velocities honest.
-        matrices: List[List] = []
-        sim_start = int(max(scene.frame_start, frame_start - LAUNCH_FRAMES - 2))
-        rbw = scene.rigidbody_world
-        if rbw is not None:
-            rbw.point_cache.frame_start = sim_start
-        for f in range(sim_start, frame_end + 1):
-            scene.frame_set(f)
-            if f >= frame_start:
-                matrices.append([o.matrix_world.copy() for o in alive])
-
-        # GROUND SNAP.  Applied to the sampled matrices, BEFORE they become
-        # keyframes, so what gets written is already correct — there is no
-        # second pass over the F-curves and nothing can re-introduce the
-        # penetration later.  See _snap_matrices_to_ground for why the solver
-        # leaves pieces both buried and hovering.
-        snap = ({"clamped": 0, "seated": 0, "max_lift": 0.0} if not snap_ground
-                else _snap_matrices_to_ground(alive, matrices, float(ground_z)))
-
-        # Drop the rigid body world BEFORE writing keys: while it exists the
-        # solver keeps overriding object transforms and the keys do not stick.
-        if scene.rigidbody_world is not None:
-            with _viewport_context():
-                try:
-                    bpy.ops.rigidbody.world_remove()
-                except Exception:
-                    scene.rigidbody_world = None
-
-        # animation_data_clear() drops the location/kinematic launch keys, which
-        # is intended — but it also drops the hide_viewport/hide_render keys, so
-        # they MUST be rewritten below.  Without that every hero piece is
-        # visible from frame 1: a static clump of shards hanging at the impact
-        # point for the whole pre-crash run while other debris flies past it.
-        for obj in alive:
-            obj.rotation_mode = "QUATERNION"
-            obj.animation_data_clear()
-            launch = obj.get(LAUNCH_PROP)
-            _key_visibility(obj, int(launch) if launch is not None else frame_start)
-
-        for i, f in enumerate(range(frame_start, frame_end + 1)):
-            row = matrices[i]
-            for j, obj in enumerate(alive):
-                mat = row[j]
-                if obj.parent:
-                    mat = (obj.matrix_parent_inverse.inverted()
-                           @ obj.parent.matrix_world.inverted() @ mat)
-                obj.location = mat.to_translation()
-                quat = mat.to_quaternion()
-                prev = obj.rotation_quaternion
-                # Keep successive quaternions on the same hemisphere, otherwise
-                # interpolation takes the long way round and the shard spins
-                # wildly between two visually identical orientations.
-                obj.rotation_quaternion = -quat if prev.dot(quat) < 0.0 else quat
-                obj.keyframe_insert("location", frame=f)
-                obj.keyframe_insert("rotation_quaternion", frame=f)
-
-        # The bake writes a key on EVERY frame, so the curve between two keys
-        # should be a straight line — there is no gap to interpolate across.
-        # Blender's default Bezier handles still fit a curve through them, and
-        # auto-clamped handles OVERSHOOT wherever the sampled motion changes
-        # direction sharply: exactly what a bouncing shard does at each contact.
-        # The result is debris that visibly dips through the ground and pops back
-        # on impact frames, and jitters while resting.  LINEAR reproduces the
-        # simulation exactly and is cheaper to evaluate.
-        for obj in alive:
-            _linearise(obj, "location")
-            _linearise(obj, "rotation_quaternion")
-
-        scene.frame_set(frame_orig)
-
-    return {"baked": len(alive), "frames": frame_end - frame_start + 1,
-            "ground_clamped": snap["clamped"], "ground_seated": snap["seated"],
-            "ground_max_lift": snap["max_lift"]}
-
-
-#: Collection the baked particle meshes live in.  A child of the main debris
-#: collection so :func:`clear_debris` and :func:`debris_objects` (retime) cover
-#: them without extra wiring.
-PARTICLE_BAKED_COLLECTION = "BeamNG Debris Particles"
-
-#: Custom property stamped on every baked particle object.  The verify scripts
-#: use it to tell a frozen chip (no particle system) from a hero shard.
-PARTICLE_BAKED_PROP = "_beamng_debris_baked_particle"
-
-
-def _particle_ground_lift(co: np.ndarray, zrows: np.ndarray,
-                          ground_z: float) -> np.ndarray:
-    """Per-frame +Z lift that keeps ONE particle's shard on the ground.
-
-    The per-body half of :func:`_snap_matrices_to_ground`, but for a single
-    particle whose ``(frame, matrix)`` series is not aligned to the bake
-    window: penetration clamp (any frame whose lowest vertex is under the plane
-    comes up to it) plus the rest seat (the settled tail is translated so it
-    sits exactly ON the plane instead of a solver-margin hair above it).
-    ``zrows`` is that particle's stacked Z matrix rows ``(F, 4)``; ``co`` is
-    its local vertices ``(V, 3)``.
-    """
-    n = len(zrows)
-    if not n:
-        return np.zeros(0, dtype=np.float64)
-    lows = co @ zrows[:, :3].T + zrows[:, 3]
-    lows = lows.min(axis=0)
-    lift = np.zeros(n, dtype=np.float64)
-    under = lows < ground_z
-    lift[under] = ground_z - lows[under]
-    rest_from = n
-    for i in range(n - 1, 0, -1):
-        if abs(lows[i] - lows[i - 1]) > _REST_EPS:
-            rest_from = i
-            break
-    else:
-        rest_from = 0
-    if rest_from < n:
-        seat = ground_z - lows[rest_from]
-        lift[rest_from:] = seat
-        blend = min(_SEAT_BLEND, rest_from)
-        if blend > 0 and rest_from < n:
-            ramp = np.linspace(0.0, 1.0, blend + 1)[:-1]
-            head = slice(rest_from - blend, rest_from)
-            lift[head] = np.maximum(lift[head], lift[rest_from] * ramp)
-    # THE GUARANTEE.  The rest seat translates a settled tail so its REST frame
-    # sits exactly on the plane, but a resting body can still wander up to
-    # _REST_EPS off that frame — so the seat can overshoot a neighbouring frame
-    # a fraction of a millimetre into the ground.  Clamp once more against the
-    # FINAL lows so NO frame of ANY particle is ever under the plane.
-    final = lows + lift
-    below = final < ground_z
-    if below.any():
-        lift[below] = ground_z - lows[below]
-    return lift
-
-
-def bake_particles(emitters: Sequence["bpy.types.Object"],
-                   frame_start: int, frame_end: int,
-                   ground_z: float = 0.0, snap_ground: bool = True) -> dict:
-    """Freeze the fine-particle emitters into ground-clamped F-curve meshes.
-
-    WHY THIS IS THE ONLY WAY TO KEEP PARTICLES OFF THE GROUND.  A NEWTON
-    particle collides as a SPHERE and the solver rests the sphere's centre a
-    radius above the deflector.  The flat shard drawn around that centre
-    reaches LESS than a radius downward on a face landing but MORE on an edge
-    landing, so no matter how the collision radius / deflector-drop percentiles
-    are tuned some settled pieces poke through the ground (measured: 36% of
-    instances with a vertex below z=0, worst 98 mm).  The two error directions
-    are tied to the same number: a drop large enough to hide the biggest shard
-    leaves every small chip floating by the same amount.  The only guarantee
-    that NO vertex ever sits under the ground is to stop the solver from owning
-    the transforms: bake each particle into its own mesh and clamp, mirroring
-    :func:`_snap_matrices_to_ground` on the hero bodies.
-
-    Baking also lifts the particle limitation in ``debris_retime``: the frozen
-    chips are ordinary F-curve objects, so the live fps/start sliders slow the
-    spray down with the car like the hero shards.
-
-    HOW.  Each emitter is walked FRAME BY FRAME (jumping the playhead reads
-    garbage from the NEWTON integrator — measured to z=-1e27), and every live
-    particle's world matrix is sampled from the evaluated depsgraph.  A particle
-    keeps the template the solver picked for it, so the baked geometry is
-    bit-identical to what the system would have rendered.  Each particle's
-    series is then penetration-clamped and rest-seated, written as
-    location/rotation keyframes with LINEAR interpolation (auto-clamped Bezier
-    overshoots at every bounce), and the emitters plus their per-material
-    deflectors are deleted.  The result is inert animation data, like the hero
-    bake.
-
-    Returns a summary for the operator report.
-    """
-    if bpy is None or not emitters:
-        return {"baked": 0}
-    scene = bpy.context.scene
-    alive = [o for o in emitters if o.name in bpy.data.objects]
-    alive = [o for o in alive if any(
-        getattr(m, "particle_system", None) is not None for m in o.modifiers)]
-    if not alive:
-        return {"baked": 0}
-    frame_end = int(frame_end)
-    frame_orig = scene.frame_current
-
-    names = {o.name for o in alive}
-    starts: List[int] = []
-    for o in alive:
-        for m in o.modifiers:
-            ps = getattr(m, "particle_system", None)
-            if ps is not None:
-                starts.append(int(ps.settings.frame_start))
-    walk_start = max(scene.frame_start,
-                     (min(starts) if starts else int(frame_start)) - 2)
-
-    # emitter -> particle index -> [(frame, float32 (4,4) matrix)].
-    # The index (depsgraph persistent_id[0]) is stable across frames; the
-    # template is whatever the solver assigned at birth.  Matrices are pulled
-    # off the depsgraph instance immediately and stored by VALUE — keeping the
-    # instance reference across evaluations reads as "StructRNA removed".
-    series: Dict[str, Dict[int, List[Tuple[int, np.ndarray]]]] = {}
-    sources: Dict[str, Dict[int, str]] = {}
-
-    with _frozen_handlers():
-        for f in range(walk_start, frame_end + 1):
-            scene.frame_set(f)
-            bpy.context.view_layer.update()
-            dg = bpy.context.evaluated_depsgraph_get()
-            for inst in dg.object_instances:
-                if not inst.is_instance:
-                    continue
-                parent = inst.parent
-                if parent is None or parent.name not in names:
-                    continue
-                pid = int(inst.persistent_id[0])
-                series.setdefault(parent.name, {}).setdefault(pid, []).append(
-                    (f, np.asarray(inst.matrix_world,
-                                   dtype=np.float32).copy()))
-                sources.setdefault(parent.name, {}).setdefault(
-                    pid, inst.object.name)
-
-    coll = _get_collection(
-        PARTICLE_BAKED_COLLECTION,
-        parent=_get_collection(DEBRIS_COLLECTION))
-    baked_total = 0
-    clamped = seated = 0
-    max_lift = 0.0
-    for ename in sorted(series):
-        for pid in sorted(series[ename]):
-            mats = series[ename][pid]
-            src = bpy.data.objects.get(sources[ename].get(pid, ""))
-            if src is None or src.data is None or not mats:
-                continue
-            co = _local_verts(src)
-            if co is None:
-                continue
-            frames = np.asarray([m[0] for m in mats], dtype=np.int64)
-            mat4 = np.asarray([m[1] for m in mats], dtype=np.float64)
-            lift = (_particle_ground_lift(co, mat4[:, 2], float(ground_z))
-                    if snap_ground
-                    else np.zeros(len(mats), dtype=np.float64))
-            if (lift > 0.0).any():
-                clamped += 1
-            # The rest seat can be negative (seat down) and only moves the
-            # settled tail, so count it from the seat region, not the lift.
-            # max_lift reports the magnitude of the biggest correction.
-            if np.abs(lift).max() > 0.0:
-                max_lift = max(max_lift, float(np.abs(lift).max()))
-            if len(lift) and abs(lift[-1]) > _REST_EPS:
-                seated += 1
-
-            tag = ename.replace("emit_", "", 1) if "emit_" in ename else ename
-            baked = bpy.data.objects.new(f"{tag}_part_{pid}", src.data)
-            baked.scale = (1.0, 1.0, 1.0)
-            baked[PARTICLE_BAKED_PROP] = True
-            baked.rotation_mode = "QUATERNION"
-            baked.animation_data_clear()
-            coll.objects.link(baked)
-
-            birth = int(frames[0])
-            death = int(frames[-1])
-            baked.hide_render = True
-            baked.hide_viewport = True
-
-            # Build the action completely, THEN bind it to the object.  An
-            # action that gains F-curves after it is assigned does not drive
-            # the object: the depsgraph binds the property→fcurve mapping at
-            # assignment time and never sees the later curves.
-            action = bpy.data.actions.new(f"{baked.name}__action")
-
-            # Visibility: hidden until its birth frame, hidden again after its
-            # death (particles are deleted when their lifetime expires, so a
-            # baked chip must blink out the same way).
-            vis_keys = [(birth - 1, 1.0), (birth, 0.0)]
-            if death < frame_end:
-                vis_keys.append((death + 1, 1.0))
-            vis_fcs = []
-            for data_path in ("hide_render", "hide_viewport"):
-                fc = action.fcurves.new(data_path=data_path)
-                fc.keyframe_points.add(len(vis_keys))
-                for k, (fr, val) in enumerate(vis_keys):
-                    kp = fc.keyframe_points[k]
-                    kp.co.x = float(fr)
-                    kp.co.y = float(val)
-                    kp.interpolation = "LINEAR"
-                vis_fcs.append(fc)
-
-            # Transform keyframes written straight into the F-curves rather than
-            # via keyframe_insert: ~3M keys across the scene, and the operator
-            # round-trip would make the bake minutes longer.
-            nf = len(frames)
-            loc_fcs = [action.fcurves.new(data_path="location", index=i)
-                       for i in range(3)]
-            quat_fcs = [action.fcurves.new(data_path="rotation_quaternion",
-                                           index=j) for j in range(4)]
-            for fc in loc_fcs + quat_fcs:
-                fc.keyframe_points.add(nf)
-            prev_q = None
-            for i, f in enumerate(frames):
-                m = mat4[i]
-                m[2][3] += lift[i]
-                mat = mathutils.Matrix(m)
-                loc = mat.to_translation()
-                q = mat.to_quaternion()
-                if prev_q is not None and prev_q.dot(q) < 0.0:
-                    q = -q
-                prev_q = q
-                for idx, fc in enumerate(loc_fcs):
-                    kp = fc.keyframe_points[i]
-                    kp.co.x = float(f)
-                    kp.co.y = float(loc[idx])
-                    kp.interpolation = "LINEAR"
-                for idx, fc in enumerate(quat_fcs):
-                    kp = fc.keyframe_points[i]
-                    kp.co.x = float(f)
-                    kp.co.y = float(q[idx])
-                    kp.interpolation = "LINEAR"
-            for fc in vis_fcs + loc_fcs + quat_fcs:
-                fc.update()
-            baked.animation_data_create().action = action
-            baked_total += 1
-
-    # The emitters are dead once their particles are frozen, and their
-    # per-material deflectors have no systems left to deflect for.
-    for o in alive:
-        if o.name in bpy.data.objects:
-            bpy.data.objects.remove(o, do_unlink=True)
-    prefix = PARTICLE_GROUND_NAME + "_"
-    for o in list(bpy.data.objects):
-        if o.name.startswith(prefix):
-            bpy.data.objects.remove(o, do_unlink=True)
-
-    scene.frame_set(frame_orig)
-    return {"baked": baked_total, "frames": frame_end - walk_start + 1,
-            "ground_clamped": clamped, "ground_seated": seated,
-            "ground_max_lift": max_lift}
+# ---------------------------------------------------------------------------
+# Re-exports (backward compatibility)
+# ---------------------------------------------------------------------------
+# Names that moved to :mod:`debris_physics` but are re-exported here so
+# existing ``from runtime.debris_spawn import ...`` call sites keep working:
+# the shared constants (DEBRIS_COLLECTION, SHARD_COLLECTION, GROUND_NAME,
+# GLASS_COLLECTION, LAUNCH_FRAMES, GROUND_CLEARANCE, LAUNCH_PROP,
+# PARTICLE_GROUND_NAME, PARTICLE_SHARD_COLLECTION, PARTICLE_BAKED_COLLECTION,
+# PARTICLE_BAKED_PROP), the DebrisSettings dataclass, and the generic helpers
+# (_safe_name, _local_verts, _linearise, _key_visibility, _bounce_params,
+# _viewport_context, _frozen_handlers, _get_collection).
+#
+# ``bake_debris`` is deliberately NOT re-exported: it lives in
+# :mod:`debris_bake` now, and call sites have been updated to import it from
+# there.
