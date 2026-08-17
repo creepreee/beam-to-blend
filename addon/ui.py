@@ -583,6 +583,91 @@ class BeamNGDebrisProperties(PropertyGroup):
     )
 
 
+class BeamNGPhysicsProperties(PropertyGroup):
+    """Physics panel settings (ported from Simply Shatter)."""
+
+    auto_keyframe: BoolProperty(
+        name="Auto Keyframe",
+        description="Automatically keyframe hide/unhide for shatter effect at current frame",
+        default=False,
+    )
+    keep_animation: BoolProperty(
+        name="Keep Animation",
+        description="Preserve original animation when shattering (bake world-space transforms)",
+        default=False,
+    )
+    # Collision settings
+    collision_margin: FloatProperty(
+        name="Collision Margin",
+        description="Margin for collision shapes",
+        default=0.01,
+        min=0.0,
+        max=1.0,
+    )
+    # Boundary settings
+    boundary_pin_radius: FloatProperty(
+        name="Pin Radius",
+        description="Radius within which constraints are created between boundaries and parts",
+        default=1.5,
+        min=0.1,
+        max=50.0,
+    )
+    boundary_use_stuck: BoolProperty(
+        name="Use Stuck",
+        description="Use stuck constraints to keep pieces together until threshold",
+        default=False,
+    )
+    boundary_animated: BoolProperty(
+        name="Animated",
+        description="Make boundaries kinematic (animated)",
+        default=True,
+    )
+    boundary_breakable: BoolProperty(
+        name="Breakable",
+        description="Make boundary constraints breakable",
+        default=True,
+    )
+    boundary_break_threshold: FloatProperty(
+        name="Break Threshold",
+        description="Force threshold at which constraints break",
+        default=0.5,
+        min=0.0,
+        max=100.0,
+    )
+    boundary_break_randomize: FloatProperty(
+        name="Randomize Breaking",
+        description="Randomize breaking threshold per constraint",
+        default=0.3,
+        min=0.0,
+        max=1.0,
+    )
+    # Bake settings
+    baked_to_keyframes: BoolProperty(
+        name="Baked To Keyframes",
+        description="True after 'Bake to Keyframes' has been run",
+        default=False,
+    )
+    # Cleanup settings
+    cleanup_use_current_keyframe: BoolProperty(
+        name="Use Current Frame",
+        description="Use current frame as cleanup start instead of the value below",
+        default=True,
+    )
+    cleanup_keyframe_start: IntProperty(
+        name="Start Frame",
+        description="Start frame to remove keyframes from (inclusive)",
+        default=0,
+        min=0,
+    )
+    cleanup_smooth_value: IntProperty(
+        name="Smooth Value",
+        description="Number of frames to smooth/damp movement over",
+        default=30,
+        min=1,
+        max=180,
+    )
+
+
 class BEAMNG_PT_main(Panel):
     bl_label = "BeamNG"
     bl_idname = "BEAMNG_PT_main"
@@ -749,12 +834,99 @@ class BEAMNG_PT_debris(Panel):
         col.operator("beamng.clear_debris", text="Clear Debris", icon="TRASH")
 
 
+class BEAMNG_PT_physics(Panel):
+    """Physics settings for debris simulation (ported from Simply Shatter)."""
+    bl_label = "Physics (EXPERIMENTAL)"
+    bl_idname = "BEAMNG_PT_physics"
+    bl_parent_id = "BEAMNG_PT_main"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "BeamNG"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        props = context.scene.beamng_physics
+        layout = self.layout
+
+        # Experimental warning
+        box = layout.box()
+        box.label(text="EXPERIMENTAL - Ported from Simply Shatter", icon="ERROR")
+        box.label(text="May not work correctly with all capture data.")
+
+        # Apply Physics section
+        box = layout.box()
+        box.label(text="Apply Physics", icon="PHYSICS")
+        row = box.row(align=True)
+        row.scale_y = 1.3
+        row.operator("beamng.apply_physics", text="Apply Physics", icon="PHYSICS")
+        box.prop(props, "auto_keyframe")
+        box.prop(props, "keep_animation")
+
+        # Collision Settings
+        box = layout.box()
+        box.label(text="Collision Settings", icon="MOD_PHYSICS")
+        box.prop(props, "collision_margin")
+        row = box.row(align=True)
+        row.scale_y = 1.2
+        row.operator("beamng.add_colliders", text="Add Selected as Colliders", icon="ADD")
+
+        # Boundary Settings
+        box = layout.box()
+        box.label(text="Boundary Settings", icon="FORCE_FORCE")
+        box.prop(props, "boundary_pin_radius")
+        box.prop(props, "boundary_use_stuck")
+        box.prop(props, "boundary_animated")
+        box.prop(props, "boundary_breakable")
+        sub = box.column(align=True)
+        sub.active = props.boundary_breakable
+        sub.prop(props, "boundary_break_threshold")
+        sub.prop(props, "boundary_break_randomize")
+        row = box.row(align=True)
+        row.scale_y = 1.2
+        row.operator("beamng.add_boundaries", text="Add Selected as Boundaries", icon="ADD")
+        row.operator("beamng.remove_boundary", text="Remove Boundaries", icon="TRASH")
+
+        # Physics Quality
+        box = layout.box()
+        box.label(text="Solver Quality", icon="SETTINGS")
+        row = box.row(align=True)
+        row.scale_y = 1.2
+        row.operator("beamng.physics_preview", text="Preview", icon="PLAY")
+        row.operator("beamng.physics_final", text="Final", icon="FILE_REFRESH")
+
+        # Bake Settings
+        box = layout.box()
+        box.label(text="Bake Settings", icon="REC")
+        row = box.row(align=True)
+        row.scale_y = 1.3
+        row.operator("beamng.bake_to_keyframes", text="Bake to Keyframes", icon="REC")
+
+        # Cleanup
+        enabled_cleanup = props.baked_to_keyframes
+        box = layout.box()
+        box.label(text="Clean Up", icon="TRASH")
+        row = box.row(align=True)
+        row.enabled = enabled_cleanup
+        row.prop(props, "cleanup_use_current_keyframe", text="Use Current Frame", toggle=True, icon="KEY_HLT")
+        sub = row.row()
+        sub.enabled = enabled_cleanup and not props.cleanup_use_current_keyframe
+        sub.prop(props, "cleanup_keyframe_start", text="Start Frame")
+        row = box.row(align=True)
+        row.enabled = enabled_cleanup
+        row.prop(props, "cleanup_smooth_value", text="Smooth Value", slider=True)
+        row = box.row(align=True)
+        row.enabled = enabled_cleanup
+        row.operator("beamng.reduce_velocity", text="Clean Up Jiggling", icon="FORCE_HARMONIC")
+
+
 _classes = [
     BeamNGSceneProperties,
     BeamNGDebrisProperties,
+    BeamNGPhysicsProperties,
     BEAMNG_PT_main,
     BEAMNG_PT_tyres,
     BEAMNG_PT_debris,
+    BEAMNG_PT_physics,
 ]
 
 
@@ -765,13 +937,15 @@ def register():
         print(f"[BeamNG] registered {cls.__name__}")
     bpy.types.Scene.beamng = bpy.props.PointerProperty(type=BeamNGSceneProperties)
     bpy.types.Scene.beamng_debris = bpy.props.PointerProperty(type=BeamNGDebrisProperties)
-    print("[BeamNG] Scene.beamng / Scene.beamng_debris properties set")
+    bpy.types.Scene.beamng_physics = bpy.props.PointerProperty(type=BeamNGPhysicsProperties)
+    print("[BeamNG] Scene.beamng / Scene.beamng_debris / Scene.beamng_physics properties set")
 
 
 def unregister():
     print("[BeamNG] unregistering...")
     del bpy.types.Scene.beamng
     del bpy.types.Scene.beamng_debris
+    del bpy.types.Scene.beamng_physics
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)
     print("[BeamNG] done")

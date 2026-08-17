@@ -1,12 +1,14 @@
 import hashlib
 import json
+import math
 import os
 import sys
 import tempfile
+from mathutils import Vector
 
 import bpy
 from bpy.types import Operator
-from bpy.props import StringProperty
+from bpy.props import (FloatProperty, IntProperty, StringProperty, BoolProperty)
 
 # Path setup for the bundled `importer`/`runtime` packages is done in the
 # add-on package __init__.py (works for both dev and packaged layouts).
@@ -924,6 +926,464 @@ class BEAMNG_OT_assign_textures(Operator):
         return {"FINISHED"}
 
 
+# ---------------------------------------------------------------------------
+# Physics operators (ported from Simply Shatter for BeamNG debris integration)
+# ---------------------------------------------------------------------------
+
+
+def _get_debris_collection():
+    """Return the main BeamNG Debris collection, creating it if needed."""
+    from runtime.debris_physics import DEBRIS_COLLECTION, _get_collection
+    return _get_collection(DEBRIS_COLLECTION)
+
+
+class BEAMNG_OT_apply_physics(Operator):
+    """Apply physics (rigid body) to all parts in the BeamNG Debris collection.
+
+    Mirrors Simply Shatter's ApplyPhysicsOperator: adds ACTIVE rigid bodies
+    with CONVEX_HULL collision, mass computed via density, and optional
+    auto-keyframe at the current frame.
+    """
+    bl_idname = "beamng.apply_physics"
+    bl_label = "Apply Physics"
+    bl_description = "Apply rigid body physics to all parts in the debris collection"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        from runtime.debris_physics import DEBRIS_COLLECTION
+
+        coll = bpy.data.collections.get(DEBRIS_COLLECTION)
+        if coll is None:
+            self.report({"WARNING"}, f"Collection '{DEBRIS_COLLECTION}' not found — build debris first")
+            return {"CANCELLED"}
+
+        shatter_frame = context.scene.frame_current
+        auto_keyframe = bool(getattr(context.scene.beamng_physics, "auto_keyframe", False))
+        keep_animation = bool(getattr(context.scene.beamng_physics, "keep_animation", False))
+
+        obj_count = 0
+        for obj in coll.all_objects:
+            if obj.type != 'MESH':
+                continue
+            obj_count += 1
+
+            # Remove existing rigid body
+            if obj.rigid_body:
+                bpy.ops.rigidbody.object_remove({'object': obj})
+                obj.rigid_body = None
+
+            # Add new rigid body
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.rigidbody.object_add(type='ACTIVE', object=obj)
+            rb = obj.rigid_body
+            if rb is None:
+                continue
+
+            rb.collision_shape = 'CONVEX_HULL'
+            rb.mass = 1.0
+            rb.friction = 0.8
+            rb.restitution = 0.1
+            rb.use_margin = True
+            rb.collision_margin = 0.002
+            rb.linear_damping = 0.04
+            rb.angular_damping = 0.1
+
+            # Try to calculate mass from geometry density
+            try:
+                bpy.context.view_layer.objects.active = obj
+                bpy.ops.rigidbody.mass_calculate(
+                    material='Glass (Broken)', density=1940)
+            except Exception:
+                pass
+
+            rb.kinematic = True
+            rb.keyframe_insert("kinematic", frame=shatter_frame)
+
+            rb.kinematic = False
+            rb.keyframe_insert("kinematic", frame=shatter_frame + 1)
+
+            # Handle existing animation
+            if keep_animation and obj.animation_data and obj.animation_data.action:
+                action = obj.animation_data.action
+                if action:
+                    for fc in list(action.fcurves):
+                        if fc.data_path in ('location', 'rotation_euler', 'scale'):
+                            action.fcurves.remove(fc)
+                    # Bake world-space transforms
+                    obj.select_set(True)
+                    start = context.scene.frame_start
+                    end = context.scene.frame_end
+                    for fr in range(start, end + 1):
+                        context.scene.frame_set(fr)
+                        bpy.ops.nla.bake(frame_start=start, frame_end=end,
+                                         only_selected=True, visual_keying=True,
+                                         clear_constraints=True, use_current_action=True)
+                    obj.select_set(False)
+
+            # Store the shatter frame for auto-keyframing
+            obj['_beamng_shatter_frame'] = shatter_frame
+            if auto_keyframe:
+                context.scene.frame_set(shatter_frame)
+                context.scene.frame_set(shatter_frame + 1)
+
+        self.report({"INFO"}, f"Applied physics to {obj_count} objects")
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_add_colliders(Operator):
+    """Add selected objects as passive collision bodies.
+
+    Mirrors Simply Shatter's AddSelectedAsColliderOperator.
+    """
+    bl_idname = "beamng.add_colliders"
+    bl_label = "Add Selected as Colliders"
+    bl_description = "Set selected objects as passive rigid body colliders"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        selected = [obj for obj in context.selected_objects if obj.type == 'MESH']
+        if not selected:
+            self.report({"WARNING"}, "No mesh objects selected")
+            return {"CANCELLED"}
+
+        keep_animation = bool(getattr(context.scene.beamng_physics, "keep_animation", False))
+
+        for obj in selected:
+            if obj.rigid_body:
+                bpy.ops.rigidbody.object_remove({'object': obj})
+                obj.rigid_body = None
+
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.rigidbody.object_add(type='PASSIVE', object=obj)
+            rb = obj.rigid_body
+            if rb is None:
+                continue
+
+            rb.collision_shape = 'CONVEX_HULL'
+            rb.use_margin = True
+            rb.collision_margin = 0.01
+            rb.friction = 0.8
+            rb.restitution = 0.1
+
+            if keep_animation and obj.animation_data and obj.animation_data.action:
+                rb.use_override_collision_settings = True
+            else:
+                obj.keyframe_insert("location", frame=context.scene.frame_current)
+                obj.keyframe_insert("rotation_euler", frame=context.scene.frame_current)
+
+        self.report({"INFO"}, f"Added {len(selected)} colliders")
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_add_boundaries(Operator):
+    """Add selected objects as passive boundaries with constraints.
+
+    Mirrors Simply Shatter's AddSelectedAsBoundaryOperator. Creates a
+    'BeamNG Boundaries' collection and optionally wires FIXED constraints
+    between nearby boundary objects and existing parts.
+    """
+    bl_idname = "beamng.add_boundaries"
+    bl_label = "Add Selected as Boundaries"
+    bl_description = "Set selected objects as rigid boundaries with optional constraints"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        from runtime.debris_physics import DEBRIS_COLLECTION, _get_collection
+
+        selected = [obj for obj in context.selected_objects if obj.type == 'MESH']
+        if not selected:
+            self.report({"WARNING"}, "No mesh objects selected")
+            return {"CANCELLED"}
+
+        boundary_coll = _get_collection("BeamNG Boundaries")
+        constraint_coll = _get_collection("BeamNG Boundary Constraints")
+        pin_radius = float(getattr(context.scene.beamng_physics, "boundary_pin_radius", 1.5))
+        use_stuck = bool(getattr(context.scene.beamng_physics, "boundary_use_stuck", False))
+        is_animated = bool(getattr(context.scene.beamng_physics, "boundary_animated", False))
+        is_breakable = bool(getattr(context.scene.beamng_physics, "boundary_breakable", True))
+        break_threshold = float(getattr(context.scene.beamng_physics, "boundary_break_threshold", 0.5))
+        break_random = float(getattr(context.scene.beamng_physics, "boundary_break_randomize", 0.3))
+
+        # Gather debris parts
+        debris_coll = bpy.data.collections.get(DEBRIS_COLLECTION)
+        all_parts = list(debris_coll.all_objects) if debris_coll else []
+        all_parts.extend(list(boundary_coll.all_objects))
+
+        for obj in selected:
+            # Move to boundary collection
+            for c in obj.users_collection:
+                c.objects.unlink(obj)
+            boundary_coll.objects.link(obj)
+
+            # Remove existing RB
+            if obj.rigid_body:
+                bpy.ops.rigidbody.object_remove({'object': obj})
+                obj.rigid_body = None
+
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.rigidbody.object_add(type='PASSIVE', object=obj)
+            rb = obj.rigid_body
+            if rb is None:
+                continue
+
+            rb.collision_shape = 'CONVEX_HULL'
+            rb.use_margin = True
+            rb.collision_margin = 0.01
+            rb.friction = 0.8
+            rb.restitution = 0.0
+
+            if is_animated:
+                rb.kinematic = True
+                rb.keyframe_insert("kinematic", frame=context.scene.frame_start)
+                rb.keyframe_insert("kinematic", frame=context.scene.frame_end)
+            else:
+                rb.kinematic = False
+
+            # Add FIXED constraints to nearby parts
+            pin_loc_radius = pin_radius
+            pin_rot_radius = pin_radius * 0.6
+
+            for part in all_parts:
+                if part == obj:
+                    continue
+                if part.name in constraint_coll.objects:
+                    continue
+
+                dist = (obj.location - part.location).length
+                if dist > pin_radius:
+                    continue
+
+                empty = bpy.data.objects.new(
+                    f"{obj.name}_constraint_{part.name}", None)
+                empty.empty_display_size = 0.1
+                constraint_coll.objects.link(empty)
+                empty.location = (obj.location + part.location) / 2.0
+                empty['constrained_object_1'] = obj.name
+                empty['constrained_object_2'] = part.name
+                empty['connection_type'] = 'FIXED'
+
+                # Create rigid body constraint
+                bpy.context.view_layer.objects.active = empty
+                if not empty.rigid_body_constraint:
+                    bpy.ops.rigidbody.constraint_add(object=empty)
+                rbc = empty.rigid_body_constraint
+                if rbc is None:
+                    continue
+                rbc.type = 'FIXED'
+                rbc.object1 = obj
+                rbc.object2 = part
+                rbc.use_breakable = is_breakable
+                rbc.breaking_threshold = break_threshold * (1.0 + break_random * (hash(part.name) % 1000) / 1000.0)
+
+                # Store constraint type
+                empty['rbc_type'] = 'FIXED'
+
+                if use_stuck:
+                    empty['use_stuck'] = True
+                    empty['stuck_threshold'] = pin_radius
+
+        self.report({"INFO"}, f"Added {len(selected)} boundaries")
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_remove_boundary(Operator):
+    """Remove boundary objects and their constraints.
+
+    Mirrors Simply Shatter's RemoveBoundaryConstraintOperator.
+    """
+    bl_idname = "beamng.remove_boundary"
+    bl_label = "Remove Boundaries"
+    bl_description = "Remove all boundary objects and their constraints"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        removed = 0
+        for name in ("BeamNG Boundaries", "BeamNG Boundary Constraints"):
+            coll = bpy.data.collections.get(name)
+            if coll is None:
+                continue
+            for obj in list(coll.objects):
+                if obj.rigid_body:
+                    bpy.ops.rigidbody.object_remove({'object': obj})
+                bpy.data.objects.remove(obj, do_unlink=True)
+                removed += 1
+            bpy.data.collections.remove(coll)
+
+        self.report({"INFO"}, f"Removed {removed} boundary/constraint objects")
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_physics_preview(Operator):
+    """Set rigid body world to preview quality (4 substeps, 10 iterations)."""
+    bl_idname = "beamng.physics_preview"
+    bl_label = "Physics Preview"
+    bl_description = "Set solver to preview quality (fast, less accurate)"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        scene = context.scene
+        if scene.rigidbody_world is None:
+            self.report({"WARNING"}, "No rigid body world — apply physics first")
+            return {"CANCELLED"}
+        scene.rigidbody_world.substeps_per_frame = 4
+        scene.rigidbody_world.solver_iterations = 10
+        self.report({"INFO"}, "Physics set to preview quality (4 substeps / 10 iterations)")
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_physics_final(Operator):
+    """Set rigid body world to final quality (30 substeps, 60 iterations)."""
+    bl_idname = "beamng.physics_final"
+    bl_label = "Physics Final"
+    bl_description = "Set solver to final quality (slow, accurate)"
+    bl_options = {"REGISTER"}
+
+    def execute(self, context):
+        scene = context.scene
+        if scene.rigidbody_world is None:
+            self.report({"WARNING"}, "No rigid body world — apply physics first")
+            return {"CANCELLED"}
+        scene.rigidbody_world.substeps_per_frame = 30
+        scene.rigidbody_world.solver_iterations = 60
+        self.report({"INFO"}, "Physics set to final quality (30 substeps / 60 iterations)")
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_bake_to_keyframes(Operator):
+    """Bake rigid body simulation to keyframes and remove constraints.
+
+    Mirrors Simply Shatter's OBJECT_OT_bake_to_keyframes. Bakes the RB
+    simulation, converts to F-curves, and removes constraint empties.
+    """
+    bl_idname = "beamng.bake_to_keyframes"
+    bl_label = "Bake to Keyframes"
+    bl_description = "Bake rigid body simulation to keyframes and remove constraints"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        scene = context.scene
+
+        if scene.rigidbody_world is None:
+            self.report({"WARNING"}, "No rigid body world — apply physics first")
+            return {"CANCELLED"}
+
+        # Freeze frame handlers during bake
+        pre_handlers = list(bpy.app.handlers.frame_change_pre)
+        post_handlers = list(bpy.app.handlers.frame_change_post)
+        bpy.app.handlers.frame_change_pre.clear()
+        bpy.app.handlers.frame_change_post.clear()
+
+        try:
+            # Bake the simulation
+            bpy.ops.rigidbody.bake_to_keyframes(
+                frame_start=scene.frame_start,
+                frame_end=scene.frame_end,
+                step=1)
+
+            # Convert baked constraints to keyframes for each boundary object
+            boundary_coll = bpy.data.collections.get("BeamNG Boundaries")
+            if boundary_coll:
+                for obj in boundary_coll.all_objects:
+                    if obj.type != 'MESH':
+                        continue
+                    if obj.animation_data and obj.animation_data.action:
+                        for fc in obj.animation_data.action.fcurves:
+                            if 'rotation' in fc.data_path:
+                                obj.keyframe_insert(
+                                    data_path=fc.data_path,
+                                    frame=scene.frame_start)
+                                obj.keyframe_insert(
+                                    data_path=fc.data_path,
+                                    frame=scene.frame_end)
+
+            # Remove constraint empties
+            constraint_coll = bpy.data.collections.get("BeamNG Boundary Constraints")
+            if constraint_coll:
+                for obj in list(constraint_coll.all_objects):
+                    if obj.rigid_body_constraint:
+                        bpy.context.view_layer.objects.active = obj
+                        bpy.ops.rigidbody.constraint_remove(object=obj)
+                    bpy.data.objects.remove(obj, do_unlink=True)
+                bpy.data.collections.remove(constraint_coll)
+
+            # Mark as baked
+            context.scene.beamng_physics.baked_to_keyframes = True
+
+        except Exception as exc:
+            self.report({"ERROR"}, f"Bake failed: {exc}")
+            return {"CANCELLED"}
+        finally:
+            # Restore frame handlers
+            bpy.app.handlers.frame_change_pre.clear()
+            bpy.app.handlers.frame_change_post.clear()
+            for h in pre_handlers:
+                bpy.app.handlers.frame_change_pre.append(h)
+            for h in post_handlers:
+                bpy.app.handlers.frame_change_post.append(h)
+
+        self.report({"INFO"}, "Baked rigid body simulation to keyframes")
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_reduce_velocity(Operator):
+    """Reduce velocity / dampen jiggling on selected objects.
+
+    Mirrors Simply Shatter's reduce_velocity operator. Smooths keyframe
+    curves to dampen residual motion.
+    """
+    bl_idname = "beamng.reduce_velocity"
+    bl_label = "Reduce Velocity"
+    bl_description = "Dampen jiggling by smoothing keyframe curves"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        scene = context.scene
+        smooth_value = int(getattr(scene.beamng_physics, "cleanup_smooth_value", 30))
+        use_current = bool(getattr(scene.beamng_physics, "cleanup_use_current_keyframe", True))
+        start_frame = int(getattr(scene.beamng_physics, "cleanup_keyframe_start", 0))
+
+        if use_current:
+            start_frame = scene.frame_current
+
+        selected = [obj for obj in context.selected_objects if obj.type == 'MESH']
+        if not selected:
+            self.report({"WARNING"}, "No mesh objects selected")
+            return {"CANCELLED"}
+
+        end_frame = scene.frame_end
+        smoothed = 0
+
+        for obj in selected:
+            if not obj.animation_data or not obj.animation_data.action:
+                continue
+            action = obj.animation_data.action
+            for fc in action.fcurves:
+                if fc.data_path not in ('location', 'rotation_euler', 'rotation_quaternion'):
+                    continue
+                # Collect keyframes in the smoothing window
+                kps = [kp for kp in fc.keyframe_points
+                       if start_frame <= kp.co.x <= end_frame]
+                if len(kps) < smooth_value:
+                    continue
+                # Moving average
+                values = [kp.co.y for kp in kps]
+                for i in range(len(kps)):
+                    window_start = max(0, i - smooth_value // 2)
+                    window_end = min(len(values), i + smooth_value // 2 + 1)
+                    avg = sum(values[window_start:window_end]) / (window_end - window_start)
+                    kps[i].co.y = avg
+                    kps[i].handle_left.y = avg
+                    kps[i].handle_right.y = avg
+                smoothed += 1
+
+        self.report({"INFO"}, f"Smoothed velocity on {smoothed} objects")
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
+# Class registration
+# ---------------------------------------------------------------------------
+
 _CLASSES = (
     BEAMNG_OT_scan_sequence,
     BEAMNG_OT_build_cache,
@@ -932,6 +1392,14 @@ _CLASSES = (
     BEAMNG_OT_assign_textures,
     BEAMNG_OT_build_debris,
     BEAMNG_OT_clear_debris,
+    BEAMNG_OT_apply_physics,
+    BEAMNG_OT_add_colliders,
+    BEAMNG_OT_add_boundaries,
+    BEAMNG_OT_remove_boundary,
+    BEAMNG_OT_physics_preview,
+    BEAMNG_OT_physics_final,
+    BEAMNG_OT_bake_to_keyframes,
+    BEAMNG_OT_reduce_velocity,
 )
 
 

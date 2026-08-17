@@ -429,3 +429,92 @@ def triangulate_indices(indices: np.ndarray) -> np.ndarray:
             return np.vstack([idx[:, (0, 1, 2)], idx[:, (0, 2, 3)]])
         return idx[:, :3]
     return np.zeros((0, 3), dtype=np.intp)
+
+
+# ---------------------------------------------------------------------------
+# Simply Shatter compatibility
+# ---------------------------------------------------------------------------
+
+
+def simply_shatter_shards(source_objects: Sequence["bpy.types.Object"],
+                          material: str = "steel",
+                          count: int = 14,
+                          seed: int = 0,
+                          collection: Optional["bpy.types.Collection"] = None,
+                          ) -> List["bpy.types.Object"]:
+    """Create shard objects from selected source objects using BeamNG's fracture
+    profiles, compatible with Simply Shatter's physics pipeline.
+
+    This bridges Simply Shatter's workflow (select parts → apply physics) with
+    BeamNG's per-material fracture profiles.  For each source object, ``count``
+    shard variants are generated from the object's own geometry, giving shards
+    that look like they genuinely came off that part.
+
+    The returned objects are ready to receive rigid bodies via
+    ``beamng.apply_physics`` or Simply Shatter's operators.
+    """
+    if bpy is None:
+        raise RuntimeError("simply_shatter_shards requires Blender (bpy)")
+
+    profile = profile_for(material)
+    rng = np.random.default_rng(seed)
+    all_objects: List["bpy.types.Object"] = []
+
+    for src in source_objects:
+        if src.type != "MESH":
+            continue
+        mesh = src.data
+        if not mesh or not mesh.polygons:
+            continue
+
+        # Extract vertices and triangles in world space
+        vcount = len(mesh.vertices)
+        co = np.empty(vcount * 3, dtype=np.float64)
+        mesh.vertices.foreach_get("co", co)
+        verts = co.reshape(-1, 3)
+
+        # Apply object transform to get world-space positions
+        mw = np.asarray(src.matrix_world, dtype=np.float64)
+        verts_h = np.hstack([verts, np.ones((vcount, 1))])
+        verts = (mw @ verts_h.T).T[:, :3]
+
+        # Get triangles
+        loop_triangles = mesh.loop_triangles
+        if not loop_triangles:
+            # Fallback: fan-triangulate polygons
+            tris_list = []
+            for poly in mesh.polygons:
+                indices = list(poly.loop_indices)
+                for i in range(1, len(indices) - 1):
+                    tris_list.append([mesh.loops[indices[0]].vertex_index,
+                                      mesh.loops[indices[i]].vertex_index,
+                                      mesh.loops[indices[i + 1]].vertex_index])
+            if not tris_list:
+                continue
+            tris = np.array(tris_list, dtype=np.intp)
+        else:
+            tris = np.array([[lt.vertices[0], lt.vertices[1], lt.vertices[2]]
+                             for lt in loop_triangles], dtype=np.intp)
+
+        patches = sample_surface_patches(verts, tris, count, rng)
+        if not patches:
+            continue
+
+        mat = _resolve_source_material(src.name, {src.name: src}) or fallback_material(material)
+
+        for i, (point, normal) in enumerate(patches):
+            sverts, sfaces = build_shard_geometry(point, normal, profile, rng)
+            smesh = _mesh_from_arrays(
+                f"ss_shard_{src.name}_{material}_{i:02d}", sverts, sfaces)
+            smesh.materials.append(mat)
+            for poly in smesh.polygons:
+                poly.use_smooth = False
+            obj = bpy.data.objects.new(
+                f"ss_shard_{src.name}_{material}_{i:02d}", smesh)
+            # Place at the shard's world position
+            obj.location = point
+            if collection is not None:
+                collection.objects.link(obj)
+            all_objects.append(obj)
+
+    return all_objects

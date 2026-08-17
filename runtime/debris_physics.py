@@ -420,12 +420,14 @@ def _ensure_rigidbody_world(scene, frame_start: int, frame_end: int) -> None:
 def _ensure_ground(settings: DebrisSettings) -> "bpy.types.Object":
     """A flat passive collision plane for debris to land on.
 
-    Modeled after Simply Shatter's approach: a simple zero-thickness Plane
-    with CONVEX_HULL shape and a small margin.  The margin acts as an invisible
-    buffer that prevents shards from penetrating the surface, while CONVEX_HULL
-    is fast and stable for a flat quad.
+    Always created — both hero rigid bodies and fine NEWTON particles need a
+    ground to collide with.  Particles use COLLISION modifiers (sphere-based),
+    rigid bodies use PASSIVE rigid body (mesh-based).  Both are on this one
+    object.
 
-    The Plane sits at ``ground_z`` with its face normal pointing up (+Z).
+    Modeled after Simply Shatter's approach: a simple zero-thickness Plane
+    with CONVEX_HULL shape and a small margin.  The Plane sits at
+    ``ground_z`` with its face normal pointing up (+Z).
     """
     ground = bpy.data.objects.get(GROUND_NAME)
     if ground is None:
@@ -447,10 +449,10 @@ def _ensure_ground(settings: DebrisSettings) -> "bpy.types.Object":
     ground.hide_render = True
     ground.display_type = "WIRE"
 
-    # NEWTON particles only collide with objects carrying a COLLISION modifier;
-    # the rigid-body plane is invisible to them, so fine debris used to fall
-    # straight through.  The same ground can be both a rigid body (hero
-    # pieces) and a COLLISION collider (fine debris).
+    # COLLISION modifier for NEWTON particles.  Particles collide as spheres
+    # (radius = particle_size) against this surface.  thickness_outer creates
+    # a detection zone ABOVE the mesh so particles are deflected before they
+    # reach the surface — critical for preventing sphere-centre penetration.
     if not any(m.type == "COLLISION" for m in ground.modifiers):
         ground.modifiers.new(name="Collision", type="COLLISION")
     if getattr(ground, "collision", None) is not None:
@@ -462,8 +464,14 @@ def _ensure_ground(settings: DebrisSettings) -> "bpy.types.Object":
             settings.friction + 0.6 * (1.0 - bounciness), 0.0, 5.0))
         col.permeability = 0.0
         col.damping = 0.6
-        col.thickness_outer = 0.1
-        col.thickness_inner = 0.05
+        # thickness_outer pushes the collision detection zone UP so the
+        # particle sphere (radius = particle_size) stops well above the mesh
+        # surface.  The instanced shard extends ~particle_size below the
+        # sphere centre, so thickness_outer must be >= particle_size to keep
+        # every shard above ground.  0.05 m is the calibrated minimum for the
+        # largest shards (~5 cm radius).
+        col.thickness_outer = 0.05
+        col.thickness_inner = 0.001
     return ground
 
 

@@ -585,15 +585,23 @@ def _spawn_hero_pieces(event: ImpactEvent, count: int,
     # shape, restitution/damping, deactivation — is delegated to
     # configure_rigidbody in debris_physics.
     bpy.context.view_layer.update()
-    for obj, launch_start, s, is_blast in placed:
-        rb_coll.objects.link(obj)
-        if obj.rigid_body is None:
-            continue
-        configure_rigidbody(
-            obj, settings,
-            mass=profile.thickness * 90.0 * s ** 3,
-            is_blast=is_blast,
-            launch_start=launch_start)
+    with _viewport_context():
+        for obj, launch_start, s, is_blast in placed:
+            rb_coll.objects.link(obj)
+            if obj.rigid_body is None:
+                # Linking into the rigid body world collection does NOT create
+                # a rigid_body component — only bpy.ops.rigidbody.object_add()
+                # does.  Without this the piece has no Bullet physics and sits
+                # at its spawn position forever (the "stuck in air" bug).
+                bpy.context.view_layer.objects.active = obj
+                bpy.ops.rigidbody.object_add(type="ACTIVE")
+            if obj.rigid_body is None:
+                continue
+            configure_rigidbody(
+                obj, settings,
+                mass=profile.thickness * 90.0 * s ** 3,
+                is_blast=is_blast,
+                launch_start=launch_start)
 
     return spawned
 
@@ -995,14 +1003,18 @@ def _spawn_glass_pane(part: str, tier: str, event: ImpactEvent,
     # freeze the real trajectory and ground-snap the final result.
     if rb_coll is not None and placed:
         bpy.context.view_layer.update()
-        for obj, launch_start in placed:
-            if obj.name not in rb_coll.objects:
-                rb_coll.objects.link(obj)
-            if obj.rigid_body is None:
-                continue
-            configure_glass_rigidbody(
-                obj, settings, launch_start,
-                mass=profile_for("glass").thickness * 70.0)
+        with _viewport_context():
+            for obj, launch_start in placed:
+                if obj.name not in rb_coll.objects:
+                    rb_coll.objects.link(obj)
+                if obj.rigid_body is None:
+                    bpy.context.view_layer.objects.active = obj
+                    bpy.ops.rigidbody.object_add(type="ACTIVE")
+                if obj.rigid_body is None:
+                    continue
+                configure_glass_rigidbody(
+                    obj, settings, launch_start,
+                    mass=profile_for("glass").thickness * 70.0)
 
     # Glass is now a genuine rigid-body launch/simulation path.  bake_debris
     # converts it to ordinary F-curves, so the final scene contains no live
