@@ -608,8 +608,9 @@ def _try_recover(scene) -> bool:
                     playback._objects[obj.name] = obj
 
         # --- rebuild _dynamic_objects ---
+        dynamic_names = {c.name for c in reader.dynamic_objects()}
         for obj in playback_coll.objects:
-            if obj.type == "MESH" and obj.name not in playback._objects and obj.name not in playback._chunks:
+            if obj.type == "MESH" and obj.name in dynamic_names:
                 playback._dynamic_objects[obj.name] = obj
 
         _active = playback
@@ -665,6 +666,14 @@ def _on_frame_change(scene, _depsgraph=None) -> None:  # pragma: no cover - Blen
             return
 
     _active.set_frame(cache_frame)
+
+    # Update the proxy mesh if one exists.
+    try:
+        from .proxy_mesh import update_proxy_from_frame
+        update_proxy_from_frame(cache_frame)
+    except Exception:
+        pass
+
     if _force_depsgraph:
         bpy.context.view_layer.update()
 

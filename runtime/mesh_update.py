@@ -1435,7 +1435,10 @@ class CachePlayback:
     def _write_dynamic_frame(self, name: str, obj: "bpy.types.Object",
                              frame: int) -> None:
         """Render one dynamic (topology-changing) object for *frame*."""
-        positions, indices = self.reader.frame_dynamic_geometry(name, frame)
+        try:
+            positions, indices = self.reader.frame_dynamic_geometry(name, frame)
+        except (KeyError, ValueError):
+            return  # proxy or unknown object — skip
         self._log_bounds("RAW_GLTF", name, frame, positions)
         if len(positions) == 0:
             obj.hide_viewport = True

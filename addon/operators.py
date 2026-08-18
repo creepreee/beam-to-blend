@@ -779,6 +779,58 @@ class BEAMNG_OT_clear_debris(Operator):
         return {"FINISHED"}
 
 
+class BEAMNG_OT_create_proxy(Operator):
+    """Create a single low-poly proxy mesh that follows the car animation.
+
+    Joins all car objects, decimates to ≤1000 vertices, and maps each proxy
+    vertex to the nearest original vertex.  The proxy follows the same per-
+    frame vertex animation as the full car, parented to the same transform
+    Empty.  Useful for viewport performance with complex captures.
+    """
+    bl_idname = "beamng.create_proxy"
+    bl_label = "Create Proxy Mesh"
+    bl_description = "Single low-poly mesh (≤1000 verts) following the car animation"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        from runtime import frame_handler
+        from runtime.proxy_mesh import create_proxy, has_proxy
+
+        if frame_handler._active is None:
+            self.report({"ERROR"}, "Import a cache first")
+            return {"CANCELLED"}
+
+        if has_proxy():
+            from runtime.proxy_mesh import clear_proxy
+            clear_proxy()
+
+        proxy = create_proxy(frame_handler._active)
+        if proxy is None:
+            self.report({"ERROR"}, "Failed to create proxy mesh")
+            return {"CANCELLED"}
+
+        n = len(proxy.data.vertices)
+        self.report({"INFO"}, f"Proxy mesh created: {n} vertices")
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_remove_proxy(Operator):
+    """Remove the proxy mesh."""
+    bl_idname = "beamng.remove_proxy"
+    bl_label = "Remove Proxy Mesh"
+    bl_description = "Remove the low-poly proxy mesh"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        from runtime.proxy_mesh import clear_proxy, has_proxy
+        if not has_proxy():
+            self.report({"INFO"}, "No proxy mesh to remove")
+            return {"CANCELLED"}
+        clear_proxy()
+        self.report({"INFO"}, "Proxy mesh removed")
+        return {"FINISHED"}
+
+
 class BEAMNG_OT_assign_textures(Operator):
     """Auto-assign BeamNG PBR textures from a vehicle folder to the imported materials.
 
@@ -1392,6 +1444,8 @@ _CLASSES = (
     BEAMNG_OT_assign_textures,
     BEAMNG_OT_build_debris,
     BEAMNG_OT_clear_debris,
+    BEAMNG_OT_create_proxy,
+    BEAMNG_OT_remove_proxy,
     BEAMNG_OT_apply_physics,
     BEAMNG_OT_add_colliders,
     BEAMNG_OT_add_boundaries,

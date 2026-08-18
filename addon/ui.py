@@ -833,6 +833,15 @@ class BEAMNG_PT_debris(Panel):
         col.operator("beamng.build_debris", text="Build Debris", icon="MOD_PARTICLES")
         col.operator("beamng.clear_debris", text="Clear Debris", icon="TRASH")
 
+        # Proxy mesh
+        layout.separator()
+        box = layout.box()
+        box.label(text="Proxy Mesh", icon="MESH_DATA")
+        row = box.row(align=True)
+        row.scale_y = 1.2
+        row.operator("beamng.create_proxy", text="Create Proxy Mesh", icon="MOD_DECIM")
+        row.operator("beamng.remove_proxy", text="Remove", icon="X")
+
 
 class BEAMNG_PT_physics(Panel):
     """Physics settings for debris simulation (ported from Simply Shatter)."""
