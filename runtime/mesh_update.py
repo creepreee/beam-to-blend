@@ -569,6 +569,42 @@ class CachePlayback:
         except Exception:
             pass
 
+        # Mantaflow fluid effector fix: add dummy location keyframes so
+        # Mantaflow treats these objects as animated (not static).
+        self._ensure_fluid_animation()
+
+    def _ensure_fluid_animation(self) -> None:
+        """Add dummy location keyframes so Mantaflow detects animation data.
+
+        Mantaflow caches effector geometry based on whether the object has
+        animation data (F-curves).  Without F-curves, Mantaflow treats
+        effectors as static and evaluates only once at frame 1 — fluid
+        passes right through the car.  Adding a single dummy location
+        keyframe at frame 0 (value = identity, matching the empty-parented
+        local origin) makes Mantaflow re-evaluate the effector each frame.
+        The F-curve is kept: removing it would undo the fix.
+        """
+        if bpy is None:
+            return
+        all_objects = list(self._objects.values())
+        all_objects.extend(self._chunks.values())
+        all_objects.extend(self._dynamic_objects.values())
+        for obj in all_objects:
+            if obj is None:
+                continue
+            # Skip if already has animation data (e.g. from a previous call
+            # or from Blender undo recovery that preserved the F-curve).
+            if (obj.animation_data is not None
+                    and obj.animation_data.action is not None
+                    and any(fc.data_path == "location"
+                            for fc in obj.animation_data.action.fcurves)):
+                continue
+            # Add dummy keyframe at frame 0 on location (0,0,0).
+            # The objects are parented to the transform Empty, so their
+            # local location is always origin — the F-curve just signals
+            # "this object is animated" to Mantaflow.
+            obj.keyframe_insert(data_path="location", frame=0)
+
     def _build_scene_individual(self) -> None:
         """Original per-object creation (no chunking)."""
         collection = self._get_or_create_collection(self.collection_name)

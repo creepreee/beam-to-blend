@@ -627,6 +627,9 @@ def _try_recover(scene) -> bool:
             playback.set_shattered_panes(
                 panes, edge_retain=_load_shatter_edge_retain(scene))
 
+        # Ensure Mantaflow fluid effector fix survives undo/reload
+        playback._ensure_fluid_animation()
+
         # Re-register handler if missing
         _ensure_handler_registered()
 
