@@ -266,22 +266,23 @@ def create_proxy(playback, max_verts: int = 1000):
 # Per-frame update
 # ---------------------------------------------------------------------------
 
-def _update_proxy(frame: int) -> None:
-    """Write proxy vertex positions for cache *frame*."""
+def gather_proxy_positions(frame: int) -> np.ndarray:
+    """Compute the proxy's (N, 3) positions for cache *frame* without writing.
+
+    Returns ``None`` when the proxy/mapping isn't built or the active
+    playback can't be reached.  This is the single source of truth for both
+    the live per-frame viewport write and the fluid-effector .mdd bake.
+    """
     if (_proxy_object is None
             or _mapping_orig_names is None
             or _mapping_orig_vi is None
             or _orig_name_list is None):
-        return
-
-    mesh = _proxy_object.data
-    n = _proxy_vert_count
-    out = np.empty(n * 3, dtype=np.float32)
+        return None
 
     from . import frame_handler
     pb = frame_handler._active
     if pb is None:
-        return
+        return None
     reader = pb.reader
 
     # Clamp to valid cache range so out-of-range timeline frames don't
@@ -300,13 +301,14 @@ def _update_proxy(frame: int) -> None:
         except Exception:
             pass
 
+    out = np.zeros((_proxy_vert_count, 3), dtype=np.float32)
+
     # Vectorised gather — group proxy verts by source object name index,
     # then batch-read each object's positions with fancy indexing.
     name_indices = _mapping_orig_names          # (N,) int32
     vi_indices = _mapping_orig_vi               # (N,) int32
     unique_names = np.unique(name_indices)      # sorted unique source indices
 
-    out_3 = out.reshape(-1, 3)
     for ui in unique_names:
         ui = int(ui)
         mask = name_indices == ui               # bool (N,)
@@ -323,9 +325,19 @@ def _update_proxy(frame: int) -> None:
         sampled = pos[safe_vis]                 # (K, 3)
         # Zero out invalid entries.
         sampled[~valid] = 0.0
-        out_3[mask] = sampled
+        out[mask] = sampled
 
-    _write_positions(mesh, out, _proxy_object)
+    return out
+
+
+def _update_proxy(frame: int) -> None:
+    """Write proxy vertex positions for cache *frame*."""
+    if _proxy_object is None:
+        return
+    pos = gather_proxy_positions(frame)
+    if pos is None:
+        return
+    _write_positions(_proxy_object.data, pos.reshape(-1), _proxy_object)
 
 
 def update_proxy_from_frame(frame: float) -> None:

@@ -659,6 +659,17 @@ def _on_frame_change(scene, _depsgraph=None) -> None:  # pragma: no cover - Blen
         if not _try_recover(scene):
             return
 
+    # CRITICAL: during a fluid bake Mantaflow steps through frames on a
+    # background thread.  Our handler fires on that thread and calls
+    # foreach_set → RNA_property_update → wm_event_add_notifier, but the
+    # WM event queue is not thread-safe during jobs — null-pointer crash
+    # (EXCEPTION_ACCESS_VIOLATION in note_cmp_for_queue_fn).  Skip mesh
+    # updates when not on the main thread; Mantaflow reads the mesh
+    # geometry directly from eval-time depsgraph, not from our handler.
+    import threading
+    if threading.current_thread() is not threading.main_thread():
+        return
+
     cache_frame = _cache_frame_for(scene.frame_current)
 
     # Every-Nth-frame experiment — skip actual update on most frames

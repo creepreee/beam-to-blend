@@ -720,6 +720,19 @@ class BEAMNG_PT_main(Panel):
         col.separator()
         col.operator("beamng.export_alembic", text="4. Export to Alembic", icon="EXPORT")
 
+        col.separator()
+        fluid = layout.column(align=True)
+        fluid.operator("beamng.prepare_fluid_effector",
+                       text="Prepare Fluid Effector", icon="MOD_FLUID")
+        fluid.operator("beamng.clear_fluid_effector",
+                       text="Clear Fluid Effector", icon="X")
+        note = fluid.column(align=True)
+        note.scale_y = 0.7
+        note.label(
+            text="Bakes proxy to .mdd + MESH_CACHE,", icon="INFO")
+        note.label(
+            text="moves FLUID effector onto proxy.", icon="INFO")
+
 
 class BEAMNG_PT_tyres(Panel):
     """Fake tyre ground-contact deformation (BeamNG tyre meshes are rigid)."""

@@ -831,6 +831,56 @@ class BEAMNG_OT_remove_proxy(Operator):
         return {"FINISHED"}
 
 
+class BEAMNG_OT_prepare_fluid_effector(Operator):
+    """Bake the proxy mesh as the Mantaflow fluid effector.
+
+    Mantaflow bakes on a background thread; our Python frame handler fires
+    there and crashes (WM notifier is not thread-safe).  This operator bakes
+    the proxy's per-frame deformation to a .mdd + MESH_CACHE modifier and the
+    rigid transform Empty to keyframes, then moves the FLUID effector from the
+    heavy meshes onto the proxy — so Mantaflow reads native depsgraph data on
+    its own thread with zero crash risk.
+    """
+    bl_idname = "beamng.prepare_fluid_effector"
+    bl_label = "Prepare Fluid Effector"
+    bl_description = "Move the Mantaflow fluid effector onto the baked low-poly proxy (no bake-thread crash)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        from runtime import frame_handler
+        from runtime.fluid_effector import prepare_fluid_effector
+
+        if frame_handler._active is None:
+            self.report({"ERROR"}, "Import a cache first")
+            return {"CANCELLED"}
+
+        if not prepare_fluid_effector(frame_handler._active):
+            self.report({"ERROR"}, "Failed to prepare fluid effector")
+            return {"CANCELLED"}
+
+        self.report(
+            {"INFO"},
+            "Fluid effector moved to proxy (baked to .mdd — bake the domain now)",
+        )
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_clear_fluid_effector(Operator):
+    """Remove the MESH_CACHE + FLUID modifiers from the proxy mesh."""
+    bl_idname = "beamng.clear_fluid_effector"
+    bl_label = "Clear Fluid Effector"
+    bl_description = "Remove the prepared fluid effector (MESH_CACHE + FLUID) from the proxy"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        from runtime.fluid_effector import clear_fluid_effector
+        if not clear_fluid_effector():
+            self.report({"INFO"}, "No prepared fluid effector to clear")
+            return {"CANCELLED"}
+        self.report({"INFO"}, "Fluid effector cleared from proxy")
+        return {"FINISHED"}
+
+
 class BEAMNG_OT_assign_textures(Operator):
     """Auto-assign BeamNG PBR textures from a vehicle folder to the imported materials.
 
@@ -1446,6 +1496,8 @@ _CLASSES = (
     BEAMNG_OT_clear_debris,
     BEAMNG_OT_create_proxy,
     BEAMNG_OT_remove_proxy,
+    BEAMNG_OT_prepare_fluid_effector,
+    BEAMNG_OT_clear_fluid_effector,
     BEAMNG_OT_apply_physics,
     BEAMNG_OT_add_colliders,
     BEAMNG_OT_add_boundaries,
