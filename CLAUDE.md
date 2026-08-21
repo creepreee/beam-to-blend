@@ -194,6 +194,36 @@ asserts both, in per-object and chunked mode (measured 8.828 m of root travel;
 The recovery link is **soft**: the .blend stores only the BVC *path* (46 MB, not
 4.27 GB). Move or rename the cache and `_try_recover` returns False silently.
 
+### Background mode gotchas (fixed in 0.3.1)
+
+Batch rendering (`blender -b file.blend ...`) exposed two traps, both measured
+with instrumented `load_post` handlers on 4.5.9:
+
+1. **`load_post` DOES fire in background** — but its handler argument is the
+   loaded FILEPATH STRING, not a scene (GUI passes different args; the old
+   signature called it `_dummy`, which is why this went unnoticed).
+   `_on_load_post` therefore resolves the scene defensively:
+   `bpy.context.scene` first, then a scan of `bpy.data.scenes` for
+   `_beamng_cache_path`.
+2. **Dual-module identity trap.** When installed, the core packages import
+   both as `beamng_cache_importer.runtime|importer` AND as top-level
+   `runtime|importer` (via the add-on's sys.path entry). Python treated each
+   name as a distinct module with separate state: the add-on's handlers
+   recovered playback into one copy while external render scripts importing
+   `beamng_cache_importer.runtime.frame_handler` saw `_active is None` in the
+   other copy and wrongly concluded auto-recovery never ran. `addon/__init__`
+   now plants sys.modules aliases for every package + submodule BEFORE
+   importing ui/operators, so all import paths bind to one module object.
+   Verified: CLI-open probe shows `_active` populated before any script runs,
+   and `packaged frame_handler IS top-level frame_handler -> True`.
+
+Render scripts no longer need the manual `_try_recover()` workaround — but
+they MUST import through the installed add-on (`beamng_cache_importer...` or
+plain `runtime...`, now the same objects) and the add-on must be enabled in
+that machine's preferences, otherwise no handler exists at all.
+Diagnostics: `tests/diag_bg_loadpost.py` (CLI-open probe) and
+`tests/diag_bg_openfile.py` (persistent-marker + wrapped-handler probe).
+
 ## Renders move the car (`runtime/frame_handler.py` render path)
 
 THE "scrubbing works but Ctrl+F12 / Viewport Render Animation outputs a
