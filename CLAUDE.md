@@ -194,6 +194,64 @@ asserts both, in per-object and chunked mode (measured 8.828 m of root travel;
 The recovery link is **soft**: the .blend stores only the BVC *path* (46 MB, not
 4.27 GB). Move or rename the cache and `_try_recover` returns False silently.
 
+## Renders move the car (`runtime/frame_handler.py` render path)
+
+THE "scrubbing works but Ctrl+F12 / Viewport Render Animation outputs a
+statue" bug. Two facts combined to cause it, and both were measured with an
+instrumented render before fixing:
+
+1. **GUI renders run every Python handler on the WM JOB THREAD**, not the
+   main thread — Blender executes the whole render pipeline on a background
+   job when rendering from the UI. Measured: an animation render from a
+   worker thread fired `frame_change` ×13 + `render_pre` ×12, ALL on the job
+   thread. `_on_frame_change` deliberately refuses non-main threads (the
+   Mantaflow-bake crash guard), so it silently skipped EVERY frame → each
+   rendered frame showed whatever pose the viewport last had.
+   `--background` renders run the same handlers on the MAIN thread, which is
+   why headless renders and scrubbing always worked and the bug looked like
+   "renders ignore the animation".
+2. `render_pre` fires once per rendered frame BEFORE the engine evaluates
+   the depsgraph, so applying the mapped cache frame there is authoritative
+   for what reaches Cycles/Eevee/Workbench.
+
+The fix: `_on_render_pre` applies `_cache_frame_for(scene.frame_current_float)`
+(via the shared `_apply_playhead`) on WHATEVER thread it is invoked on — no
+main-thread guard. The Mantaflow hazard does not apply to renders (bakes
+never trigger render callbacks), and the bake guard stays on the frame-change
+path. Job-thread mesh writes are proven safe by test (worker-thread renders
+complete cleanly and produce bit-identical motion to main-thread renders).
+`attach()` / `detach_handler()` / `_ensure_handler_registered()` /
+`_try_recover()` manage the render handler alongside the frame-change one,
+so undo/reload recovery re-arms renders too.
+
+Gotchas:
+- **Double application is fine.** In background renders both handlers fire
+  per frame on the main thread; `CachePlayback.set_frame` early-returns when
+  the cache frame is unchanged, so the second call is a cheap no-op.
+- **Subframes**: the render path maps `scene.frame_current_float`, so motion
+  blur subframes land on the right cache frame; the viewport path keeps
+  integer frames.
+- **`_skip_n` never applies to renders** — that knob decimates viewport
+  updates only; a render must always be exact.
+- **View > Viewport Render Animation is NOT fixable from a handler when the
+  viewport shading is Rendered + Cycles** (Blender 4.5.9). The ogl-render
+  path fires `frame_change` per frame on the main thread and our writes DO
+  land in the original mesh data — but every saved frame is bit-identical:
+  the path never re-evaluates per frame. Proven NOT our bug: a plain
+  keyframed cube with zero Python also freezes there (5.5e-5 mean pixel diff)
+  while the same cube moves under Solid/Workbench (2.3e-3) and Material/
+  EEVEE (4.9e-3); brightness ~0.22 rules out blank renders. Flushing
+  `evaluated_depsgraph_get()` inside the handler was tested and changed
+  nothing (upstream consumes no tags on this path), so that flush is NOT in
+  the runtime. User workaround: switch the viewport to **Material Preview**
+  or **Solid** before Viewport Render Animation; real renders (F12 /
+  Ctrl+F12) are unaffected and covered by `_on_render_pre`. Diagnostic:
+  `tests/diag_viewport_render.py` (env knobs VP_SHADING / VP_ENGINE /
+  VP_TRANSFORMS / VP_KEYFRAMED; must run WINDOWED — ogl needs a GPU context).
+  `tests/diag_user_scene.py` runs inside the user's open Blender against
+  their real scene (Text Editor > Run Script) and writes
+  `%TEMP%\opencode\user_vp_diag.log`.
+
 ## Smooth car stop (`runtime/mesh_update.py` tail path)
 
 Without it, the crash ends with the car frozen mid-pose the instant the last
@@ -339,7 +397,7 @@ Name filter (`tire,tyre` by default) keeps rims/hubs/brakes rigid. Alembic
 export bakes the same deformation into the .mdd, so renders match the viewport.
 
 ### Validation
-- 74/74 tests pass (`python -m pytest -q`)
+- 113/113 tests pass (`python -m pytest -q`)
 - Tyre contact verified headless against real capture data (97 objects, 4 tyres):
   flat patch spans 0.000 mm, no ground penetration, 93 non-tyre objects
   bit-identical, all 20 rigid members inside the merged `wheels` chunk
@@ -388,6 +446,16 @@ export bakes the same deformation into the .mdd, so renders match the viewport.
   swings and converges from the new seam, retuning the start frame refreshes a
   parked playhead, `start=0` restores the default onset at the capture end, and
   undo/reload recovery restores the live start frame.
+- Renders verified headless with REAL Cycles output (22 checks, synthetic
+  24-frame cache, self-contained — no capture needed). Run:
+  `blender --background --python tests/blender_render_playback.py`
+  Negative control: an animation render ON A WORKER THREAD (the GUI job-thread
+  condition) with the render handler removed fires ZERO playback updates and
+  every PNG is identical (frozen car); with it registered the same worker
+  render applies one mapped cache frame per rendered frame, first/last PNGs
+  differ (4e-2 mean), the mesh ends on the exact final cache pose, a still
+  render applies the parked frame without scrubbing, and post-undo recovery
+  re-arms renders. Thread instrumentation: `tests/diag_render_thread.py`.
 - Deform cost ~2.2 ms/frame for 4 tyres / 1024 verts (bulge dominates; the
   `axle_axis` eigensolve is 0.36 ms of it)
 - GLB pipeline: 2000-frame capture at 10x slowmo, 97 objects, 7.4 GB BVC — verified

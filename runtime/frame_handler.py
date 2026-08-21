@@ -641,7 +641,12 @@ def _try_recover(scene) -> bool:
 
 
 def _ensure_handler_registered() -> None:
-    """Register the frame-change handler if not already present."""
+    """Register the frame-change AND render handlers if not already present.
+
+    The render handler is part of recovery for the same reason as the
+    frame-change one: a background render of a freshly opened .blend must
+    start moving without any prior scrub (see :func:`_on_render_pre`).
+    """
     if bpy is None:
         return
     handlers = bpy.app.handlers.frame_change_pre
@@ -651,6 +656,63 @@ def _ensure_handler_registered() -> None:
     )
     if not already:
         handlers.append(_on_frame_change)
+    _ensure_render_handler_registered()
+
+
+def _ensure_render_handler_registered() -> None:
+    """Register the render-pre handler if not already present."""
+    if bpy is None:
+        return
+    handlers = bpy.app.handlers.render_pre
+    already = any(
+        getattr(h, "__name__", "") == "_on_render_pre"
+        for h in handlers
+    )
+    if not already:
+        handlers.append(_on_render_pre)
+
+
+def _apply_playhead(scene) -> None:
+    """Map the scene playhead to a cache frame and push it to the meshes.
+
+    Shared by the frame-change handler (viewport scrub/playback) and the
+    render handler (:func:`_on_render_pre`) so both paths apply the exact
+    same mapping.  Uses ``frame_current_float`` when available so motion-blur
+    subframes land on the right cache frame too.
+
+    May run on ANY thread — GUI renders invoke handlers on the render job
+    thread — so anything touching ``bpy.context.screen`` (redraws, the proxy
+    mesh) is restricted to the main thread here.
+    """
+    frame = getattr(scene, "frame_current_float", None)
+    if frame is None:
+        frame = float(scene.frame_current)
+    cache_frame = _cache_frame_for(frame)
+
+    _active.set_frame(cache_frame)
+
+    # Update the proxy mesh if one exists — main thread only (it walks
+    # bpy.context.screen areas to tag redraws).
+    import threading
+    main = threading.current_thread() is threading.main_thread()
+    if main:
+        try:
+            from .proxy_mesh import update_proxy_from_frame
+            update_proxy_from_frame(cache_frame)
+        except Exception:
+            pass
+
+    # NOTE: Viewport Render Animation with the viewport in RENDERED shading
+    # + Cycles freezes ALL per-frame animation — including plain keyframed
+    # objects with no Python involved (verified: keyframed cube frozen at
+    # 5.5e-5 mean pixel diff while the same cube moves at 2.3e-3 under Solid
+    # shading; EEVEE Material Preview also moves).  That is a Blender-level
+    # limitation of the ogl-render path in 4.5.9, NOT something a handler
+    # can fix: flushing evaluated_depsgraph_get() inside frame_change was
+    # tested and changed nothing.  Workaround for users: switch the viewport
+    # to Material Preview or Solid before View > Viewport Render Animation.
+    # Real renders (F12 / Ctrl+F12) are unaffected — _on_render_pre covers
+    # those, including on the GUI job thread.
 
 
 def _on_frame_change(scene, _depsgraph=None) -> None:  # pragma: no cover - Blender cb
@@ -672,7 +734,9 @@ def _on_frame_change(scene, _depsgraph=None) -> None:  # pragma: no cover - Blen
 
     cache_frame = _cache_frame_for(scene.frame_current)
 
-    # Every-Nth-frame experiment — skip actual update on most frames
+    # Every-Nth-frame experiment — skip actual update on most frames.
+    # Deliberately NOT applied on the render path: a render must always be
+    # exact, never decimated.
     global _frame_counter
     if _skip_n > 0:
         _frame_counter += 1
@@ -690,6 +754,48 @@ def _on_frame_change(scene, _depsgraph=None) -> None:  # pragma: no cover - Blen
 
     if _force_depsgraph:
         bpy.context.view_layer.update()
+
+
+def _on_render_pre(scene=None, depsgraph=None) -> None:  # pragma: no cover - Blender cb
+    """Push the cache pose for the frame Blender is ABOUT TO RENDER.
+
+    THE "RENDER DOESN'T MOVE" FIX (2026-08-21)
+    ------------------------------------------
+    A playback driven only from :func:`_on_frame_change` freezes in GUI
+    renders.  Two facts combine to cause it:
+
+    1. Blender DOES run frame-change handlers during animation renders —
+       but on the RENDER JOB THREAD when rendering from the GUI (WM job),
+       and this handler deliberately refuses non-main threads (the
+       Mantaflow-bake crash guard).  Measured with an instrumented render:
+       13 frame-change + 12 render-pre invocations, all on the job thread,
+       zero mesh updates — every rendered frame showed the viewport's last
+       pose.  Background ``--background`` renders run the same handlers on
+       the main thread, which is why they (and scrubbing) always worked.
+    2. ``render_pre`` fires once per rendered frame BEFORE the engine
+       evaluates the depsgraph, so applying the mapped cache frame here is
+       authoritative for what reaches Cycles/Eevee/Workbench.
+
+    This handler therefore applies the update on WHATEVER thread it is
+    invoked on — no main-thread guard.  The Mantaflow hazard does not apply:
+    fluid bakes never trigger render callbacks, and bakes keep their guard
+    on the frame-change path.  Also auto-recovers after undo/reload, so a
+    background render of a freshly opened .blend moves without any prior
+    scrub.
+    """
+    if bpy is None:
+        return
+    if scene is None:
+        scene = bpy.context.scene
+    if scene is None:
+        return
+
+    # Auto-recover after undo/reload (wipes module-level _active).
+    if _active is None:
+        if not _try_recover(scene):
+            return
+
+    _apply_playhead(scene)
 
 
 def attach(playback: CachePlayback, frame_start: int = 0,
@@ -735,6 +841,10 @@ def attach(playback: CachePlayback, frame_start: int = 0,
 
     detach_handler()  # avoid duplicate registrations
     bpy.app.handlers.frame_change_pre.append(_on_frame_change)
+    # Renders bypass frame-change handlers entirely (see _on_render_pre), so
+    # the render handler must be registered alongside it or Ctrl+F12 /
+    # Viewport Render Animation output a frozen car.
+    _ensure_render_handler_registered()
 
     scene = bpy.context.scene
     scene.frame_start = _frame_start
@@ -784,13 +894,17 @@ def attach(playback: CachePlayback, frame_start: int = 0,
 
 
 def detach_handler() -> None:
-    """Remove our frame-change handler if present (leaves objects intact)."""
+    """Remove our frame-change AND render handlers (leaves objects intact)."""
     if bpy is None:
         return
     handlers = bpy.app.handlers.frame_change_pre
     for h in list(handlers):
         if getattr(h, "__name__", "") == "_on_frame_change":
             handlers.remove(h)
+    render_handlers = bpy.app.handlers.render_pre
+    for h in list(render_handlers):
+        if getattr(h, "__name__", "") == "_on_render_pre":
+            render_handlers.remove(h)
 
 
 def detach() -> None:

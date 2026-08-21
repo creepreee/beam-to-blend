@@ -25,6 +25,9 @@ def build_glb(
     """Build a GLB from ``(name, positions (N,3) float32, indices (M,3) int|None)``.
 
     Each object becomes one node -> one mesh -> one triangle primitive.
+    An object may carry an optional 4th tuple element: a node translation
+    (3,) — stored as the glTF node's ``translation``, mirroring how the real
+    exporter emits per-object rigid transforms.
     """
     bin_parts: List[bytes] = []
     buffer_views: List[dict] = []
@@ -43,7 +46,8 @@ def build_glb(
         offset += len(raw)
         return len(buffer_views) - 1
 
-    for name, positions, indices in objects:
+    for obj in objects:
+        name, positions, indices = obj[0], obj[1], obj[2]
         positions = np.asarray(positions, dtype=np.float32)
         pos_view = add_view(positions.tobytes())
         pos_min = positions.min(axis=0).tolist()
@@ -77,7 +81,10 @@ def build_glb(
             prim["indices"] = len(accessors) - 1
 
         meshes.append({"name": f"{name}_mesh", "primitives": [prim]})
-        nodes.append({"name": name, "mesh": len(meshes) - 1})
+        node = {"name": name, "mesh": len(meshes) - 1}
+        if len(obj) >= 4 and obj[3] is not None:
+            node["translation"] = [float(v) for v in obj[3]]
+        nodes.append(node)
 
     bin_chunk = b"".join(bin_parts)
     gltf = {
