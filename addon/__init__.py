@@ -1,7 +1,7 @@
 bl_info = {
     "name": "BeamNG Cache Importer",
     "author": "AI contributors",
-    "version": (0, 2, 0),
+    "version": (0, 3, 0),
     "blender": (4, 0, 0),
     "location": "File Browser > Sidebar > BeamNG",
     "description": "Cache-based importer for BeamNG GLB crash sequences",
