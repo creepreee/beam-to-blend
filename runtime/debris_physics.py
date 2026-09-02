@@ -998,9 +998,19 @@ def configure_particle_physics(
     # fast, so the spray loses its shape instead of holding a clean parabola.
     # At low bounciness the drag is raised too, so a chip that has landed loses
     # its remaining speed instead of sliding away across the road.
+    #
+    # SCALING GOTCHA.  The original formula ``air_drag + 0.45*(1-bounciness)``
+    # fed a 0..1 dial into Blender's ``damping``, which is a *velocity decay
+    # factor*, not a "percent drag" dial.  With the defaults (0.35 + 0.45*0.75)
+    # that produced an effective damping of ~0.69, capping terminal velocity at
+    # a measured ~0.24 m/s — every chip fell like a snowflake (measured 1.6 m
+    # of fall in 1.8 s at 60 fps; damping 0.1 covers 14.8 m in the same time).
+    # The dial is now remapped onto a sane 0..0.3 band so debris still sheds
+    # speed a little (light chips land short of heavy ones) while falling at
+    # near-real gravity.
     bounciness = float(np.clip(settings.bounciness, 0.0, 1.0))
-    st.damping = float(np.clip(settings.air_drag + 0.45 * (1.0 - bounciness),
-                               0.0, 1.0))
+    st.damping = float(np.clip(settings.air_drag * 0.3 + 0.06 * (1.0 - bounciness),
+                               0.0, 0.3))
     # Sub-stepping the solver: at 10-25 m/s a particle covers up to 0.4 m per
     # frame, several times its own size, and would tunnel through the ground.
     st.subframes = int(max(0, settings.particle_subframes))

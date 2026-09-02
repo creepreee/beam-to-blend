@@ -654,7 +654,6 @@ def _spawn_fine_particles(event: ImpactEvent, count: int,
     emitter.rotation_mode = "QUATERNION"
     emitter.rotation_quaternion = mathutils.Vector(
         (0.0, 0.0, 1.0)).rotation_difference(mathutils.Vector(tuple(axis)))
-    emitter.hide_render = True
     coll.objects.link(emitter)
 
     psys_mod = emitter.modifiers.new(name="debris", type="PARTICLE_SYSTEM")
@@ -749,23 +748,30 @@ def _spawn_fine_particles(event: ImpactEvent, count: int,
     # Hide the emitter quad until the impact, so it does not sit as a tiny
     # fixed square at each impact point from frame 1 (measured: 121 quads
     # visible at frame 1).  Emission itself was always gated by frame_start;
-    # this hides the emitter OBJECT.  It is re-hidden once every particle is
-    # dead so it does not linger after the spray settles.  (hide_render stays
-    # True throughout — the emitter quad is never rendered, only its instances.)
+    # this hides the emitter OBJECT.
     #
-    # With the lifetime now running past the end of the scene this key lands
-    # beyond the timeline and never fires, which is correct: hiding the emitter
-    # drops it out of the depsgraph and takes its instanced particles with it,
-    # so re-hiding it while any chip is still on the ground would delete the
-    # settled debris. The key is kept for the case where a short settle window
-    # genuinely does outlive the spray.
+    # BOTH hide_viewport AND hide_render are keyed (not just viewport).  An
+    # emitter with ``hide_render = True`` suppresses its instanced particles in
+    # the FINAL render even though they show in the viewport — the collection
+    # instances are evaluated from the depsgraph, which drops render-hidden
+    # emitters, so the emitted debris vanished from final output.  Keying
+    # hide_render to 0 from the spawn frame keeps the particles in real renders.
+    #
+    # It is re-hidden once every particle is dead so it does not linger after
+    # the spray settles.  With the lifetime now running past the end of the
+    # scene this key lands beyond the timeline and never fires, which is
+    # correct: hiding the emitter drops it out of the depsgraph and takes its
+    # instanced particles with it, so re-hiding it while any chip is still on
+    # the ground would delete the settled debris. The key is kept for the case
+    # where a short settle window genuinely does outlive the spray.
     end_hide = int(spawn_frame) + 2 + int(st.lifetime) + 1
-    emitter.hide_viewport = True
-    emitter.keyframe_insert("hide_viewport", frame=spawn_frame - 1)
-    emitter.hide_viewport = False
-    emitter.keyframe_insert("hide_viewport", frame=spawn_frame)
-    emitter.hide_viewport = True
-    emitter.keyframe_insert("hide_viewport", frame=end_hide)
+    for attr in ("hide_viewport", "hide_render"):
+        setattr(emitter, attr, True)
+        emitter.keyframe_insert(attr, frame=spawn_frame - 1)
+        setattr(emitter, attr, False)
+        emitter.keyframe_insert(attr, frame=spawn_frame)
+        setattr(emitter, attr, True)
+        emitter.keyframe_insert(attr, frame=end_hide)
 
     return emitter
 
