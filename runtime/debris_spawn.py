@@ -1421,6 +1421,30 @@ def build_debris(reader, events: Sequence[ImpactEvent],
             st = psys.settings
             st.lifetime = max(int(st.lifetime),
                               int(scene.frame_end) - int(st.frame_start) + 2)
+
+    # FREEZE EVERY SIM into its baked point cache so the finished .blend is
+    # deterministic on any machine (the .blend is often transferred to a render
+    # box).  Hero shards + glass are live rigid bodies and the fine debris is
+    # live NEWTON particles; without a baked cache they re-solve on the first
+    # scrub, making fine debris jump the instant the playhead crosses an
+    # emission window out of order.  Bake them here, once, with the frame
+    # handlers detached so the vertex playback cannot corrupt the caches.
+    # NOTE: a later live fps/start retune invalidates these caches — the user
+    # must settle the timing BEFORE building, or re-bake after retuning.
+    from . import debris_bake as _debris_bake_module
+    cache_summary = {}
+    if emitters or (scene.rigidbody_world is not None
+                    and getattr(scene.rigidbody_world, "point_cache", None)):
+        with _frozen_handlers():
+            cache_summary = _debris_bake_module.bake_point_caches(
+                emitters, frame_start=bake_start, frame_end=bake_end)
+        sys.stderr.write(
+            f"[BeamNG] point caches baked: "
+            f"{cache_summary.get('rigidbodies', 0)} rigid bodies, "
+            f"{cache_summary.get('particles', 0)} emitters, "
+            f"baked={cache_summary.get('baked', False)}\n")
+        sys.stderr.flush()
+
 # Restore auto-keying setting
     ts.use_keyframe_insert_auto = auto_key_was_on
     return {
@@ -1434,6 +1458,7 @@ def build_debris(reader, events: Sequence[ImpactEvent],
         "cracked_panes": cracked_panes,
         "bake_start": bake_start,
         "bake_end": bake_end,
+        "cache": cache_summary,
         "hero_objects": hero_objects + glass_objects,
         "emitter_objects": emitters,
     }

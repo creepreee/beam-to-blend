@@ -64,6 +64,75 @@ def _hide_curves(obj: "bpy.types.Object") -> list:
             if fcu.data_path in ("hide_viewport", "hide_render")]
 
 
+def bake_point_caches(emitters: Optional[Sequence["bpy.types.Object"]] = None,
+                      frame_start: Optional[int] = None,
+                      frame_end: Optional[int] = None) -> dict:
+    """Bake every live debris simulation into its point cache.
+
+    The finished debris is all LIVE simulation (rigid bodies for hero shards +
+    glass, NEWTON particles for fine debris).  A live sim re-solves lazily on
+    first scrub, which is exactly the bug where fine debris "jumps" the moment
+    the playhead crosses an emission window out of order, and it is wasted work
+    on a render-only box.  This pass freezes every simulation into its baked
+    (red) point cache so the .blend replays deterministically on ANY machine.
+
+    IMPORTANT: this must run AFTER the timeline/lifetimes are final and with all
+    frame handlers detached (the vertex playback rewrites ~550K verts per frame
+    and corrupts caches being baked — the same guard the rigid-body bake uses).
+    Retiming the debris afterwards (live fps/start sliders) invalidates these
+    caches and they must be re-baked.
+
+    Returns {"particles", "rigidbodies", "baked"}.
+    """
+    if bpy is None:
+        return {"particles": 0, "rigidbodies": 0, "baked": False}
+
+    scene = bpy.context.scene
+    frame_end = int(frame_end if frame_end is not None else scene.frame_end)
+    frame_start = int(frame_start if frame_start is not None
+                      else getattr(scene, "frame_start", 1))
+
+    # Align every cache range to the (possibly extended) timeline so the bake
+    # covers the whole settle window.
+    rbw = scene.rigidbody_world
+    if rbw is not None and rbw.point_cache is not None:
+        rbw.point_cache.frame_start = frame_start
+        rbw.point_cache.frame_end = frame_end
+
+    particle_count = 0
+    for obj in (emitters or []):
+        if obj.name not in bpy.data.objects:
+            continue
+        for mod in getattr(obj, "modifiers", ()) or ():
+            ps = getattr(mod, "particle_system", None)
+            if ps is None:
+                continue
+            cache = getattr(ps, "point_cache", None)
+            if cache is not None:
+                cache.frame_start = frame_start
+                cache.frame_end = frame_end
+                particle_count += 1
+
+    # point-cache baking needs a live context (Blender's ptcache operators
+    # demand a real window/area) — reuse the viewport-context helper.
+    n_rb = 0
+    if rbw is not None:
+        n_rb = len(getattr(rbw, "objects", [])) or 0
+
+    try:
+        with _viewport_context():
+            bpy.ops.ptcache.bake_all(bake=True)
+        baked = True
+    except Exception:
+        baked = False
+
+    return {
+        "particles": particle_count,
+        "rigidbodies": n_rb,
+        "baked": baked,
+    }
+
+
 def _lowest_world_z(obj: "bpy.types.Object",
                     frame: int) -> Optional[float]:
     """Lowest world-space vertex of ``obj`` at ``frame`` (float64).
