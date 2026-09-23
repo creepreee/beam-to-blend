@@ -52,7 +52,9 @@ import bpy
 from mathutils import Vector
 
 #: Default blend (PERMANENT RULE — no other blend files allowed for testing).
-DEFAULT_BLEND = r"C:\Users\ubaid_i2c\Downloads\vehicle materials ready made.blend"
+# Point at a .blend that already contains an imported BeamNG cache
+# (pass one explicitly: blender --background --python verify/01_... -- /path/to/scene.blend)
+DEFAULT_BLEND = ""
 
 #: Step every frame, but only read the simulation every SAMPLE_EVERY frames.
 #: Stepping every frame is what keeps the particle integrator honest; reading

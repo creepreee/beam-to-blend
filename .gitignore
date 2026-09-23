@@ -36,3 +36,8 @@ newcapture*.txt
 *.png
 dump_debug.json
 gt_dump.json
+archive/
+
+# Editor/tool internals
+.freebuff/
+Simply Shatter*/

@@ -1,8 +1,12 @@
-"""Rebuild name.bvc from name.bmc (weld=False, matching the addon default).
+"""Rebuild a .bvc cache from a .bmc capture (weld=False, matching the addon default).
 
 Builds to a temp path, verifies the result, then atomically replaces the live
 cache.  Prints a [CACHE] tag line on every line for easy log filtering.
+
+Usage:
+    python tools/rebuild_cache.py --captures <dir> [--name name] [--no-swap]
 """
+import argparse
 import os
 import sys
 import time
@@ -11,41 +15,50 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from importer.cache_builder import CacheBuilder
 
-CAPTURES = r"C:\Users\ubaid_i2c\AppData\Local\BeamNG\BeamNG.drive\current\captures"
-BMC = os.path.join(CAPTURES, "name.bmc")
-OUT_LIVE = os.path.join(CAPTURES, "name.bvc")
-OUT_TMP = os.path.join(CAPTURES, "name.rebuilt.bvc")
-
 
 def tag(msg):
     print(f"[CACHE] {msg}", flush=True)
 
 
 def main():
-    if not os.path.exists(BMC):
-        tag(f"FATAL: source capture missing: {BMC}")
-        return 1
-    if os.path.exists(OUT_TMP):
-        tag(f"removing stale temp output {OUT_TMP}")
-        os.remove(OUT_TMP)
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--captures", required=True,
+                    help="BeamNG captures directory (containing <name>.bmc)")
+    ap.add_argument("--name", default="name",
+                    help="capture base name, default: name")
+    ap.add_argument("--no-swap", action="store_true",
+                    help="verify only; do not replace the live .bvc")
+    args = ap.parse_args()
 
-    tag(f"source = {BMC} ({os.path.getsize(BMC) / 1e9:.2f} GB)")
-    tag(f"target = {OUT_LIVE}")
+    captures = os.path.abspath(args.captures)
+    bmc = os.path.join(captures, f"{args.name}.bmc")
+    out_live = os.path.join(captures, f"{args.name}.bvc")
+    out_tmp = os.path.join(captures, f"{args.name}.rebuilt.bvc")
+
+    if not os.path.exists(bmc):
+        tag(f"FATAL: source capture missing: {bmc}")
+        return 1
+    if os.path.exists(out_tmp):
+        tag(f"removing stale temp output {out_tmp}")
+        os.remove(out_tmp)
+
+    tag(f"source = {bmc} ({os.path.getsize(bmc) / 1e9:.2f} GB)")
+    tag(f"target = {out_live}")
     t0 = time.time()
     tag(f"build start {time.strftime('%H:%M:%S')}")
 
-    builder = CacheBuilder(CAPTURES, OUT_TMP)
-    manifest = builder.build_from_capture(BMC, weld=False)
+    builder = CacheBuilder(captures, out_tmp)
+    manifest = builder.build_from_capture(bmc, weld=False)
 
     dt = time.time() - t0
     tag(f"build done in {dt:.0f}s ({dt / 60:.1f} min) "
         f"frames={manifest.frame_count} "
         f"objects={len(manifest.stable_objects)}")
-    tag(f"output = {OUT_TMP} ({os.path.getsize(OUT_TMP) / 1e9:.2f} GB)")
+    tag(f"output = {out_tmp} ({os.path.getsize(out_tmp) / 1e9:.2f} GB)")
 
     # Verify header before swapping.
     from runtime.cache_reader import CacheReader
-    check = CacheReader(OUT_TMP)
+    check = CacheReader(out_tmp)
     tag(f"verify: frames={check.frame_count}, "
         f"objects={len(check.stable_objects())}, "
         f"version={check.header.get('version')}, "
@@ -56,15 +69,19 @@ def main():
     check._mmap._mmap.close()
     del check
 
+    if args.no_swap:
+        tag("--no-swap: leaving rebuilt cache at " + out_tmp)
+        return 0
+
     # Swap.
-    backup = OUT_LIVE + ".old"
+    backup = out_live + ".old"
     if os.path.exists(backup):
         os.remove(backup)
-    if os.path.exists(OUT_LIVE):
-        os.rename(OUT_LIVE, backup)
+    if os.path.exists(out_live):
+        os.rename(out_live, backup)
         tag(f"moved existing cache -> {backup}")
-    os.rename(OUT_TMP, OUT_LIVE)
-    tag(f"installed {OUT_LIVE} ({os.path.getsize(OUT_LIVE) / 1e9:.2f} GB)")
+    os.rename(out_tmp, out_live)
+    tag(f"installed {out_live} ({os.path.getsize(out_live) / 1e9:.2f} GB)")
     return 0
 
 

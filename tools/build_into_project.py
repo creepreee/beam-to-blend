@@ -15,7 +15,15 @@ import sys
 
 import bpy
 
-BLEND = r"C:\Users\ubaid_i2c\Downloads\vehicle materials ready made.blend"
+# Pass the project blend explicitly:
+#   blender --background --python tools/build_into_project.py -- /path/to/scene.blend
+_argv = ([a for a in sys.argv[sys.argv.index("--") + 1:]]
+         if "--" in sys.argv else [])
+BLEND = _argv[0] if _argv else os.environ.get("BEAMNG_TEST_BLEND", "")
+if not BLEND or not os.path.isfile(BLEND):
+    print("[BUILD][FAIL] pass a .blend path after '--' (no default for privacy)",
+          flush=True)
+    sys.exit(1)
 
 
 def main():

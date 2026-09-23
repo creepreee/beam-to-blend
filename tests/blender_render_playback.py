@@ -55,7 +55,7 @@ import bpy  # noqa: E402
 import numpy as np  # noqa: E402
 from mathutils import Vector  # noqa: E402
 
-from glb_fixtures import build_glb  # noqa: E402
+from bmc_fixtures import moving_car_sequence  # noqa: E402
 from importer.cache_builder import CacheBuilder  # noqa: E402
 from runtime.cache_reader import CacheReader  # noqa: E402
 from runtime.mesh_update import CachePlayback  # noqa: E402
@@ -75,41 +75,6 @@ def check(cond, msg):
     else:
         print(f"[RENDER][FAIL] {msg}")
         _failures.append(msg)
-
-
-def _box(cx, cy, cz, sx, sy, sz):
-    """Axis-aligned box centred at (cx, cy, cz) with the given edge lengths."""
-    hx, hy, hz = sx / 2.0, sy / 2.0, sz / 2.0
-    pos = np.array([
-        [cx - hx, cy - hy, cz - hz], [cx + hx, cy - hy, cz - hz],
-        [cx + hx, cy + hy, cz - hz], [cx - hx, cy + hy, cz - hz],
-        [cx - hx, cy - hy, cz + hz], [cx + hx, cy - hy, cz + hz],
-        [cx + hx, cy + hy, cz + hz], [cx - hx, cy + hy, cz + hz],
-    ], dtype=np.float32)
-    idx = np.array([
-        [0, 2, 1], [0, 3, 2], [4, 5, 6], [4, 6, 7],
-        [0, 1, 5], [0, 5, 4], [1, 2, 6], [1, 6, 5],
-        [2, 3, 7], [2, 7, 6], [3, 0, 4], [3, 4, 7],
-    ], dtype=np.uint32)
-    return pos, idx
-
-
-def _write_sequence(seq_dir):
-    """24 GLB frames: a body sliding +X, wheels riding along with a bob."""
-    os.makedirs(seq_dir, exist_ok=True)
-    for f in range(N_FRAMES):
-        bx = -1.0 + 0.08 * f
-        bob = 0.02 * math.sin(2.0 * math.pi * f / 12.0)
-        body_pos, body_idx = _box(bx, 0.0, 0.6, 1.0, 0.5, 0.35)
-        wfl_pos, wfl_idx = _box(bx - 0.55, -0.32, 0.15 + bob, 0.28, 0.28, 0.28)
-        wfr_pos, wfr_idx = _box(bx - 0.55, 0.32, 0.15 - bob, 0.28, 0.28, 0.28)
-        glb = build_glb([
-            ("body", body_pos, body_idx),
-            ("wheel_fl", wfl_pos, wfl_idx),
-            ("wheel_fr", wfr_pos, wfl_idx),
-        ])
-        with open(os.path.join(seq_dir, f"frame_{f:05d}.glb"), "wb") as fh:
-            fh.write(glb)
 
 
 def read_verts(obj):
@@ -210,13 +175,13 @@ def render_still_on_worker(scene, out_dir, tag, box):
 def main():
     tmp = tempfile.mkdtemp(prefix="beamng_render_test_")
     try:
-        seq_dir = os.path.join(tmp, "seq")
         cache_path = os.path.join(tmp, "render_test.bvc")
         out_dir = os.path.join(tmp, "frames")
         os.makedirs(out_dir, exist_ok=True)
 
-        _write_sequence(seq_dir)
-        CacheBuilder(seq_dir, cache_path).build()
+        bmc_path = moving_car_sequence(os.path.join(tmp, "capture.bmc"),
+                                       n_frames=N_FRAMES)
+        CacheBuilder(tmp, cache_path).build(bmc_path)
 
         bpy.ops.wm.read_factory_settings(use_empty=True)
         reader = CacheReader(cache_path)

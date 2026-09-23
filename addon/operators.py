@@ -14,12 +14,6 @@ from bpy.props import (FloatProperty, IntProperty, StringProperty, BoolProperty)
 # add-on package __init__.py (works for both dev and packaged layouts).
 
 
-def _manifest_stash(directory: str) -> str:
-    """Deterministic temp-file path so scan writes it and build reads it."""
-    h = hashlib.md5(os.path.abspath(directory).encode()).hexdigest()[:12]
-    return os.path.join(tempfile.gettempdir(), f"beamng_manifest_{h}.json")
-
-
 def _tyre_settings(context):
     """Build a TyreSettings from the scene's tyre UI properties."""
     from runtime.tyre_deform import TyreSettings
@@ -196,40 +190,6 @@ def _restore_after_export(bpy, token):
     bpy.context.view_layer.update()
 
 
-class BEAMNG_OT_scan_sequence(Operator):
-    bl_idname = "beamng.scan_sequence"
-    bl_label = "Scan BeamNG Sequence"
-    bl_options = {"REGISTER"}
-
-    def execute(self, context):
-        directory = context.scene.beamng.sequence_dir
-        if not directory:
-            self.report({"ERROR"}, "Set the sequence folder first")
-            return {"CANCELLED"}
-        from importer.scanner import SequenceScanner
-
-        workers = int(getattr(context.scene.beamng, "workers", 1))
-        try:
-            manifest = SequenceScanner(directory).scan(workers=workers)
-        except Exception as exc:
-            self.report({"ERROR"}, f"Scan failed: {exc}")
-            return {"CANCELLED"}
-
-        path = _manifest_stash(directory)
-        with open(path, "w") as f:
-            f.write(manifest.to_json())
-        sys.stderr.write(f"[BeamNG] manifest saved ({manifest.frame_count} frames)\n")
-        sys.stderr.flush()
-
-        self.report(
-            {"INFO"},
-            f"{manifest.frame_count} frames, "
-            f"{len(manifest.stable_objects)} stable, "
-            f"{len(manifest.dynamic_objects)} dynamic",
-        )
-        return {"FINISHED"}
-
-
 class BEAMNG_OT_build_cache(Operator):
     bl_idname = "beamng.build_cache"
     bl_label = "Build BeamNG Cache"
@@ -251,79 +211,41 @@ class BEAMNG_OT_build_cache(Operator):
         out = os.path.abspath(out)
         context.scene.beamng.cache_path = out
 
-        from importer.scanner import SequenceManifest, SequenceScanner
         from importer.cache_builder import CacheBuilder
 
         weld = bool(context.scene.beamng.weld_cache)
 
-        # --- BMC pipeline routing ------------------------------------------
-        # If the folder holds a .bmc capture (not a .glb sequence), build via
-        # build_from_capture so the cross-frame-safe weld actually runs.  The
-        # GLB path (below) never reaches build_from_capture, so without this a
-        # BMC user's "Weld duplicate vertices" checkbox is a no-op.
+        # --- BMC pipeline (the only pipeline) -------------------------------
         bmc_files = [f for f in os.listdir(directory) if f.lower().endswith(".bmc")]
-        if bmc_files and not any(
-            f.lower().endswith(".glb") for f in os.listdir(directory)
-        ):
-            bmc_path = os.path.join(directory, sorted(bmc_files)[0])
-            sys.stderr.write(
-                f"[BeamNG] BMC capture found ({bmc_files[0]}), "
-                f"building via build_from_capture (weld={weld})\n"
-            )
-            sys.stderr.flush()
-            try:
-                manifest = CacheBuilder(directory, out).build_from_capture(
-                    bmc_path, weld=weld)
-            except Exception as exc:
-                details = traceback.format_exc()
-                sys.stderr.write(f"[BeamNG] BUILD CACHE ERROR:\n{details}\n")
-                sys.stderr.flush()
-                self.report({"ERROR"}, f"Cache build failed: {exc}")
-                return {"CANCELLED"}
-            sys.stderr.write("[BeamNG] BUILD CACHE DONE\n")
-            sys.stderr.flush()
+        if not bmc_files:
             self.report(
-                {"INFO"},
-                f"Built BMC cache: {out} "
-                f"({manifest.frame_count} frames, "
-                f"{len(manifest.stable_objects)} objects)",
+                {"ERROR"},
+                "No .bmc capture in the folder — capture one with "
+                "v5capture in BeamNG first",
             )
-            return {"FINISHED"}
-
-        # Try loading stashed manifest; fall back to scan.
-        manifest = None
-        stash = _manifest_stash(directory)
-        if os.path.exists(stash):
-            try:
-                with open(stash) as f:
-                    manifest = SequenceManifest.from_json(f.read())
-                sys.stderr.write(f"[BeamNG] using stashed manifest ({manifest.frame_count} frames)\n")
-                sys.stderr.flush()
-            except Exception as exc:
-                sys.stderr.write(f"[BeamNG] stash broken ({exc}), re-scanning...\n")
-                sys.stderr.flush()
-
-        workers = int(getattr(context.scene.beamng, "workers", 1))
-        if manifest is None:
-            sys.stderr.write("[BeamNG] no manifest found, scanning...\n")
-            sys.stderr.flush()
-            manifest = SequenceScanner(directory).scan(workers=workers)
-
+            return {"CANCELLED"}
+        bmc_path = os.path.join(directory, sorted(bmc_files)[0])
+        sys.stderr.write(
+            f"[BeamNG] BMC capture found ({bmc_files[0]}), "
+            f"building via build_from_capture (weld={weld})\n"
+        )
+        sys.stderr.flush()
         try:
-            manifest = CacheBuilder(directory, out).build(
-                manifest=manifest, weld=weld, workers=workers)
+            manifest = CacheBuilder(directory, out).build_from_capture(
+                bmc_path, weld=weld)
         except Exception as exc:
             details = traceback.format_exc()
             sys.stderr.write(f"[BeamNG] BUILD CACHE ERROR:\n{details}\n")
             sys.stderr.flush()
             self.report({"ERROR"}, f"Cache build failed: {exc}")
             return {"CANCELLED"}
-
         sys.stderr.write("[BeamNG] BUILD CACHE DONE\n")
         sys.stderr.flush()
         self.report(
             {"INFO"},
-            f"Built cache: {out} ({manifest.frame_count} frames)",
+            f"Built BMC cache: {out} "
+            f"({manifest.frame_count} frames, "
+            f"{len(manifest.stable_objects)} objects)",
         )
         return {"FINISHED"}
 
@@ -828,6 +750,67 @@ class BEAMNG_OT_remove_proxy(Operator):
             return {"CANCELLED"}
         clear_proxy()
         self.report({"INFO"}, "Proxy mesh removed")
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_stick_to_proxy(Operator):
+    """Vertex-parent selected objects to the nearest proxy triangle.
+
+    A child parented to 3 proxy vertices follows the triangle's centroid for
+    position AND its orientation for rotation (Blender native vertex
+    parenting).  Vertex parenting reads the proxy's evaluated mesh, so stuck
+    objects track the per-frame vertex animation and even the MESH_CACHE-
+    driven fluid-bake deformation with zero Python.  The world transform is
+    preserved at stick time; afterwards the object rides the surface with that
+    offset baked in.
+    """
+    bl_idname = "beamng.stick_to_proxy"
+    bl_label = "Stick Selected to Proxy"
+    bl_description = "Vertex-parent selected objects to the nearest proxy triangle (position + rotation follow the car)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return bool(context.selected_objects)
+
+    def execute(self, context):
+        from runtime.proxy_mesh import _PROXY_NAME
+        from runtime.stick_to_proxy import stick_objects_to_proxy
+
+        proxy = bpy.data.objects.get(_PROXY_NAME)
+        if proxy is None or proxy.type != "MESH":
+            self.report({"ERROR"}, "Create the proxy mesh first (Debris panel)")
+            return {"CANCELLED"}
+
+        objects = [o for o in context.selected_objects if o is not proxy]
+        if not objects:
+            self.report({"WARNING"}, "Select the objects to stick (not the proxy)")
+            return {"CANCELLED"}
+
+        n = stick_objects_to_proxy(objects)
+        if n == 0:
+            self.report({"WARNING"}, "No objects stuck — move them onto the car surface and retry")
+            return {"CANCELLED"}
+
+        self.report({"INFO"}, f"Stuck {n} object(s) to the proxy")
+        return {"FINISHED"}
+
+
+class BEAMNG_OT_unstick_proxy(Operator):
+    """Clear vertex parenting to the proxy, keeping each object in place."""
+    bl_idname = "beamng.unstick_proxy"
+    bl_label = "Unstick from Proxy"
+    bl_description = "Remove vertex parenting to the proxy (objects keep their world transform)"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        from runtime.stick_to_proxy import unstick_objects
+
+        n = unstick_objects(context.selected_objects)
+        if n == 0:
+            self.report({"INFO"}, "No selected objects are stuck to the proxy")
+            return {"CANCELLED"}
+        self.report({"INFO"}, f"Unstuck {n} object(s)")
         return {"FINISHED"}
 
 
@@ -1487,7 +1470,6 @@ class BEAMNG_OT_reduce_velocity(Operator):
 # ---------------------------------------------------------------------------
 
 _CLASSES = (
-    BEAMNG_OT_scan_sequence,
     BEAMNG_OT_build_cache,
     BEAMNG_OT_import_cache,
     BEAMNG_OT_export_alembic,
@@ -1496,6 +1478,8 @@ _CLASSES = (
     BEAMNG_OT_clear_debris,
     BEAMNG_OT_create_proxy,
     BEAMNG_OT_remove_proxy,
+    BEAMNG_OT_stick_to_proxy,
+    BEAMNG_OT_unstick_proxy,
     BEAMNG_OT_prepare_fluid_effector,
     BEAMNG_OT_clear_fluid_effector,
     BEAMNG_OT_apply_physics,

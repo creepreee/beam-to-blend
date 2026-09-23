@@ -30,7 +30,10 @@ def log(msg):
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _ZIP = os.path.join(_REPO, "dist", "beamng_cache_importer.zip")
-_CACHE = r"C:\Users\ubaid_i2c\AppData\Local\BeamNG\BeamNG.drive\current\captures\name.bvc"
+_CACHE = os.environ.get(
+    "BEAMNG_TEST_BVC",
+    os.path.join(os.environ.get("LOCALAPPDATA", ""), "BeamNG", "BeamNG.drive",
+                 "current", "captures", "name.bvc"))
 _MODULE = "beamng_cache_importer"
 
 FAILS = []

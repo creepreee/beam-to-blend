@@ -5,8 +5,8 @@ the BeamNG Cache Importer add-on. Everything an AI (or human) needs to take over
 the glass work: what it is, how it works, what is done, what is not, and how to
 prove a change is correct.
 
-All file paths are relative to the repo root
-`C:\Users\ubaid_i2c\Downloads\beamng-cache-importer`.
+All file paths are relative to the repo root (wherever you cloned this
+repository).
 
 ---
 

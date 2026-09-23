@@ -81,8 +81,8 @@ def _on_smooth_stop_update(self, context):
 
 class BeamNGSceneProperties(PropertyGroup):
     sequence_dir: StringProperty(
-        name="Sequence Folder",
-        description="Folder containing the .glb frame files",
+        name="Capture Folder",
+        description="Folder containing the .bmc capture written by v5capture",
         subtype="DIR_PATH",
         default="",
     )
@@ -131,15 +131,11 @@ class BeamNGSceneProperties(PropertyGroup):
     )
     workers: IntProperty(
         name="Parallel Workers",
-        description="Number of worker processes for scanning and cache building. "
-                    "Frames are read in parallel across CPU cores (each frame is "
-                    "independent), giving a large speedup on long sequences. "
-                    "1 = sequential. Falls back to sequential automatically if the "
-                    "process pool can't start.",
-        default=_default_workers(),
+        description="Unused since the BMC-only pipeline (kept so old .blend "
+                    "files that stored this property still load)",
+        default=1,
         min=1,
         max=64,
-        soft_max=32,
     )
     start_frame: IntProperty(
         name="Start at Frame",
@@ -690,7 +686,6 @@ class BEAMNG_PT_main(Panel):
         box.prop(props, "cache_path")
         box.prop(props, "use_chunked")
         box.prop(props, "weld_cache")
-        box.prop(props, "workers")
         box.prop(props, "start_frame")
         box.prop(props, "playback_fps")
         box.prop(props, "output_fps")
@@ -854,6 +849,13 @@ class BEAMNG_PT_debris(Panel):
         row.scale_y = 1.2
         row.operator("beamng.create_proxy", text="Create Proxy Mesh", icon="MOD_DECIM")
         row.operator("beamng.remove_proxy", text="Remove", icon="X")
+        row = box.row(align=True)
+        row.operator("beamng.stick_to_proxy", text="Stick Selected to Proxy", icon="OBJECT_PARENT")
+        row.operator("beamng.unstick_proxy", text="Unstick", icon="UNLINKED")
+        note = box.column(align=True)
+        note.scale_y = 0.7
+        note.label(text="Stuck objects follow position + rotation of the", icon="INFO")
+        note.label(text="proxy surface (vertex parenting — survives the bake).", icon="INFO")
 
 
 class BEAMNG_PT_physics(Panel):

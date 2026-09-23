@@ -270,13 +270,18 @@ def find_beamng_install(hint: Optional[str] = None) -> Optional[str]:
         if v:
             candidates.append(os.path.normpath(v))
 
+    # Steam library folders can live on any drive; scan them all.
+    import string
+    for drive in string.ascii_uppercase:
+        candidates += [
+            f"{drive}:\\SteamLibrary\\steamapps\\common\\BeamNG.drive",
+            f"{drive}:\\Steam\\steamapps\\common\\BeamNG.drive",
+            f"{drive}:\\Games\\BeamNG.drive",
+            f"{drive}:\\BeamNG.drive",
+        ]
     candidates += [
-        r"D:\danish\Games\beamng\BeamNG.drive",
         r"C:\Program Files (x86)\Steam\steamapps\common\BeamNG.drive",
         r"C:\Program Files\Steam\steamapps\common\BeamNG.drive",
-        r"D:\Steam\steamapps\common\BeamNG.drive",
-        r"D:\SteamLibrary\steamapps\common\BeamNG.drive",
-        r"E:\SteamLibrary\steamapps\common\BeamNG.drive",
     ]
 
     for c in candidates:

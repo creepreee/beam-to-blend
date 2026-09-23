@@ -40,7 +40,7 @@ if _TESTS not in sys.path:
 import bpy  # noqa: E402
 import numpy as np  # noqa: E402
 
-from glb_fixtures import build_glb  # noqa: E402
+from bmc_fixtures import moving_car_sequence  # noqa: E402
 from importer.cache_builder import CacheBuilder  # noqa: E402
 from runtime.cache_reader import CacheReader  # noqa: E402
 from runtime.mesh_update import CachePlayback  # noqa: E402
@@ -66,40 +66,6 @@ def flush_log():
             fh.write("\n".join(_log_lines) + "\n")
     except OSError:
         pass
-
-
-def _box(cx, cy, cz, s):
-    h = s / 2.0
-    pos = np.array([
-        [cx - h, cy - h, cz - h], [cx + h, cy - h, cz - h],
-        [cx + h, cy + h, cz - h], [cx - h, cy + h, cz - h],
-        [cx - h, cy - h, cz + h], [cx + h, cy - h, cz + h],
-        [cx + h, cy + h, cz + h], [cx - h, cy + h, cz + h],
-    ], dtype=np.float32)
-    idx = np.array([
-        [0, 2, 1], [0, 3, 2], [4, 5, 6], [4, 6, 7],
-        [0, 1, 5], [0, 5, 4], [1, 2, 6], [1, 6, 5],
-        [2, 3, 7], [2, 7, 6], [3, 0, 4], [3, 4, 7],
-    ], dtype=np.uint32)
-    return pos, idx
-
-
-def write_sequence(seq_dir):
-    os.makedirs(seq_dir, exist_ok=True)
-    with_tf = os.environ.get("VP_TRANSFORMS", "0") == "1"
-    for f in range(N_FRAMES):
-        bx = -0.8 + 0.15 * f
-        tf = (0.05 * f, 0.01 * f, 0.0) if with_tf else None
-        body_pos, body_idx = _box(bx, 0.0, 0.6, 1.0)
-        wfl_pos, wfl_idx = _box(bx - 0.55, -0.32, 0.15, 0.28)
-        wfr_pos, wfr_idx = _box(bx - 0.55, 0.32, 0.15, 0.28)
-        glb = build_glb([
-            ("body", body_pos, body_idx, tf),
-            ("wheel_fl", wfl_pos, wfl_idx, tf),
-            ("wheel_fr", wfr_pos, wfl_idx, tf),
-        ])
-        with open(os.path.join(seq_dir, f"frame_{f:05d}.glb"), "wb") as fh:
-            fh.write(glb)
 
 
 _state = {"entries": [], "stubs": [], "wrapped": [], "probe": None,
@@ -214,10 +180,10 @@ def _watcher(scene):
 def _start_test():
     try:
         tmp = tempfile.mkdtemp(prefix="beamng_vp_diag_")
-        seq_dir = os.path.join(tmp, "seq")
+        bmc_path = os.path.join(tmp, "capture.bmc")
         cache_path = os.path.join(tmp, "diag.bvc")
-        write_sequence(seq_dir)
-        CacheBuilder(seq_dir, cache_path).build()
+        moving_car_sequence(bmc_path, n_frames=N_FRAMES)
+        CacheBuilder(tmp, cache_path).build(bmc_path)
 
         # Factory startup KEEPS the default 3D viewport (required for the
         # opengl render operator); clear its default cube/lamp/camera.

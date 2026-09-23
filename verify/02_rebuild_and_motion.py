@@ -43,7 +43,9 @@ import bpy
 from mathutils import Vector
 
 #: Default blend (PERMANENT RULE — no other blend files allowed for testing).
-DEFAULT_BLEND = r"C:\Users\ubaid_i2c\Downloads\vehicle materials ready made.blend"
+# Point at a .blend that already contains an imported BeamNG cache
+# (pass one explicitly: blender --background --python verify/01_... -- /path/to/scene.blend)
+DEFAULT_BLEND = ""
 
 #: A mesh whose total world path over the sampled walk is shorter than this (m)
 #: is STUCK.  Debris pieces fly metres and settle; a live shard always beats it.

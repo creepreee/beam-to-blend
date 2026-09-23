@@ -9,42 +9,29 @@ Working memory for AI contributors. Read first.
 Captures BeamNG.drive crash sequences (deforming mesh + rigid vehicle motion)
 and replays them as vertex animation in Blender.
 
-Two capture pipelines, both working:
-
-1. **GLB pipeline** (`capture_gltf_sequence.py` → `build_from_gltf`): pause+step
-   or slowmo capture via beamngpy → directory of `.glb` frames → BVC cache.
-   Per-object GLB exports give drag-free detached parts. Superior path.
-
-2. **BMC pipeline** (`v5_capture.lua` → `build_from_capture`): GE console Lua
-   mod captures GPU pool vertices + rigid transform to `.bmc` → BVC cache.
-   Origin-relative translation prevents detached-part drag.
-
----
-
-## Pipeline
+**One capture pipeline (BMC), as of 2026-09:** the GLB pipeline
+(`capture_gltf_sequence.py` + `gltf_reader` + `parallel_reader`) was REMOVED
+for publication — it depended on a patched third-party glTF Sequence Exporter
+mod and duplicated the capture path. Deleted modules: `tools/capture_gltf_sequence.py`,
+`importer/gltf_reader.py`, `importer/parallel_reader.py`, the GLB branch of
+`CacheBuilder.build_from_gltf`, the `SequenceScanner` GLB walk, and the add-on's
+scan operator + manifest stash. Old copies live in `archive/` (gitignored).
 
 ```
-BeamNG (GLB)                        BeamNG (BMC)
-    │                                   │
-    ▼                                   ▼
-capture_gltf_sequence.py            v5_capture.lua
-    │  (beamngpy + glTF SE)             │  (GE console, GPUMesh API)
-    ▼                                   ▼
-D:\animation_test\                 captures/test.bmc
-  frame_00000.glb ...                (local pool verts +
-  frame_00001.glb ...                 origin-relative transform)
-    │                                   │
-    ▼                                   ▼
-cache_builder.py                   cache_builder.py
-  build_from_gltf()                  build_from_capture()
-    │                                   │
-    ▼                                   ▼
-animation_test.bvc                test.bvc
-    │                                   │
-    └──────────┬────────────────────────┘
-               ▼
-    Blender addon (import + playback)
-      CacheReader → CachePlayback → frame_handler
+BeamNG (v5capture console mod)
+    │  GPUMesh API + origin-relative rigid transform
+    ▼
+captures/<name>/capture.bmc
+    │
+    ▼
+cache_builder.py  build_from_capture()   (the ONLY build path)
+    │
+    ▼
+<name>.bvc
+    │
+    ▼
+Blender addon (import + playback)
+  CacheReader → CachePlayback → frame_handler
 ```
 
 ---
@@ -52,8 +39,10 @@ animation_test.bvc                test.bvc
 ## File formats
 
 **BMC v1** (`capture.bmc`): Fixed-size frames from the Lua capture mod.
-40-byte header + static section (indices, UVs, primitives, materials) +
-per-frame blocks (timestamp + local pool positions + 9 f32 rigid transform).
+40-byte header + static section (indices, UVs, primitives, materials,
+optional prop section) + per-frame blocks (timestamp + shared-pool positions
++ 9 f32 rigid transform). v5 flag `FLAG_WORLD_SPACE` = vertices already in
+Blender Z-up world space.
 
 **BVC v4** (`capture.bvc`): Blender vertex cache for runtime playback.
 Header + object table + base meshes + frame directory + per-frame position
@@ -69,42 +58,34 @@ streams + optional transform data + dynamic object section.
 | BeamNG physics | Z | right | X=right, Y=fwd, Z=up |
 | Blender | Z | right | X=right, Y=fwd, Z=up |
 
-Pool→Blender permutation: `(pool_z, pool_x, pool_y)` → `(X, Y, Z)`.
-Physics Z-up == Blender Z-up — direction vectors need no permutation.
+The v5 Lua capture applies `world = (x, -z, y)` after `getRefNodeMatrix()`,
+baking the Y-up→Z-up rotation into the stored coordinates — so `.bmc` vertex
+data is already Blender-world and `_pool_to_blender` handles the final
+permutation `blender = (pool_x, -pool_z, pool_y)`.
+
+**Detached-part anti-drag lives in the BMC pipeline.** `tools/v5_capture.lua`
+stores `(getPosition() - originWorld)` per frame; a part resting in the world
+keeps `map(pool) + getPosition` constant, so it does not drag. Verified
+(measured: exporter map puts the nose ~0.7° on heading; the old map yawed 90°
+and dragged parts).
 
 ---
 
-## Capture modes (capture_gltf_sequence.py)
+## Capture (v5capture mod)
 
-**Deterministic** (`--mode deterministic`): Pause + set 2000 Hz deterministic
-physics + step(N) per frame. Precise but changes crash behavior (pausing
-alters the BKS Controller mod timing). `--frames 2400` for ~40s crash.
+Deployed to `%LOCALAPPDATA%\BeamNG\BeamNG.drive\current\mods\unpacked\v5capture\`:
 
-**Slowmo** (`--mode slowmo`): Set timescale via `simTimeAuthority.setInstant()`.
-Game runs naturally but slowly. Real physics, no pause artifacts.
-`--timescale 0.1` (10x slower), `--frames 2400` for ~40s crash.
-
-Always captures at 60fps (hardcoded `TARGET_FPS = 60`).
-
----
-
-## Deployed mods
-
-**v5capture** (BMC capture):
 ```
-C:\Users\ubaid_i2c\AppData\Local\BeamNG\BeamNG.drive\current\
-  mods\unpacked\v5capture\
-    info.json
-    lua\ge\extensions\v5capture.lua
+info.json
+lua\ge\extensions\v5capture.lua
 ```
 
-**glTF Sequence Exporter** (patched for re-export):
-```
-C:\Users\ubaid_i2c\Downloads\beamng\BeamNG.drive\current\
-  mods\unpacked\glTF_Sequence_Exporter\
-    lua\ge\extensions\gltfSequenceExporter\export.lua
-```
-Patched with `beamng_capture_quiet` flag to suppress GE console spam.
+1. Spawn a vehicle in BeamNG
+2. GE console: `extensions.load("v5capture"); v5capture.start("name", 300)`
+3. Crash the car
+4. `v5capture.stop()` (or let it run to the frame limit)
+
+Output: `...\current\captures\<name>\capture.bmc` at 60 fps.
 
 ---
 
@@ -113,29 +94,45 @@ Patched with `beamng_capture_quiet` flag to suppress GE console spam.
 | Module | State | Notes |
 |--------|-------|-------|
 | `importer/binary.py` | ✅ | BVC v4 format, backward compat v2/v3 |
-| `importer/cache_builder.py` | ✅ | GLB + BMC → BVC, position-only weld (epsilon=1e-5) |
-| `importer/capture_format.py` | ✅ | BMC v1 pack/unpack, FLAG_HAS_TRANSFORM |
+| `importer/cache_builder.py` | ✅ | BMC → BVC only; `build()` accepts a .bmc path OR the folder containing it; position-only weld (epsilon=1e-4, cross-frame-safe) |
+| `importer/capture_format.py` | ✅ | BMC v1 pack/unpack, FLAG_HAS_TRANSFORM/PROPS/WORLD_SPACE |
 | `importer/capture_reader.py` | ✅ | BMC reader, shared pool + per-frame positions |
-| `importer/gltf_reader.py` | ✅ | GLB reader, glTF→Blender coord conversion |
-| `importer/scanner.py` | ✅ | Topology classification (stable/dynamic) |
-| `importer/parallel_reader.py` | ✅ | Parallel GLB reading with remap caching |
+| `importer/materials.py` | ⚠️ | Blender 4.0+ Specular socket issue; `find_beamng_install` scans env vars + all drive letters (no personal paths) |
+| `importer/scanner.py` | ✅ | Manifest dataclasses + `_edge_count` only (GLB scanner removed) |
 | `importer/topology.py` | ✅ | SHA-256 topology hashing |
-| `importer/materials.py` | ⚠️ | Blender 4.0+ Specular socket issue |
 | `runtime/cache_reader.py` | ✅ | BVC memmap reader |
-| `runtime/mesh_update.py` | ✅ | Per-frame vertex update, sharp edge marking, smooth-stop swing tail |
+| `runtime/mesh_update.py` | ✅ | Per-frame vertex update, sharp edge marking, smooth-stop swing tail; `CHUNK_MAP_E180` is a FALLBACK chunk map — other cars import per-object automatically |
 | `runtime/debris_retime.py` | ✅ | Rescales baked debris/particle keys on live fps/start changes |
-| `runtime/frame_handler.py` | ✅ | Timeline handler, undo/reload recovery, live start/fps/tyre/smooth-stop retune |
-| `addon/operators.py` | ✅ | Scan/build/import/export/texture operators |
-| `addon/ui.py` | ✅ | Panel + scene properties + Tyre Contact sub-panel |
-| `tools/capture_gltf_sequence.py` | ✅ | beamngpy driver, slowmo + deterministic |
+| `runtime/frame_handler.py` | ✅ | Timeline handler, undo/reload recovery, live start/fps/tyre/smooth-stop retune, render_pre path |
+| `addon/operators.py` | ✅ | Build/import/export/texture/debris operators; build operator is BMC-only (no scan step) |
+| `addon/ui.py` | ✅ | Panel + scene props + Tyre/Debris/Physics sub-panels; `workers` prop kept inert for old .blends |
 | `tools/v5_capture.lua` | ✅ | BMC capture, origin-relative anti-drag |
+| `tools/rebuild_cache.py` | ✅ | argparse: `--captures <dir> --name <name> [--no-swap]` |
+
+### Removed for publication (2026-09-21)
+
+- `tools/capture_gltf_sequence.py` — GLB capture driver (beamngpy + patched
+  glTF SE mod). User decision: BMC pipeline only.
+- `importer/gltf_reader.py`, `importer/parallel_reader.py`, `SequenceScanner.scan()`,
+  `CacheBuilder.build_from_gltf()`, add-on scan operator + manifest stash.
+- ~50 one-off diagnostic scripts from `tests/` and all private session docs
+  (personal paths) → `archive/` (gitignored, still on disk).
+- Synthetic test fixtures now build real `.bmc` captures via
+  `tests/bmc_fixtures.py` (moving car, no BeamNG needed).
+
+---
+
+## Car compatibility
+
+The BVC/BMC pipeline is car-agnostic. `validate_chunk_map()` drops names not
+in the cache, so any vehicle imports; only *chunked* mode's merging benefits
+from a car-specific map. `CHUNK_MAP_E180` (one dev vehicle) is the default;
+other cars silently import per-object. To support chunking for a new car,
+pass a custom map: `CachePlayback(reader, chunk_map={...})`.
 
 ---
 
 ## Live-retunable UI knobs (no re-import)
-
-These panel fields have `update=` callbacks that push straight into the running
-`frame_handler`, so dragging them retunes the imported cache in place:
 
 | Field | Entry point |
 |-------|-------------|
@@ -144,378 +141,110 @@ These panel fields have `update=` callbacks that push straight into the running
 | all Tyre Contact fields | `frame_handler.update_tyre()` |
 | Smooth Car Stop / Stop Frames | `frame_handler.update_smooth_stop()` |
 
-**The start offset is stored in FRAMES** (`_start_frame`), and `_frame_start` is
-just a copy of it. It used to be seconds, so that cache frame 0 held its *time*
-across an Output FPS change — but typing 500 then meant 500 *seconds* (frame
-30000 at 60 fps). The timeline shows frames, so the field means frames. The
-deliberate tradeoff: an Output FPS change now keeps the frame NUMBER, so set the
-start after settling on Output FPS. `update_start_second()` still converts, for
-older .blends.
+**The start offset is stored in FRAMES** (`_start_frame`). `update_start_second()`
+converts seconds for older .blends. Tradeoff: an Output FPS change keeps the
+frame NUMBER, so set the start after settling on Output FPS.
 
-**Every retune must end in `_refresh_current_frame()`.** This is the one rule
-that gets forgotten, and it fails identically for all three knobs: the playhead
-usually does *not* move, so no frame-change handler fires and the viewport keeps
-showing the previous settings. The field then looks dead and the only apparent
-fix is a re-import — which costs re-linking all the materials.
+**Every retune must end in `_refresh_current_frame()`.** The playhead usually
+does *not* move, so no frame-change handler fires and the viewport keeps the
+previous settings. `_apply_timeline` also clamps the playhead inside the new
+range — outside it, every frame maps to cache frame 0 (frozen car).
 
-Both fps values are inputs to `_cache_frame_for`, so this bites `update_fps` as
-hard as the others: at frame 300, Playback Speed 24 → 15 remaps cache frame
-120 → 75. Refresh in place rather than sliding the playhead to hold the current
-cache frame — that also gives the slider feedback while dragging.
-
-`_apply_timeline` also clamps the playhead back inside the new range — outside
-it, every frame maps to cache frame 0 and the car looks frozen.
-
-Everything is persisted as `_beamng_*` scene custom props so undo/reload
-recovery restores the *live* values, not the ones present at import.
+All values persist as `_beamng_*` scene custom props for undo/reload recovery.
 
 ## Reload recovery (`_try_recover`)
 
-Two separate failure modes, both of which look like "the animation vanished":
+1. **The add-on must be enabled in saved preferences** — recovery hangs off
+   `load_post`. A disabled add-on registers nothing; the .blend itself is fine.
+2. **`_try_recover` must rebind EVERY piece of module state** — including
+   `playback._transform_empty` (the `<collection>__root` Empty). Missing it
+   gives "car deforms correctly but sits at the origin".
 
-1. **The add-on must be enabled in saved preferences.** Recovery hangs off
-   `load_post`, so a disabled add-on registers nothing and the reopened file has
-   97 objects, an empty `frame_change_pre`, and zero motion. Nothing is wrong
-   with the .blend. Verified: with the add-on ticked, both the double-click and
-   File > Open paths recover fully.
-2. **`_try_recover` must rebind EVERY piece of module state**, not just the mesh
-   dicts. It rebuilds `_objects` / `_chunks` / `_chunk_member_ranges`, and it
-   must also re-bind `playback._transform_empty` to the `<collection>__root`
-   Empty. That field is module state; the Empty and the parenting *are* saved in
-   the .blend, so missing it produces the deceptive symptom **"car deforms
-   correctly but sits at the origin"** — `_apply_transform` returns early on
-   `_transform_empty is None` while vertex playback carries on normally.
+`tests/blender_reload_root.py` asserts both, per-object and chunked mode.
 
-Deformation and rigid motion travel through different paths, so **a
-deformation-only assertion cannot see a dead root**. `tests/blender_reload_root.py`
-asserts both, in per-object and chunked mode (measured 8.828 m of root travel;
-0.000 m before the fix).
+The recovery link is **soft**: the .blend stores only the BVC *path*.
 
-The recovery link is **soft**: the .blend stores only the BVC *path* (46 MB, not
-4.27 GB). Move or rename the cache and `_try_recover` returns False silently.
+### Background mode gotchas (fixed)
 
-### Background mode gotchas (fixed in 0.3.1)
+1. **`load_post` fires in background with the FILEPATH STRING as arg** (not a
+   scene). `_on_load_post` resolves the scene defensively.
+2. **Dual-module identity trap**: the add-on's `__init__` plants sys.modules
+   aliases (`importer`, `runtime`, all submodules) BEFORE importing
+   ui/operators, so `beamng_cache_importer.runtime.x` and `runtime.x` are one
+   module object. Render scripts must import through the installed add-on.
 
-Batch rendering (`blender -b file.blend ...`) exposed two traps, both measured
-with instrumented `load_post` handlers on 4.5.9:
+## Renders move the car (`_on_render_pre`)
 
-1. **`load_post` DOES fire in background** — but its handler argument is the
-   loaded FILEPATH STRING, not a scene (GUI passes different args; the old
-   signature called it `_dummy`, which is why this went unnoticed).
-   `_on_load_post` therefore resolves the scene defensively:
-   `bpy.context.scene` first, then a scan of `bpy.data.scenes` for
-   `_beamng_cache_path`.
-2. **Dual-module identity trap.** When installed, the core packages import
-   both as `beamng_cache_importer.runtime|importer` AND as top-level
-   `runtime|importer` (via the add-on's sys.path entry). Python treated each
-   name as a distinct module with separate state: the add-on's handlers
-   recovered playback into one copy while external render scripts importing
-   `beamng_cache_importer.runtime.frame_handler` saw `_active is None` in the
-   other copy and wrongly concluded auto-recovery never ran. `addon/__init__`
-   now plants sys.modules aliases for every package + submodule BEFORE
-   importing ui/operators, so all import paths bind to one module object.
-   Verified: CLI-open probe shows `_active` populated before any script runs,
-   and `packaged frame_handler IS top-level frame_handler -> True`.
+1. GUI renders run Python handlers on the WM JOB THREAD; the frame-change
+   path refuses non-main threads (Mantaflow guard), so `_on_render_pre`
+   applies `_cache_frame_for(scene.frame_current_float)` on WHATEVER thread
+   it is invoked on.
+2. `render_pre` fires once per rendered frame BEFORE depsgraph evaluation —
+   authoritative for what reaches the engine.
 
-Render scripts no longer need the manual `_try_recover()` workaround — but
-they MUST import through the installed add-on (`beamng_cache_importer...` or
-plain `runtime...`, now the same objects) and the add-on must be enabled in
-that machine's preferences, otherwise no handler exists at all.
-Diagnostics: `tests/diag_bg_loadpost.py` (CLI-open probe) and
-`tests/diag_bg_openfile.py` (persistent-marker + wrapped-handler probe).
-
-## Renders move the car (`runtime/frame_handler.py` render path)
-
-THE "scrubbing works but Ctrl+F12 / Viewport Render Animation outputs a
-statue" bug. Two facts combined to cause it, and both were measured with an
-instrumented render before fixing:
-
-1. **GUI renders run every Python handler on the WM JOB THREAD**, not the
-   main thread — Blender executes the whole render pipeline on a background
-   job when rendering from the UI. Measured: an animation render from a
-   worker thread fired `frame_change` ×13 + `render_pre` ×12, ALL on the job
-   thread. `_on_frame_change` deliberately refuses non-main threads (the
-   Mantaflow-bake crash guard), so it silently skipped EVERY frame → each
-   rendered frame showed whatever pose the viewport last had.
-   `--background` renders run the same handlers on the MAIN thread, which is
-   why headless renders and scrubbing always worked and the bug looked like
-   "renders ignore the animation".
-2. `render_pre` fires once per rendered frame BEFORE the engine evaluates
-   the depsgraph, so applying the mapped cache frame there is authoritative
-   for what reaches Cycles/Eevee/Workbench.
-
-The fix: `_on_render_pre` applies `_cache_frame_for(scene.frame_current_float)`
-(via the shared `_apply_playhead`) on WHATEVER thread it is invoked on — no
-main-thread guard. The Mantaflow hazard does not apply to renders (bakes
-never trigger render callbacks), and the bake guard stays on the frame-change
-path. Job-thread mesh writes are proven safe by test (worker-thread renders
-complete cleanly and produce bit-identical motion to main-thread renders).
-`attach()` / `detach_handler()` / `_ensure_handler_registered()` /
-`_try_recover()` manage the render handler alongside the frame-change one,
-so undo/reload recovery re-arms renders too.
-
-Gotchas:
-- **Double application is fine.** In background renders both handlers fire
-  per frame on the main thread; `CachePlayback.set_frame` early-returns when
-  the cache frame is unchanged, so the second call is a cheap no-op.
-- **Subframes**: the render path maps `scene.frame_current_float`, so motion
-  blur subframes land on the right cache frame; the viewport path keeps
-  integer frames.
-- **`_skip_n` never applies to renders** — that knob decimates viewport
-  updates only; a render must always be exact.
-- **View > Viewport Render Animation is NOT fixable from a handler when the
-  viewport shading is Rendered + Cycles** (Blender 4.5.9). The ogl-render
-  path fires `frame_change` per frame on the main thread and our writes DO
-  land in the original mesh data — but every saved frame is bit-identical:
-  the path never re-evaluates per frame. Proven NOT our bug: a plain
-  keyframed cube with zero Python also freezes there (5.5e-5 mean pixel diff)
-  while the same cube moves under Solid/Workbench (2.3e-3) and Material/
-  EEVEE (4.9e-3); brightness ~0.22 rules out blank renders. Flushing
-  `evaluated_depsgraph_get()` inside the handler was tested and changed
-  nothing (upstream consumes no tags on this path), so that flush is NOT in
-  the runtime. User workaround: switch the viewport to **Material Preview**
-  or **Solid** before Viewport Render Animation; real renders (F12 /
-  Ctrl+F12) are unaffected and covered by `_on_render_pre`. Diagnostic:
-  `tests/diag_viewport_render.py` (env knobs VP_SHADING / VP_ENGINE /
-  VP_TRANSFORMS / VP_KEYFRAMED; must run WINDOWED — ogl needs a GPU context).
-  `tests/diag_user_scene.py` runs inside the user's open Blender against
-  their real scene (Text Editor > Run Script) and writes
-  `%TEMP%\opencode\user_vp_diag.log`.
+- Double application is fine (CachePlayback early-returns on unchanged frame).
+- Subframes map via `frame_current_float`.
+- `_skip_n` never applies to renders.
+- **View > Viewport Render Animation is NOT fixable from a handler** when the
+  viewport is Rendered + Cycles (upstream never re-evaluates; a keyframed cube
+  freezes there too). Workaround: Material Preview / Solid shading.
 
 ## Smooth car stop (`runtime/mesh_update.py` tail path)
 
-Without it, the crash ends with the car frozen mid-pose the instant the last
-captured frame plays. With "Smooth Car Stop" on, the timeline is extended by
-`Stop Frames` past the seam and the car keeps the little swing it was still
-rocking through, and that swing gradually decreases and then stops. The tail
-is a *fitted damped-sine continuation* of the car's residual oscillation —
-NOT a rigid decelerate-and-halt.
-
-The seam (where the smooth stop begins) defaults to the last captured frame,
-but can be set earlier with the **Start at Frame** slider: when enabled, the
-car plays normally up to that frame and the damped settle takes over from
-there, cutting any remaining captured frames in favour of the continuation.
-This is useful when the crash has already settled on screen but the capture
-kept rolling — set "Start at Frame" to where the motion actually ends and the
-car will settle from that point instead of playing on to the absolute end.
-The seam is clamped to the capture end, so a value past it behaves like the
-default.
-
-- **Frames vs cache units.** The UI fields are in *timeline* frames; the playback
-  needs *cache* frames (`tail_cache = tail_frames * playback_fps / output_fps`).
-  `frame_handler._smooth_stop_tail_cache()` and
-  `frame_handler._smooth_stop_start_cache()` do the conversions; both `attach()`
-  and the live `update_smooth_stop()` pass the results to
-  `CachePlayback.set_smooth_stop()`, and the scene props
-  `_beamng_smooth_stop_frames` / `_beamng_smooth_stop_start` (TIMELINE frames)
-  persist them for undo/reload recovery.
-- **The seam.** `set_smooth_stop(tail_cache, start_cache)` stores the seam in
-  cache-frame units. When it is unset (≤ 0) or past the last captured frame it
-  falls back to `frame_count - 1` — the original behaviour. The seam determines
-  both the glide onset (positions past it enter the tail) and the fit window
-  (the trailing `_TAIL_FIT_WINDOW` frames at-or-before the seam).
-- **The fit.** `_compute_tail_fit()` (called by `set_smooth_stop`) fits a damped
-  sine to the `_TAIL_FIT_WINDOW = 24` cache frames ending at the seam of the ROOT
-  translation (real captures end mid-swing: the test cache rocks at period ~10
-  frames, amplitude ~3 mm at the seam). A frequency grid
-  (`_TAIL_PERIOD_GRID = np.linspace(4.0, 30.0, 40)`) minimises joint SSE; if the
-  series is too short or the variance is below `_TAIL_AMPLITUDE_EPS = 1e-4`
-  (`_fit_sine_at` returns None) there is no swing to continue and the tail just
-  holds the seam pose. Each axis is fitted as
-  `c + Ac·cos(ωt) + As·sin(ωt)` with an absolute phase `t = (frame - start)`;
-  rotation is the vector part of `q_n · q_mean⁻¹` per component, plus the sign-
-  aligned mean quaternion `_average_quaternion(qs)`.
-- **The continuation.** For cache position `s` past the seam: `env = cos²(πu/2)`
-  where `u = s / tail` (raised-cosine taper, `env(0)=1`, `env(1)=0`, zero
-  slope at both ends). The root pose is
-  `c + (Ac·cos(ωt) + As·sin(ωt)) · env` (position) and
-  `q_mean · Quaternion((1, vx, vy, vz)) · normalized()` (rotation); vertices get
-  the same per-axis damped continuation plus an env-scaled seam residual
-  (`c + (Ac·cos(ωt) + As·sin(ωt) + residual) · env`) so the first tail frame
-  matches the seam pose exactly. The oscillation centre — where `env = 0`
-  lands — is the pose the car settles into.
-- **A stopped car stops**: if the fitted amplitude is below the epsilon there is
-  no oscillation to continue and the tail is a static hold (correct physics, not
-  a bug). The test cache is still swinging at the end, so the continuation is
-  measurable there.
-
-**Smooth car stop start frame** (`runtime/frame_handler.py` + `runtime/mesh_update.py`):
-the `_smooth_stop_start_frame` global (timeline frames, 0 = unset) is converted to
-cache units by `_smooth_stop_start_cache()`, passed to `attach()` /
-`update_smooth_stop()` as `smooth_stop_start_frame`, and stored as the seam in
-`CachePlayback.set_smooth_stop(tail_cache, start_cache)`. The `_apply_timeline`
-function sets `scene.frame_end = start_frame + stop_frames` when the start is
-within the capture range, cutting the timeline short. All state persists via
-`_beamng_smooth_stop_start` for undo/reload recovery.
+Fitted damped-sine continuation of the car's residual oscillation
+(`_compute_tail_fit` over `_TAIL_FIT_WINDOW = 24` cache frames; raised-cosine
+envelope). The seam defaults to the last captured frame; **Start at Frame**
+can pull it earlier. UI fields are timeline frames; conversions in
+`frame_handler._smooth_stop_tail_cache()` / `_smooth_stop_start_cache()`.
+A stopped car stops (below `_TAIL_AMPLITUDE_EPS` the tail is a static hold).
 
 ## Debris retime (`runtime/debris_retime.py`)
 
-The car is animated *procedurally* — `frame_handler._cache_frame_for` maps the
-playhead to a cache frame every frame, so changing Playback Speed / Output FPS
-/ Start at Frame re-times it for free.  Debris is the opposite: `build_debris`
-*bakes* each impact to an absolute TIMELINE frame (`_blender_frame_for` at
-build time), freezes the rigid-body sim into F-curves, and stamps particle
-emitters with absolute `frame_start` / `frame_end` / `lifetime`.  Change fps
-after a build and the car re-times while every debris keyframe stays put — the
-shards fire at the wrong moment.  `retime_debris` fixes that:
-
-- **The record.** `record_build_timing(scene, ...)` stores the build-time
-  `(frame_start, playback_fps, output_fps)` as `_beamng_debris_build_*` scene
-  props (survives save/undo).  Called at the end of a successful debris build.
-- **The retime.** On live fps/start changes `frame_handler._retime_debris`
-  calls `retime_debris(scene, live...)`, which affinely rescales every debris
-  key about the start frame so each key keeps the CACHE frame it was baked
-  for: `f_new = start_new + (f_old - start_old) * scale` with
-  `scale = (pb_old/out_old) / (pb_new/out_new)`.  Bezier handles move with
-  their key (otherwise rescaling shears the curves).  Covers F-curves, particle
-  windows, `_beamng_debris_launch` props, and the rigid-body world cache range.
-  Incremental: the record is re-written after each call, so slider drags
-  compose instead of squaring the scale; `_EPS` no-ops an unchanged mapping.
-- **Old builds (no record).** Debris built before this module existed has no
-  `_beamng_debris_build_*` props → `retime_debris` skips (nothing to retime
-  *from*).  The debris object names carry the build-time timeline spawn frame
-  (`debris_<material>_<spawn_frame>_NNN`, same suffix repeated by the
-  emitters), and the impacts' cache frames are in the BVC; fitting
-  `spawn = start + cache * (out/pb)` over hero suffixes recovers the build
-  mapping.  Verified exact on real data (spawn = 400 + cache·3).  Manual
-  recovery: `blender --background --python tests/fix_debris_resync.py -- <file.blend>`
-  (records the derived mapping, retimes to the live values, asserts alignment,
-  saves).
-- **Particles limitation.** Emission timing re-syncs, but particle trajectories
-  are solver-integrated at `scene.render.fps` — their fall speed does not slow
-  with the car.  Baked rigid-body shards are the only full slow-motion.
+Debris keys are baked to absolute TIMELINE frames at build time;
+`retime_debris` affinely rescales them about the start frame on live
+fps/start changes (`f_new = start_new + (f_old - start_old) * scale`).
+Incremental (record rewritten each call). Old builds without the record can
+be recovered by fitting the `debris_<mat>_<spawn_frame>_NNN` name suffixes.
+Particle *trajectories* are still solver-integrated at scene fps (limitation).
 
 ## Tyre ground contact (`runtime/tyre_deform.py`)
 
-BeamNG's tyre mesh is **rigid** — a loaded tyre never shows a contact patch, the
-round mesh just sinks into the ground as the hub deflects. This fakes the
-missing rubber at playback time, driven only by how the cached wheel geometry
-sits relative to a horizontal ground plane. Four terms:
-
-| Term | UI field | What it does |
-|------|----------|--------------|
-| contact patch | (implicit) | verts below ground projected onto it — patch width tracks real physics load, needs no tuning |
-| static deflection | Static Deflection | extra squash of the lower carcass, weighted by depth below the axle, so a *resting* tyre also flattens |
-| sidewall bulge | Sidewall Bulge | displaced rubber pushed out **horizontally** along the axle (see gotcha) |
-| lift-off release | Lift-off Release | ramps every term to exactly 0 by `release` metres above ground |
-
-**Stateless by design.** Each frame is computed from that frame's geometry
-alone — nothing accumulates. That's what makes a lifted car's tyres go
-*bit-exactly* round again instead of holding a flat spot from the start.
-
-**`amount=0` short-circuits before any work** and returns the input array
-identity, so the feature off is byte-identical to pre-feature playback.
-
-### Gotchas
-- **Bulge must be horizontal.** A cambered/steered axle tilts out of the ground
-  plane; bulging along it shoves sidewall verts back *down through* the ground
-  the patch step just lifted them onto (measured 3.5 mm of re-penetration on
-  real data). `flatten_tyre` projects the axle into the ground plane first.
-- **Heights in float64.** `height_offset` carries the vehicle's world position
-  (can be 100s of m) while the deformation is sub-cm; float32 cancellation cost
-  ~0.5 mm and visibly roughened the patch.
-- **Chunked mode deforms per *member*, not per chunk.** All four tyres plus the
-  rigid rims/hubs/brakes share one `wheels` mesh; a whole-chunk deform would
-  smear one axle+depth across all of them.
-- **Auto-ground runs after `build_scene`'s `set_frame(0)`**, and lives in
-  `obj.location` (outside the vertex data). Playback folds in `obj.location @ up`
-  and re-runs frame 0; the Alembic bake needs it passed as `height_bias`.
-- `MAX_SQUASH_RATIO = 0.35` caps the patch depth so a wrong `ground_z` gives a
-  slightly over-squashed tyre, not a pancake.
-
-Name filter (`tire,tyre` by default) keeps rims/hubs/brakes rigid. Alembic
-export bakes the same deformation into the .mdd, so renders match the viewport.
-
-### Validation
-- 113/113 tests pass (`python -m pytest -q`)
-- Tyre contact verified headless against real capture data (97 objects, 4 tyres):
-  flat patch spans 0.000 mm, no ground penetration, 93 non-tyre objects
-  bit-identical, all 20 rigid members inside the merged `wheels` chunk
-  untouched, airborne tyres restored exactly, live slider retune reaches the
-  mesh. Run:
-  `blender --background --python tests/blender_tyre_contact.py -- <cache.bvc>`
-  (the script evicts an installed add-on's bundled `runtime`/`importer` from
-  `sys.modules` — otherwise it silently tests the deployed build)
-- Live "Start at Frame" verified headless (21 checks, 97 objects): range shifts
-  by exactly the offset with duration unchanged, geometry at `frame_start+k` is
-  bit-identical before and after the shift (slid in time, not resampled), the
-  parked playhead's mesh updates without scrubbing, the offset survives an
-  output-fps change as the same frame number, undo recovery keeps the live
-  offset. Run:
-  `blender --background --python tests/blender_start_second.py -- <cache.bvc>`
-- Live "Playback Speed" / "Output FPS" verified headless (20 checks, 97 objects,
-  1200-frame capture): the parked playhead's mesh refreshes without scrubbing and
-  matches scrubbing to the remapped cache frame bit-identically, half speed
-  doubles the duration, Output FPS moves `render.fps` without changing wall-clock
-  duration, the start offset survives, a round trip restores range + geometry
-  exactly, undo recovery keeps the live fps. Run:
-  `blender --background --python tests/blender_playback_fps.py -- <cache.bvc>`
-  Negative control: deleting the `_refresh_current_frame` call fails exactly the
-  3 staleness assertions and nothing else — the other 17 pass without it, so only
-  those 3 actually cover the bug.
-- Live "Smooth Car Stop" verified headless (23 checks, 97 objects, 1200-frame
-  capture): the timeline extends by exactly the requested frames and the value is
-  persisted for recovery; the tail FITS the car's residual oscillation (period
-  ~10 frames, amplitude 3.13 mm) and SWINGS through its rest centre and back
-  (motion reverses — not a rigid glide); both the vertex deformation and the root
-  pose lose velocity as the envelope decays and settle ON the fitted centre
-  (~0.001 mm off) once past the tail; retuning the tail length while parked
-  mid-tail refreshes the parked playhead's swing pose; toggling OFF clamps the
-  playhead back and returns the mesh to the exact final captured pose;
-  undo/reload recovery restores the LIVE tail and reproduces the swung pose
-  bit-identically. Run:
-  `blender --background --python tests/blender_smooth_stop.py -- <cache.bvc>`
-  Negative control: disabling `_refresh_current_frame` in `update_smooth_stop`
-  fails exactly the 2 parked-refresh/toggle-off assertions and nothing else —
-  the other 21 pass without it.
-- Live "Smooth Car Stop Start-at-Frame" verified headless (section G of
-  `tests/blender_smooth_stop.py`): setting a start frame inside the capture cuts
-  the timeline at `start + tail` (not `capture_end + tail`), the seam is stored
-  in cache units, the fit window is taken from frames at-or-before the seam,
-  frames before the seam play the captured motion unaffected, the tail still
-  swings and converges from the new seam, retuning the start frame refreshes a
-  parked playhead, `start=0` restores the default onset at the capture end, and
-  undo/reload recovery restores the live start frame.
-- Renders verified headless with REAL Cycles output (22 checks, synthetic
-  24-frame cache, self-contained — no capture needed). Run:
-  `blender --background --python tests/blender_render_playback.py`
-  Negative control: an animation render ON A WORKER THREAD (the GUI job-thread
-  condition) with the render handler removed fires ZERO playback updates and
-  every PNG is identical (frozen car); with it registered the same worker
-  render applies one mapped cache frame per rendered frame, first/last PNGs
-  differ (4e-2 mean), the mesh ends on the exact final cache pose, a still
-  render applies the parked frame without scrubbing, and post-undo recovery
-  re-arms renders. Thread instrumentation: `tests/diag_render_thread.py`.
-- Deform cost ~2.2 ms/frame for 4 tyres / 1024 verts (bulge dominates; the
-  `axle_axis` eigensolve is 0.36 ms of it)
-- GLB pipeline: 2000-frame capture at 10x slowmo, 97 objects, 7.4 GB BVC — verified
-- BMC pipeline: 700-frame capture, 88 objects, 533K verts, 4.5 GB BVC — verified
-- Detached-part drag fixed via origin-relative translation in v5_capture.lua
+Fake contact patch + static deflection + horizontal sidewall bulge +
+lift-off release, computed per frame from that frame's geometry (stateless —
+a lifted tyre is bit-exactly round again). `amount=0` short-circuits.
+Gotchas: bulge is horizontal (project axle into ground plane first), heights
+in float64, chunked mode deforms per *member*, auto-ground lives in
+`obj.location` and is passed to Alembic bake as `height_bias`.
+`MAX_SQUASH_RATIO = 0.35` caps patch depth.
 
 ---
 
-## Conventions
-- Python 3.10+, `from __future__ import annotations` at top of every module.
-- Dataclasses + type hints. `importer/` must NOT import `bpy` (plain CPython
-  for CI). `runtime/` and `addon/` may.
-- Tests in `tests/`, run with `pytest`. Keep logic testable without Blender.
+## Tests
+
+- `python -m pytest -q` — pure-Python suite (no Blender needed).
+- Headless Blender scripts (run with the repo FIRST on sys.path so they test
+  the working tree, not the installed add-on):
+  - `tests/blender_render_playback.py` — REAL Cycles renders incl. job-thread
+    renders, stills, post-undo recovery (self-contained BMC fixture).
+  - `tests/diag_render_thread.py`, `tests/diag_viewport_render.py` — thread
+    instrumentation / viewport-render diagnostics (viewport one must run
+    WINDOWED).
+  - `tests/blender_smooth_stop.py`, `tests/blender_start_second.py`,
+    `tests/blender_playback_fps.py`, `tests/blender_tyre_contact.py` — need a
+    real capture `.bvc` (pass after `--`).
+  - `tests/bmc_fixtures.py` — synthetic BMC writer (`moving_car_sequence`).
 - After changes, repack: `python build_addon.py` → `dist/beamng_cache_importer.zip`.
 
 ## How to run
 - Tests: `python -m pytest -q`
 - Build addon: `python build_addon.py`
-- Build BVC from GLB: `from importer.cache_builder import CacheBuilder; CacheBuilder(src, dst).build()`
-- Build BVC from BMC: same, pass `.bmc` path as src
+- Build BVC from BMC: `from importer.cache_builder import CacheBuilder; CacheBuilder(captures_dir, dst).build(bmc_path)` (or `.build()` with the folder)
 
-## Capture
-1. Open BeamNG with vehicle spawned
-2. GLB: `python tools\capture_gltf_sequence.py --mode slowmo --timescale 0.1 --frames 2400 --out D:\animation_test`
-3. BMC: GE console `extensions.load("v5capture"); v5capture.start("captures/name", 300)` → crash → `v5capture.stop()`
-4. Build BVC, import in Blender via addon panel
-
-### BeamNG paths
-- Game install: `D:\danish\Games\beamng\BeamNG.drive`
-- User dir: `C:\Users\ubaid_i2c\AppData\Local\BeamNG\BeamNG.drive\current\`
-- Mods: `...\current\mods\unpacked\<name>\`
-- Captures: `...\current\captures\`
-- Deploy mods to `mods\unpacked\<name>\` with `info.json` + `lua\ge\extensions\<name>.lua`. Restart required.
+## Conventions
+- Python 3.10+, `from __future__ import annotations` at top of every module.
+- Dataclasses + type hints. `importer/` must NOT import `bpy` (plain CPython
+  for CI). `runtime/` and `addon/` may.
+- No personal filesystem paths in tracked files — use env vars
+  (`BEAMNG_HOME`, `BEAMNG_USER_DIR`, `BEAMNG_TEST_BVC`, `BEAMNG_TEST_BLEND`)
+  or argparse.
+- Private session notes/diag scripts live in `archive/` (gitignored).

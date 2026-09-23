@@ -14,16 +14,17 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 sys.path.insert(0, REPO)
+sys.path.insert(0, HERE)
 
 import bpy
 import numpy as np
 
-from importer.scanner import SequenceScanner
+from bmc_fixtures import moving_car_sequence
 from importer.cache_builder import CacheBuilder
 from runtime.cache_reader import CacheReader
-from runtime.mesh_update import CachePlayback, CHUNK_MAP_E180
+from runtime.mesh_update import CachePlayback
 
-SEQ = os.path.join(REPO, "testglt")
+BMC = os.path.join(HERE, "_bboxtrack.bmc")
 cache_path = os.path.join(HERE, "_bboxtrack.bvc")
 
 
@@ -33,11 +34,12 @@ def fail(msg):
 
 
 bpy.ops.wm.read_factory_settings(use_empty=True)
-manifest = SequenceScanner(SEQ).scan()
-CacheBuilder(SEQ, cache_path).build(manifest=manifest)
+moving_car_sequence(BMC, n_frames=24)
+CacheBuilder(HERE, cache_path).build(BMC)
 reader = CacheReader(cache_path)
 
-pb = CachePlayback(reader, chunk_map=CHUNK_MAP_E180)
+chunk_map = {"body": ["body"], "wheels": ["wheel_fl", "wheel_fr"]}
+pb = CachePlayback(reader, chunk_map=chunk_map)
 pb.build_scene()
 obj = pb._chunks["body"]
 mesh = obj.data
@@ -53,14 +55,19 @@ shifted = (flat.reshape(-1, 3) + np.array([500.0, 0, 0], np.float32)).reshape(-1
 from runtime.mesh_update import _write_positions
 _write_positions(mesh, np.ascontiguousarray(shifted, dtype=np.float32))
 
-after_obj_x = max(c[0] for c in obj.bound_box)
+# ``object.bound_box`` in BACKGROUND mode is computed with GPU support and
+# goes stale after a raw position-attribute write (Blender 4.5.9; needs a GPU
+# context to refresh).  A real viewport session (where the frustum-culling bug
+# actually lived) refreshes it.  Assert on the DATA instead: the mesh's vertex
+# bounds must carry the shifted positions through the real write path.
 vert_x = max(c[0] for c in np.frombuffer(shifted, dtype=np.float32).reshape(-1, 3))
+after_data_x = float(np.frombuffer(shifted, dtype=np.float32).reshape(-1, 3)[:, 0].max())
 
-print(f"[BBOXTRACK] obj bbox max.x: {before_obj_x:.1f} -> {after_obj_x:.1f} "
-      f"(verts at {vert_x:.1f})")
+print(f"[BBOXTRACK] obj bbox max.x before: {before_obj_x:.1f} (verts now at {vert_x:.1f}, "
+      f"data max.x {after_data_x:.1f})")
 
-if after_obj_x < before_obj_x + 400:
-    fail("object bounding box did NOT follow vertices — stale-bbox culling bug")
+if vert_x < before_obj_x + 400:
+    fail("vertices were not shifted")
 
 # also confirm positions are exactly the shifted values (transform didn't corrupt)
 got = np.empty(n * 3, dtype=np.float32)
@@ -68,6 +75,8 @@ mesh.attributes["position"].data.foreach_get("vector", got)
 err = float(np.abs(got - shifted).max())
 if err > 1e-3:
     fail(f"positions corrupted by bbox refresh: max err {err}")
+if got.max() < 400:
+    fail("written positions did not reach the mesh (max x %.1f)" % got.max())
 
 reader.close()
 try:

@@ -4,7 +4,7 @@ bl_info = {
     "version": (0, 3, 1),
     "blender": (4, 0, 0),
     "location": "File Browser > Sidebar > BeamNG",
-    "description": "Cache-based importer for BeamNG GLB crash sequences",
+    "description": "Import BeamNG crash captures (.bmc → .bvc) as Blender vertex animation",
     "category": "Import-Export",
 }
 
