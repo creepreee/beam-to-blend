@@ -246,10 +246,18 @@ own chunk map programmatically (`CachePlayback(reader, chunk_map=...)`).
 ### Development vehicle
 
 The [captures](#capturing-a-crash) used to build and test this project were
-recorded with a **Toyota Corolla E180** vehicle mod (Flanje E180) in
-BeamNG.drive. If you want to reproduce the exact development
-captures/renders, open an issue and the vehicle + sample captures can be
-shared.
+recorded with a **Toyota Corolla E180** vehicle mod by **Flanje** in
+BeamNG.drive — a beautifully detailed, bone-stock-quality model that deforms
+and detaches convincingly, which made it perfect for testing the crash
+pipeline:
+
+- https://www.modland.net/beamng.drive-mods/cars/toyota-corolla-e180-2.html
+- https://www.modland.net/beamng.drive-mods/cars/toyota-corolla-e180-6.html
+
+Big thanks to **Flanje** for such a clean, high-quality asset — the E180 was
+a joy to crash-test this add-on against. If you want to reproduce the exact
+development captures/renders, open an issue and the vehicle + sample
+captures can be shared.
 
 ## Project status & roadmap
 
@@ -266,3 +274,9 @@ belong to their respective owners.
 Built against the BeamNG.drive engine's own vehicle/part APIs; the capture
 runs entirely in-game via the bundled `v5capture` Lua mod (no external
 drivers, no modded pipeline dependencies).
+
+### Credits
+
+- **Vehicle mod** — [Toyota Corolla E180](#development-vehicle) by
+  [**Flanje**](https://www.modland.net) — the development test vehicle, and
+  a seriously good model.
