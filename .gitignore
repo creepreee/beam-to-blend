@@ -30,6 +30,8 @@ newcapture*.txt
 
 # Tooling internals
 .opencode/
+.claude/
+CLAUDE.md
 
 # Mesh / image dumps
 *.obj
