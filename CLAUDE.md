@@ -21,7 +21,7 @@ scan operator + manifest stash. Old copies live in `archive/` (gitignored).
 BeamNG (v5capture console mod)
     │  GPUMesh API + origin-relative rigid transform
     ▼
-captures/<name>/capture.bmc
+captures/<name>.bmc
     │
     ▼
 cache_builder.py  build_from_capture()   (the ONLY build path)
@@ -38,11 +38,13 @@ Blender addon (import + playback)
 
 ## File formats
 
-**BMC v1** (`capture.bmc`): Fixed-size frames from the Lua capture mod.
-40-byte header + static section (indices, UVs, primitives, materials,
-optional prop section) + per-frame blocks (timestamp + shared-pool positions
-+ 9 f32 rigid transform). v5 flag `FLAG_WORLD_SPACE` = vertices already in
-Blender Z-up world space.
+**BMC v1** (`*.bmc`): Fixed-size frames from the Lua capture mod. The
+extension writes ONE flat file named after the `v5capture.start` path
+(e.g. `v5capture.start("captures/my_crash", N)` → `<userfolder>/captures/
+my_crash.bmc`). 40-byte header + static section (indices, UVs, primitives,
+materials, optional prop section) + per-frame blocks (timestamp +
+shared-pool positions + 9 f32 rigid transform). v5 flag `FLAG_WORLD_SPACE` =
+vertices already in Blender Z-up world space.
 
 **BVC v4** (`capture.bvc`): Blender vertex cache for runtime playback.
 Header + object table + base meshes + frame directory + per-frame position
@@ -81,11 +83,13 @@ lua\ge\extensions\v5capture.lua
 ```
 
 1. Spawn a vehicle in BeamNG
-2. GE console: `extensions.load("v5capture"); v5capture.start("name", 300)`
+2. GE console: `extensions.load("v5capture"); v5capture.start("captures/name", 300)`
 3. Crash the car
 4. `v5capture.stop()` (or let it run to the frame limit)
 
-Output: `...\current\captures\<name>\capture.bmc` at 60 fps.
+Output: `...\current\captures\<name>.bmc` at 60 fps (the `start` path is
+used verbatim, so `v5capture.start("name", 300)` would write straight to the
+user folder).
 
 ---
 

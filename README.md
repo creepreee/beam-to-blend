@@ -73,12 +73,14 @@ The BeamNG user dir is normally
 
    ```lua
    extensions.load("v5capture")
-   v5capture.start("mycrash", 300)   -- name, frames to record
+   v5capture.start("captures/my_crash", 300)   -- path (relative), frames to record
    ```
 
 3. Crash the car however you like. At 60 fps the mod records the deforming
-   mesh + rigid motion per frame into
-   `.../current/captures/mycrash/capture.bmc`.
+   mesh + rigid motion per frame into **a single file**:
+   `<userfolder>/captures/my_crash.bmc` (your user folder is
+   `%LOCALAPPDATA%\BeamNG\BeamNG.drive\current\`). The path you pass is used
+   as-is, so `"my_crash"` alone would write straight to the user folder.
 4. Stop early if you want: `v5capture.stop()`
 
 Detached parts (doors, bumpers, mirrors) are captured **origin-relative**, so
@@ -87,9 +89,9 @@ pieces that come to rest in the world do not drag along with the wreck.
 ## Building the cache & importing
 
 1. In Blender, open the **BeamNG** sidebar panel.
-2. **Capture Folder** → point at the folder containing `capture.bmc`
-   (e.g. `...\current\captures\mycrash`).
-3. Click **1. Build Cache** — writes `mycrash.bvc` next to the capture.
+2. **Capture Folder** → point at the folder *containing* your `.bmc`
+   (e.g. `...\current\captures` where `my_crash.bmc` sits).
+3. Click **1. Build Cache** — writes `my_crash.bvc` next to the capture.
    *Weld duplicate vertices* makes a smaller cache and enables smooth shading;
    leave it off if any part's edges separate mid-crash (the build verifies and
    aborts if welding would break a part).
@@ -146,7 +148,7 @@ python tools/rebuild_cache.py --captures <captures-dir> --name mycrash
 
 | Symptom | Fix |
 |---------|-----|
-| "No .bmc capture in the folder" | Point **Capture Folder** at the folder *containing* `capture.bmc` |
+| "No .bmc capture in the folder" | Point **Capture Folder** at the folder that directly contains your `.bmc` (e.g. `captures/` with `my_crash.bmc` inside) |
 | Animation vanished after reopening the .blend | Make sure the add-on is enabled in Preferences *before* opening; recovery is automatic |
 | Car deforms but sits at the origin | Recovery lost the root Empty — re-run import once; with the add-on enabled this recovers automatically |
 | Parts of the car have no texture | Enable **Include Base Game Textures** and set **Game Folder** to your BeamNG install (auto-detected if left empty) |
