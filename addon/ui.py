@@ -82,13 +82,24 @@ def _on_smooth_stop_update(self, context):
 class BeamNGSceneProperties(PropertyGroup):
     sequence_dir: StringProperty(
         name="Capture Folder",
-        description="Folder containing the .bmc capture written by v5capture",
+        description="Legacy folder field (kept so old .blend files that "
+                    "stored it still load; superseded by bmc_path)",
         subtype="DIR_PATH",
         default="",
     )
+    bmc_path: StringProperty(
+        name="Capture File (.bmc)",
+        description="The .bmc capture file that the v5capture mod wrote in "
+                    "BeamNG — usually <userfolder>\\captures\\my_crash.bmc "
+                    "(your user folder is "
+                    "%LOCALAPPDATA%\\BeamNG\\BeamNG.drive\\current).",
+        subtype="FILE_PATH",
+        default="",
+    )
     cache_path: StringProperty(
-        name="Cache File",
-        description="Path to the .bvc cache file",
+        name="Cache File (.bvc)",
+        description="Path to the .bvc cache file. Filled in automatically "
+                    "when you build — you don't normally need to touch it",
         subtype="FILE_PATH",
         default="",
     )
@@ -681,28 +692,52 @@ class BEAMNG_PT_main(Panel):
 
         layout.label(text="BeamNG Cache Importer")
 
+        # --- Step 1: pick the capture --------------------------------------
         box = layout.box()
-        box.prop(props, "sequence_dir")
-        box.prop(props, "cache_path")
-        box.prop(props, "use_chunked")
-        box.prop(props, "weld_cache")
-        box.prop(props, "start_frame")
+        box.label(text="1 · Pick your capture", icon="FILE_TICK")
+        box.prop(props, "bmc_path")
+        note = box.column(align=True)
+        note.scale_y = 0.7
+        note.label(text="The .bmc your v5capture recording wrote —", icon="INFO")
+        note.label(text="…\\current\\captures\\<name>.bmc.", icon="INFO")
+
+        # --- Step 2: playback knobs ----------------------------------------
+        box = layout.box()
+        box.label(text="2 · Playback (tune to taste)", icon="PLAY")
         box.prop(props, "playback_fps")
         box.prop(props, "output_fps")
-        box.prop(props, "car_smooth_stop")
+        note = box.column(align=True)
+        note.scale_y = 0.7
+        note.label(text="Speed + render fps — live, no re-import.", icon="INFO")
+
+        # --- Step 3: build & import ----------------------------------------
+        box = layout.box()
+        box.label(text="3 · Build + Import", icon="MOD_BUILD")
+        row = box.row(align=True)
+        row.scale_y = 1.3
+        row.operator("beamng.build_cache", text="Build Cache & Import", icon="EXPORT")
+        box.prop(props, "use_chunked")
+        box.prop(props, "weld_cache")
+        note = box.column(align=True)
+        note.scale_y = 0.7
+        note.label(text="Builds <name>.bvc from your .bmc, then imports", icon="INFO")
+        note.label(text="the animating car into the scene. One click.", icon="INFO")
+
+        # --- Optional settings ---------------------------------------------
+        layout.separator()
+        col = layout.column(align=True)
+        col.label(text="Optional", icon="PREFERENCES")
+        col.prop(props, "start_frame")
+        col.prop(props, "car_smooth_stop")
         if props.car_smooth_stop:
-            box.prop(props, "car_smooth_stop_frames")
-            box.prop(props, "car_smooth_stop_start")
+            col.prop(props, "car_smooth_stop_frames")
+            col.prop(props, "car_smooth_stop_start")
         # These three retune the imported cache in place (see
         # runtime.frame_handler.update_start_frame / update_fps), so say so —
         # otherwise the natural assumption is that they need a re-import.
-        note = box.column(align=True)
+        note = col.column(align=True)
         note.scale_y = 0.7
         note.label(text="Timing is live — no re-import needed.", icon="INFO")
-
-        col = layout.column(align=True)
-        col.operator("beamng.build_cache", text="1. Build Cache", icon="EXPORT")
-        col.operator("beamng.import_cache", text="2. Import Cache", icon="IMPORT")
 
         col.separator()
         col.prop(props, "vehicle_dir")
@@ -710,10 +745,7 @@ class BEAMNG_PT_main(Panel):
         sub = col.column(align=True)
         sub.enabled = props.use_game_textures
         sub.prop(props, "game_dir")
-        col.operator("beamng.assign_textures", text="3. Assign Textures", icon="TEXTURE")
-
-        col.separator()
-        col.operator("beamng.export_alembic", text="4. Export to Alembic", icon="EXPORT")
+        col.operator("beamng.assign_textures", text="Assign Textures", icon="TEXTURE")
 
         col.separator()
         fluid = layout.column(align=True)
@@ -723,10 +755,10 @@ class BEAMNG_PT_main(Panel):
                        text="Clear Fluid Effector", icon="X")
         note = fluid.column(align=True)
         note.scale_y = 0.7
-        note.label(
-            text="Bakes proxy to .mdd + MESH_CACHE,", icon="INFO")
-        note.label(
-            text="moves FLUID effector onto proxy.", icon="INFO")
+        note.label(text="Bakes the proxy mesh to .mdd + MESH_CACHE,", icon="INFO")
+        note.label(text="moves the FLUID effector onto the proxy so", icon="INFO")
+        note.label(text="Mantaflow reads native depsgraph data on its", icon="INFO")
+        note.label(text="own bake thread — no crash. Needs a proxy first.", icon="INFO")
 
 
 class BEAMNG_PT_tyres(Panel):

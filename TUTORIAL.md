@@ -105,19 +105,17 @@ your BeamNG user folder.
 ## Part 4 — Build the cache in Blender
 
 1. Open Blender and the **BeamNG** panel (3D View ▸ N-panel ▸ BeamNG).
-2. **Capture Folder** → point it at a folder containing your `.bmc`
-   (e.g. copy `my_crash.bmc` into a working folder next to where you'll
-   save your .blend).
-3. Optional build settings:
-   - **Weld duplicate vertices** — smaller cache and allows Shade Smooth /
-     Weighted Normals later. Verified safe at build time (it aborts if any
-     welded seam would visibly separate during playback). Leave off if you
-     want a 1:1 copy of the capture.
-4. Click **Build BeamNG Cache**. This writes a `.bvc` file next to the
-   capture and fills in **Cache File** automatically.
-5. Click **Import BeamNG Cache**. The car appears, fully posed at frame 1,
-   with a parent Empty driving the rigid motion and per-frame vertex
-   deformation on the meshes.
+2. **1 · Pick your capture** → browse to the `.bmc` file your recording
+   wrote (e.g. `C:\Users\you\AppData\Local\BeamNG\BeamNG.drive\current\
+   captures\my_crash.bmc`). You can also copy `my_crash.bmc` somewhere
+   next to your .blend and point at that.
+3. **2 · Playback** → set **Playback Speed** and **Output FPS** however you
+   like (details in Part 5; you can also retune these after importing).
+4. Optional build settings (**Chunked Playback**, **Weld duplicate
+   vertices**) if you want them — details in Part 5.
+5. **3 · Build Cache & Import** — one click. It writes a `.bvc` next to
+   your `.bmc` and imports the car, fully posed with a parent Empty
+   driving the rigid motion and per-frame vertex deformation on the meshes.
 
 > The `.bvc` is the heavy file. Save your .blend after importing — the
 > blend stores only the *path* to the cache, so keep both together (if you
@@ -224,9 +222,10 @@ path is: build debris, play, render.
 
 - Real renders (F12 / Ctrl+F12) always match the viewport — the cache pose
   is applied on the render path too, including motion-blur subframes.
-- **Export Alembic** bakes the entire animation (including tyre contact)
-  into an `.abc` + point-cache if you want to hand the shot to another
-  package or a lighter scene.
+- **Export Alembic** still exists as a *script-only* operator
+  (`beamng.export_alembic`), but it is experimental / construction tooling —
+  the panel button was removed. Prefer rendering the vertex cache directly
+  from Blender unless you really need to hand the shot to another package.
 - Viewport Render Animation: if the viewport is in Rendered + Cycles,
   Blender itself freezes that mode (a known upstream limitation — even a
   plain keyframed cube freezes there). Switch the viewport to **Material
@@ -238,7 +237,7 @@ path is: build debris, play, render.
 
 | Symptom | Fix |
 |---|---|
-| "No .bmc capture in the folder" | Point **Capture Folder** at the folder that directly contains your `.bmc`. |
+| "No .bmc capture in the folder" | Point **1 · Pick your capture** at the `.bmc` file directly. |
 | Build fails: weld verification | Turn off **Weld duplicate vertices** and rebuild. |
 | Animation gone after reopening the .blend | Make sure the add-on is still enabled in Preferences, and **Cache File** points at an existing `.bvc`. Recovery is automatic on load. |
 | Car deforms but sits at the origin | Cache path moved/renamed — re-point **Cache File** and re-import. |

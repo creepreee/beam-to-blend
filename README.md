@@ -33,8 +33,9 @@ BeamNG.drive                 Blender 4.x
   lift-off release, computed per frame from the cached geometry.
 - **Smooth car stop** — a damped continuation of the car's residual swing
   after the capture ends, so the wreck settles instead of freezing.
-- **Alembic export** — bake the whole animation (deformation + transforms) to
-  `.abc` for other DCCs or render farms.
+- **Alembic export** (experimental, script-only) — an `alembic_export` helper
+  can bake the whole animation (deformation + transforms) to `.abc` for other
+  DCCs; it is construction-side tooling, not a polished panel feature.
 
 ## Requirements
 
@@ -133,8 +134,9 @@ With the cache imported, use the **Debris** sub-panel:
   shading + Cycles (it re-evaluates nothing per frame — this affects keyframed
   objects too). Use Material Preview or Solid shading if you need it, or just
   render normally.
-- **Export Alembic** bakes everything to `.abc` (including tyre deformation)
-  when you need the animation outside Blender.
+- **Export Alembic** (`beamng.export_alembic`) is available as a script-only
+  operator — experimental / construction-side. Prefer rendering the cache
+  directly from Blender.
 
 ## Command-line cache building
 

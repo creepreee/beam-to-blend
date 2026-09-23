@@ -108,7 +108,7 @@ user folder).
 | `runtime/mesh_update.py` | ✅ | Per-frame vertex update, sharp edge marking, smooth-stop swing tail; `CHUNK_MAP_E180` is a FALLBACK chunk map — other cars import per-object automatically |
 | `runtime/debris_retime.py` | ✅ | Rescales baked debris/particle keys on live fps/start changes |
 | `runtime/frame_handler.py` | ✅ | Timeline handler, undo/reload recovery, live start/fps/tyre/smooth-stop retune, render_pre path |
-| `addon/operators.py` | ✅ | Build/import/export/texture/debris operators; build operator is BMC-only (no scan step) |
+| `addon/operators.py` | ✅ | Build/import/texture/debris/fluid operators; build operator is BMC-only (builds from `bmc_path` AND imports in one click); `import_cache`/`export_alembic` stay registered for scripts but have no panel button |
 | `addon/ui.py` | ✅ | Panel + scene props + Tyre/Debris/Physics sub-panels; `workers` prop kept inert for old .blends |
 | `tools/v5_capture.lua` | ✅ | BMC capture, origin-relative anti-drag |
 | `tools/rebuild_cache.py` | ✅ | argparse: `--captures <dir> --name <name> [--no-swap]` |

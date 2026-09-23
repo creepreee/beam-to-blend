@@ -2,19 +2,19 @@
 
     blender --background --python tests/blender_addon_install.py
 
-Installs dist/beamng_cache_importer.zip, enables it, then drives the three
-operators (scan, build cache, import cache) against testglt/. Exits non-zero on
-any failure.
+Installs dist/beamng_cache_importer.zip, enables it, then drives the
+operators (build cache + import) against a synthetic .bmc fixture. Exits
+non-zero on any failure.
 """
 
 import os
 import sys
+import tempfile
 
 import bpy
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _ZIP = os.path.join(_REPO, "dist", "beamng_cache_importer.zip")
-_SEQ = os.path.join(_REPO, "testglt")
 _MODULE = "beamng_cache_importer"
 
 
@@ -42,35 +42,30 @@ def main():
         _fail("add-on did not enable")
     _ok("add-on installed and enabled")
 
-    # Operators must be genuinely callable (poll), not just lazy stubs.
-    if bpy.ops.beamng.scan_sequence.poll() is False and not hasattr(
-        bpy.types, "BEAMNG_OT_scan_sequence"
-    ):
-        _fail("operator beamng.scan_sequence not registered")
-    _ok("operators registered and callable")
+    # Build a synthetic .bmc fixture (no BeamNG needed).
+    sys.path.insert(0, _REPO)
+    from tests.bmc_fixtures import moving_car_sequence
 
-    # The operators read the sequence folder + settings from scene properties
-    # (not operator keywords). Set them, and exercise the parallel read path.
+    tmp = tempfile.mkdtemp(prefix="beamng_addon_test_")
+    bmc = moving_car_sequence(os.path.join(tmp, "capture.bmc"), n_frames=30)
+    cache = os.path.join(tmp, "capture.bvc")
+
+    # The build operator reads the .bmc path from scene properties (not
+    # operator keywords). Set it and exercise the one-click build+import.
     scene = bpy.context.scene
-    scene.beamng.sequence_dir = _SEQ
-    scene.beamng.workers = 4
-    _ok(f"scan/build with {scene.beamng.workers} parallel workers")
-
-    bpy.ops.beamng.scan_sequence()
-    _ok("scan_sequence ran")
+    scene.beamng.bmc_path = bmc
+    _ok(f"build+import from {bmc}")
 
     bpy.ops.beamng.build_cache()
-    cache = os.path.join(_SEQ, "testglt.bvc")
     if not os.path.exists(cache):
         _fail(f"build_cache did not produce {cache}")
     _ok(f"build_cache produced {os.path.getsize(cache)/1e6:.1f} MB cache")
 
     meshes_before = len(bpy.data.meshes)
-    bpy.ops.beamng.import_cache()
     created = len(bpy.data.meshes) - meshes_before
     if created < 90:
-        _fail(f"import_cache created only {created} meshes")
-    _ok(f"import_cache created {created} mesh datablocks")
+        _fail(f"build+import created only {created} meshes")
+    _ok(f"build+import created {created} mesh datablocks")
 
     # Scrub the timeline; confirm the handler moves geometry.
     import numpy as np

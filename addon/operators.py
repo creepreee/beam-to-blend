@@ -200,12 +200,17 @@ class BEAMNG_OT_build_cache(Operator):
         sys.stderr.write("[BeamNG] BUILD CACHE\n")
         sys.stderr.flush()
 
-        directory = context.scene.beamng.sequence_dir.strip().rstrip("\\/")
-        if not directory:
-            self.report({"ERROR"}, "Set the sequence folder first")
+        bmc_path = context.scene.beamng.bmc_path.strip()
+        if not bmc_path:
+            self.report({"ERROR"}, "Pick a .bmc capture file first (step 1)")
+            return {"CANCELLED"}
+        bmc_path = os.path.abspath(bmc_path)
+        if not os.path.exists(bmc_path):
+            self.report({"ERROR"}, f"Capture file not found: {bmc_path}")
             return {"CANCELLED"}
 
-        name = os.path.basename(os.path.normpath(directory)) or "sequence"
+        directory = os.path.dirname(bmc_path)
+        name = os.path.splitext(os.path.basename(bmc_path))[0] or "capture"
         out = os.path.join(directory, f"{name}.bvc")
         # Normalize to avoid trailing-space / encoding issues on Windows.
         out = os.path.abspath(out)
@@ -216,17 +221,8 @@ class BEAMNG_OT_build_cache(Operator):
         weld = bool(context.scene.beamng.weld_cache)
 
         # --- BMC pipeline (the only pipeline) -------------------------------
-        bmc_files = [f for f in os.listdir(directory) if f.lower().endswith(".bmc")]
-        if not bmc_files:
-            self.report(
-                {"ERROR"},
-                "No .bmc capture in the folder — capture one with "
-                "v5capture in BeamNG first",
-            )
-            return {"CANCELLED"}
-        bmc_path = os.path.join(directory, sorted(bmc_files)[0])
         sys.stderr.write(
-            f"[BeamNG] BMC capture found ({bmc_files[0]}), "
+            f"[BeamNG] BMC capture ({name}.bmc), "
             f"building via build_from_capture (weld={weld})\n"
         )
         sys.stderr.flush()
@@ -241,9 +237,15 @@ class BEAMNG_OT_build_cache(Operator):
             return {"CANCELLED"}
         sys.stderr.write("[BeamNG] BUILD CACHE DONE\n")
         sys.stderr.flush()
+
+        # Build and import in one click — no separate import step needed.
+        res = BEAMNG_OT_import_cache.execute(self, context)
+        if "CANCELLED" in res:
+            return res
+
         self.report(
             {"INFO"},
-            f"Built BMC cache: {out} "
+            f"Built + imported: {out} "
             f"({manifest.frame_count} frames, "
             f"{len(manifest.stable_objects)} objects)",
         )
