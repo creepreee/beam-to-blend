@@ -2,8 +2,8 @@
 
 **BeamNG.drive crash simulations, imported into Blender as real vertex animation.**
 
-Crash cars in BeamNG — the most realistic soft-body car physics engine out
-there — record the exact deforming mesh + rigid motion, and this add-on
+Crash cars in BeamNG, the most realistic soft-body car physics engine out
+there, record the exact deforming mesh + rigid motion, and this add-on
 replays it in Blender as per-frame vertex animation with materials, debris,
 glass shatter, tyre deformation and more.
 
